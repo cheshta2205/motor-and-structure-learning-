@@ -27,12 +27,14 @@ refitting anything):
                classifier.
                CAUTION on the cosine matrix: multinomial logistic weights are
                defined only up to an additive constant across classes (the
-               softmax gauge), and L2 picks the centred solution -- the 16 rows
-               sum to exactly zero in every z dimension.  Sixteen zero-sum
-               vectors have mean pairwise cosine -1/15 = -0.067, and that is
-               what is measured (-0.065).  So NEUTRAL IS -0.067, NOT 0: the
-               faint blue background is arithmetic, not a finding, and only
-               departures from it mean anything.
+               softmax gauge), and L2 picks the centered solution -- the K rows
+               sum to exactly zero in every z dimension.  K zero-sum vectors
+               have mean pairwise cosine -1/(K-1), so NEUTRAL IS NOT ZERO and
+               the faint blue background is arithmetic rather than a finding.
+               At K = 16 that was -0.067 (measured -0.065); at the current
+               K = 8 it is -0.143, twice as far from zero.  The figure prints
+               the value it should be read against, so trust the figure over
+               any number quoted here.
   --pca        top PCs at each site, coloured by context, family, position and
                velocity.  The kinematic colourings matter: z carries velocity as
                well as context (that is why the oracle ladder needed velocity to
@@ -63,17 +65,16 @@ import torch
 import model as M
 from data import generate_sequences
 from decode import _clf, seq_split
-from task import CONTEXTS, C_LABEL, FAMILY, FAMS, FAM_NAME, N_CONTEXTS, TSS_MIN
+from task import (CONTEXTS, C_LABEL, FAMILY, FAM_NAMES, N_CONTEXTS, TSS_MIN)
 
 N_SEQ = 1200
 N_SPLITS = 8
 SITES = ("z", "mtl_hidden", "cb_layer1", "cb_layer2")
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b",
-        "drift": "#1e8449", "curl": "#8e44ad"}
-# contexts grouped by family, which is the order that makes block structure
-# visible; CONTEXTS is already in this order but do not rely on that
+FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b"}
+# contexts grouped by family, which is the order that makes the block
+# structure visible in the confusion matrix
 ORDER = sorted(range(N_CONTEXTS), key=lambda c: (FAMILY[c], c))
-LABELS = [C_LABEL[c].split(":")[1].strip() for c in ORDER]
+LABELS = [C_LABEL[c] for c in ORDER]
 
 
 def _despine(a):
@@ -98,7 +99,8 @@ def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN):
     fam = ctx[:, :, 1].numpy().astype(int).ravel()
     sid = np.repeat(np.arange(n)[:, None], t.shape[1], 1).ravel()
     out = {k: v.numpy().reshape(-1, v.shape[-1])[keep] for k, v in sites.items()}
-    out.update(cid=cid[keep], fam=fam[keep], sid=sid[keep], tss=t.ravel()[keep])
+    out.update(cid=cid[keep], fam=fam[keep], sid=sid[keep],
+               tss=t.ravel()[keep])
     # kinematics, for the PCA colourings: the same observation the network sees
     obs, _, _ = M.build(trans)
     obs = obs.numpy().reshape(-1, obs.shape[-1])[keep]
@@ -108,7 +110,8 @@ def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN):
 
 # ── 1. confusion 
 def confusion(d, site="z", n_splits=N_SPLITS):
-    """16x16 row-normalised confusion, plus the decoder weight-cosine matrix.
+    """KxK row-normalised confusion (K = N_CONTEXTS), plus the decoder
+    weight-cosine matrix.
 
     Predictions are ACCUMULATED across splits rather than averaging per-split
     matrices, so every row has enough counts to be read.  The weight matrix is
@@ -121,11 +124,11 @@ def confusion(d, site="z", n_splits=N_SPLITS):
         te = seq_split(sid, seed=s)
         if te.all() or (~te).all():
             continue
-        clf = _clf("linear", s).fit(X[~te], y[~te])
+        clf = _clf(s).fit(X[~te], y[~te])
         pred = clf.predict(X[te])
         for a, b in zip(y[te], pred):
             C[a, b] += 1
-        W.append(clf[-1].coef_)                       # (16, n_features)
+        W.append(clf[-1].coef_)                  # (N_CONTEXTS, n_features)
     C = C[np.ix_(ORDER, ORDER)]
     C = C / np.maximum(C.sum(1, keepdims=True), 1)    # row-normalise
     Wm = np.mean(W, 0)
@@ -137,7 +140,7 @@ def confusion(d, site="z", n_splits=N_SPLITS):
 def fig_confusion(arm, seed, C, S, path, site="z"):
     """Two separate figures: the annotated confusion, and the weight cosine.
 
-    Separate rather than side by side because a 16x16 matrix with a number in
+    Separate rather than side by side because a KxK matrix with a number in
     every cell needs the space to stay legible.
     """
     acc = float(np.mean(np.diag(C)))
@@ -156,15 +159,16 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
     ax.set_yticklabels(full, fontsize=7.5)
     ax.set_xlabel("predicted context"); ax.set_ylabel("true context")
     bnd = np.cumsum([sum(1 for c in ORDER if FAMILY[c] == f)
-                     for f in sorted(set(FAMILY.values()))])[:-1] - .5
+                     for f in range(len(FAM_NAMES))])[:-1] - .5
     for x in bnd:
         ax.axhline(x, color="w", lw=1.4); ax.axvline(x, color="w", lw=1.4)
     fig.colorbar(im, ax=ax, fraction=.046)
     ax.set_title(f"{arm} {seed if str(seed).startswith('pooled') else f'seed {seed}'}"
                  f" -- context confusion in {site}  "
                  f"(tss >= {TSS_MIN})\n"
-                 f"rows sum to 1; accuracy {acc:.3f}; {within:.0%} of errors "
-                 f"stay inside the true family", fontsize=10.5)
+                 f"rows sum to 1; accuracy {acc:.3f}; {within['family']:.0%} "
+                 f"of errors stay inside the true family "
+                 f"(chance {within['chance']:.0%})", fontsize=10.5)
     fig.tight_layout()
     fig.savefig(path, dpi=170); plt.close(fig)
     print(f"  saved -> {path}")
@@ -205,12 +209,21 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
 
 
 def _within_family_mass(C):
-    """Fraction of the OFF-DIAGONAL mass that stays inside the true family."""
+    """Fraction of OFF-DIAGONAL mass that stays inside the true family, and
+    the chance level it has to beat.
+
+    CHANCE IS NOT ZERO.  With 8 members per family, a uniformly wrong guess
+    stays inside the family 7/15 of the time, so 0.47 is neutral and only
+    departures from it mean anything.  Reporting the raw fraction without the
+    reference reads as a strong result when it is arithmetic.
+    """
     fam = np.array([FAMILY[c] for c in ORDER])
     off = C.copy()
     np.fill_diagonal(off, 0)
-    same = off[fam[:, None] == fam[None, :]].sum()
-    return float(same / max(off.sum(), 1e-12))
+    tot = max(off.sum(), 1e-12)
+    per_fam = N_CONTEXTS // len(FAM_NAMES)
+    return {"family": float(off[fam[:, None] == fam[None, :]].sum() / tot),
+            "chance": (per_fam - 1) / (N_CONTEXTS - 1)}
 
 
 # ── 2. PCA: what explains the variance at each site ──────────────────────────
@@ -247,7 +260,9 @@ def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
         ("speed |v|", spd, "plasma", (np.percentile(spd, 1),
                                       np.percentile(spd, 99))),
     ]
-    fig, axes = plt.subplots(len(SITES), 5, figsize=(21, 4.1 * len(SITES)))
+    fig, axes = plt.subplots(len(SITES), 1 + len(colourings),
+                             figsize=(4.2 * (1 + len(colourings)),
+                                      4.1 * len(SITES)))
     for si, site in enumerate(SITES):
         v = P[site]["var"]
         a = axes[si, 0]
@@ -262,7 +277,7 @@ def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
         for ci, (name, c, cmap, lim) in enumerate(colourings):
             a = axes[si, 1 + ci]
             if name == "family":
-                for fi, f in enumerate(FAMS):
+                for fi, f in enumerate(FAM_NAMES):
                     m = c == fi
                     a.scatter(pr[m, 0], pr[m, 1], s=2, alpha=.35,
                               color=FCOL[f], label=f if si == 0 else None)
@@ -293,7 +308,8 @@ def pc_variance(d, P, n_pc=10):
     component (a 1-D signal over samples):
 
         context   eta^2 -- between-context variance / total.  Exactly the R^2 of
-                  regressing the PC on a 16-way one-hot, no linearity assumed.
+                  regressing the PC on an N_CONTEXTS-way one-hot, no linearity
+                  assumed.
         position  R^2 of an OLS fit on (x, y)
         velocity  R^2 of an OLS fit on (vx, vy)
 
@@ -361,7 +377,7 @@ def fig_pc_variance(arm, seed, V, path, n_pc=10):
     fig.suptitle(
         f"{arm} seed {seed} -- what does each principal component encode?  "
         f"(tss >= {TSS_MIN})\n"
-        f"context is $\\eta^2$ over the 16 contexts; position and velocity are "
+        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts; position and velocity are "
         f"linear $R^2$.  They may overlap -- drift contexts move the agent, so "
         f"context and position are genuinely correlated.\n"
         f"dashed line: how much of the site's total variance that PC carries.",
@@ -392,11 +408,12 @@ def gif_pca(arm, seed, d, P, site, path, n_show=3000, frames=72, rng_seed=0):
               ("position (x)", d["pos"][idx][:, 0], "viridis", None),
               ("speed |v|", spd, "plasma",
                (np.percentile(spd, 1), np.percentile(spd, 99)))]
-    fig = plt.figure(figsize=(17, 4.6))
-    axes = [fig.add_subplot(1, 4, i + 1, projection="3d") for i in range(4)]
+    fig = plt.figure(figsize=(4.25 * len(panels), 4.6))
+    axes = [fig.add_subplot(1, len(panels), i + 1, projection="3d")
+            for i in range(len(panels))]
     for a, (name, c, cmap, lim) in zip(axes, panels):
         if name == "family":
-            for fi, f in enumerate(FAMS):
+            for fi, f in enumerate(FAM_NAMES):
                 m = c == fi
                 a.scatter(pr[m, 0], pr[m, 1], pr[m, 2], s=2, alpha=.5,
                           color=FCOL[f], label=f)
@@ -443,7 +460,7 @@ def topk(d, P, ks=(1, 2, 3, 5, 8, 12, 20, 32, 48, 64), n_splits=3):
         for k in ks:
             if k > pr.shape[1]:
                 acc.append(np.nan); continue
-            a = [_clf("linear", sp).fit(pr[~te][:, :k], d["cid"][~te]).score(
+            a = [_clf(sp).fit(pr[~te][:, :k], d["cid"][~te]).score(
                      pr[te][:, :k], d["cid"][te])
                  for sp in range(n_splits)
                  for te in [seq_split(d["sid"], seed=sp)]]
@@ -464,7 +481,7 @@ def fig_topk(arm, seed, T, full_acc, path):
                       (ax[1], "cumulative variance those PCs explain", "linear")):
         a.axhline(1 / N_CONTEXTS, ls=":", color="#888", lw=1)
         a.set_xlabel(xl); a.set_xscale(xs)
-        a.set_ylabel("16-way context decoding")
+        a.set_ylabel(f"{N_CONTEXTS}-way context decoding")
         a.set_ylim(0, 1.02)
         a.legend(frameon=False, fontsize=8)
         _despine(a)
@@ -474,7 +491,7 @@ def fig_topk(arm, seed, T, full_acc, path):
                    fontsize=8, color="#c0392b", ha="right")
     fig.suptitle(
         f"{arm} seed {seed} -- is context a MAJOR or a MINOR axis?\n"
-        f"left: 16-way decoding from the top-k PCs only.\n"
+        f"left: {N_CONTEXTS}-way decoding from the top-k PCs only.\n"
         f"right: the same, against how much variance those PCs explain.\n"
         f"context needing PCs that carry little variance = a minor axis "
         f"(mixed selectivity)", fontsize=10)
@@ -511,7 +528,7 @@ def fig_clusters(arm, seed, d, P, site, path, n_show=4000, rng_seed=0):
         for ci, (i, j) in enumerate(pairs):
             a = axes[ri, ci]
             if name == "family":
-                for fi, f in enumerate(FAMS):
+                for fi, f in enumerate(FAM_NAMES):
                     m = c == fi
                     a.scatter(pr[m, i], pr[m, j], s=2.5, alpha=.4,
                               color=FCOL[f], label=f if (ri, ci) == (1, 0) else None)
@@ -550,7 +567,7 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0):
     across-seed claim is carried by the bottom row instead.
 
     Bottom row: for each of the top 10 PCs, how much of ITS variance is
-    explained by context (eta^2 over the 16 contexts), by position and by
+    explained by context (eta^2 over the contexts), by position and by
     velocity (linear R^2), as mean +- SD ACROSS SEEDS.  This is the quantitative
     statement and it is what should be quoted.
 
@@ -615,7 +632,7 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0):
     fig.suptitle(
         f"{arm}: $z$ encodes CONTEXT in its dominant components  "
         f"(tss >= {TSS_MIN}; scatter from seed {seeds[0]})\n"
-        f"context is $\\eta^2$ over the 16 contexts, assumption-free; position "
+        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts, assumption-free; position "
         f"and velocity are linear $R^2$.  They need not sum to 1 -- drift "
         f"contexts move the agent, so context and position are correlated.",
         fontsize=11)
@@ -633,13 +650,14 @@ def _mds(dist, seed=0):
 def mds_weights(d, site="z", n_splits=N_SPLITS, rank=None):
     """Geometry of the decoder's READOUT DIRECTIONS.
 
-    Fit the 16-way decoder, take its weight matrix W (16 x n_features), low-rank
+    Fit the N_CONTEXTS-way decoder, take its weight matrix W, low-rank
     truncate it, normalise the rows and use 1 - cosine as a distance.  Each
     point is then one context, positioned by how similar its detection RECIPE is
     to every other context's.
 
     The rank truncation (default N/2, following the earlier figure) denoises W:
-    16 contexts cannot need more than a handful of directions to separate, and
+    N_CONTEXTS contexts cannot need more than a handful of directions to
+    separate, and
     the trailing singular values are fit noise that inflates every pairwise
     distance.  It does NOT depend on whether context is a major or minor axis of
     the variance -- the decoder finds its directions by supervised fitting
@@ -649,7 +667,7 @@ def mds_weights(d, site="z", n_splits=N_SPLITS, rank=None):
     W = []
     for sp in range(n_splits):
         te = seq_split(d["sid"], seed=sp)
-        W.append(_clf("linear", sp).fit(d[site][~te], d["cid"][~te])[-1].coef_)
+        W.append(_clf(sp).fit(d[site][~te], d["cid"][~te])[-1].coef_)
     W = np.mean(W, 0)
     U, S, Vt = np.linalg.svd(W, full_matrices=False)
     Wt = U[:, :rank] @ np.diag(S[:rank]) @ Vt[:rank]
@@ -658,24 +676,124 @@ def mds_weights(d, site="z", n_splits=N_SPLITS, rank=None):
     return _mds(1 - dp), dp
 
 
-def mds_centroids(d, site="z", residualise=False):
-    """Geometry of the REPRESENTATION: the 16 context centroids.
+def context_centroids(d, site="z", residualise=False, center=True,
+                      context_ids=None):
+    """The per-context mean of `site`, as a (n_contexts, n_features) array.
 
-    Centroids, not all samples -- MDS on ~28k points would be dominated by
-    within-context spread and is not what the question asks.
+    Centroids, not all samples -- any geometry over ~28k points would be
+    dominated by within-context spread and is not what the question asks.
 
     residualise=True first regresses position and velocity out of the site,
     which matters because drift contexts systematically push the agent around:
     their centroids differ partly because the agent IS somewhere else, not only
     because the context differs.  Comparing the two tells you whether a
     separation is contextual or kinematic.
+
+    BEWARE: residualise=True ALSO CENTRES, whether or not `center` is set.  Its
+    design matrix carries an intercept column, so the residual has zero mean by
+    construction and the contexts' shared component goes with it.  Measured on
+    main seed 0, mean off-diagonal cosine of the centroids:
+
+        residualise=0 center=0   +0.645        <- the only uncentered combination
+        residualise=0 center=1   -0.142
+        residualise=1 center=0   -0.142        <- centered despite center=False
+        residualise=1 center=1   -0.142
+
+    So a caller that wants the geometry WITH its common component -- which is
+    what a downstream reader receives -- must pass residualise=False as well as
+    center=False.  Asking for one and not the other silently returns the
+    centered geometry under the uncentered name.
+
+    center=True subtracts the mean OVER CONTEXTS.  It is off for the MDS
+    callers, which use distances and so are already translation-invariant, and
+    on for anything angular -- see centroid_cosine.
+
+    context_ids restricts to a SUBSET of the contexts, and the restriction
+    happens BEFORE centering, which is the only order that means anything: an
+    agent that meets four of the eight contexts has the mean of those four as
+    its shared component, not the mean of all eight.
     """
+    ids = range(N_CONTEXTS) if context_ids is None else list(context_ids)
     X = d[site]
     if residualise:
         K = np.column_stack([d["pos"], d["vel"], np.ones(len(X))])
         beta, *_ = np.linalg.lstsq(K, X, rcond=None)
         X = X - K @ beta
-    cen = np.stack([X[d["cid"] == c].mean(0) for c in range(N_CONTEXTS)])
+    cen = np.stack([X[d["cid"] == c].mean(0) for c in ids])
+    return cen - cen.mean(0) if center else cen
+
+
+def centroid_cosine(d, site="z", residualise=True, center=True,
+                    context_ids=None):
+    """Pairwise cosine between the context centroids.
+
+    Returns (S, eigenvalues of S).  This is the representational geometry in
+    the form sac.make_oracle_embed consumes: a Gram matrix it draws a context
+    code from, so that the RL oracle's code has the circuit's geometry instead
+    of a near-orthogonal one.  Angular rather than the Euclidean distances
+    mds_centroids uses, because a cosine matrix is scale-free -- it says where
+    the contexts sit RELATIVE to each other and carries no unit that would have
+    to be matched against another code's.
+
+    CENTRING IS THE ONE CHOICE HERE THAT CHANGES THE ANSWER, and which way to
+    take it depends on what the caller is going to do with the matrix.  The
+    centroids share a large common component (z is a tanh readout and its mean
+    is nowhere near the origin), so the RAW cosines are all strongly positive
+    -- main seed 0 measures off-diagonal mean +0.645, min +0.289, with a single
+    eigenvalue carrying 5.53 of the trace of 8.
+
+      center=False  the geometry a DOWNSTREAM READER actually receives, common
+                    mean included.  That mean is not inert to learning even
+                    though it carries no context information: it is shared by
+                    every context's input and therefore by every context's
+                    gradient, which is the gradient-sharing sac.center_ec
+                    exists to test.  This is what an RL oracle should match.
+      center=True   the DISCRIMINATIVE geometry alone, with the shared offset
+                    a first-layer bias absorbs removed.  This is the one to
+                    read when asking what distinguishes the contexts.
+
+    NEUTRAL IS NOT ZERO once centered, for the same arithmetic as the decoder
+    weight cosines in confusion(): K centered vectors sum to zero, so their mean
+    pairwise INNER PRODUCT is exactly -1/(K-1) of their mean squared norm, and
+    the mean COSINE lands there too up to the spread in those norms -- exactly
+    only if the centroids are equally long.  At K = 8 that is -0.143 against a
+    measured -0.142, and at the K = 4 sac uses, -0.3333 against -0.3329.  Those
+    agreements are near-arithmetic, not findings; only departures from them
+    mean anything.
+
+    WHAT THE CENTRED MATRIX MEASURES, on the trained circuit (main, seeds 0
+    and 1 agree):
+
+        rot -90 vs rot +90   -0.91      refl 0  vs refl 90    -0.94
+        rot -90 vs rot -45   +0.60      refl 45 vs refl 135   -0.95
+        rot -45 vs rot +45   -0.19      any rotation vs any reflection  ~0
+
+    which is the geometry of the ACTION TRANSFORMS THEMSELVES.  Under the
+    Frobenius inner product <R(a), R(b)> = 2 cos(a - b) and <M(a), M(b)> =
+    2 cos(2(a - b)), while <R(a), M(b)> = 0 for every pair -- so rotations lie
+    on one circle, reflections on another at double angle, and the two planes
+    are orthogonal.  Every number above is that prediction to within ~0.1.
+
+    Hence the SPECTRUM: 3.21, 1.96, 1.85, 0.96, then 0.013, 0.003, 0.001,
+    0.000.  Four directions hold 99.8% of the trace and the gap to the fifth is
+    74x, so the eight contexts occupy a 4-DIMENSIONAL code -- exactly the
+    dimension of the 2x2 matrices they are.  The circuit has not learned eight
+    labels; it has learned the space they live in.
+    """
+    cen = context_centroids(d, site, residualise=residualise, center=center,
+                            context_ids=context_ids)
+    n = cen / (np.linalg.norm(cen, axis=1, keepdims=True) + 1e-12)
+    S = n @ n.T
+    S = 0.5 * (S + S.T)                      # exactly symmetric, for eigh
+    return S, np.sort(np.linalg.eigvalsh(S))[::-1]
+
+
+def mds_centroids(d, site="z", residualise=False):
+    """MDS on the Euclidean distances between context centroids.
+
+    Distances, so no centering is needed -- see context_centroids.
+    """
+    cen = context_centroids(d, site, residualise=residualise, center=False)
     D = np.linalg.norm(cen[:, None] - cen[None], axis=-1)
     return _mds(D / (D.max() + 1e-12)), D
 
@@ -687,9 +805,9 @@ def fig_mds(arm, seed, panels, path, site="z"):
     for i, (name, coords, note) in enumerate(panels):
         for c in range(N_CONTEXTS):
             ax[i].scatter(coords[c, 0], coords[c, 1], s=170,
-                          color=FCOL[FAM_NAME[FAMILY[c]]], edgecolor="k", lw=.7,
-                          zorder=3)
-            ax[i].annotate(C_LABEL[c].split(":")[1].strip(),
+                          color=FCOL[FAM_NAMES[FAMILY[c]]],
+                          edgecolor="k", lw=.7, zorder=3)
+            ax[i].annotate(C_LABEL[c],
                            (coords[c, 0], coords[c, 1]),
                            textcoords="offset points", xytext=(8, 6),
                            fontsize=7, color="#333")
@@ -756,7 +874,7 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10):
     fig.suptitle(
         f"{arm} -- what does each principal component encode?  mean $\\pm$ SD "
         f"across {len(got)} seeds {got}  (tss >= {TSS_MIN})\n"
-        f"context is $\\eta^2$ over the 16 contexts (assumption-free); position "
+        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts (assumption-free); position "
         f"and velocity are linear $R^2$.  Only $z$ leads with context.",
         fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .89))
@@ -799,7 +917,7 @@ def pool_topk(arm, seeds, tag=""):
                          "linear")):
         a_.axhline(1 / N_CONTEXTS, ls=":", color="#888", lw=1)
         a_.set_xlabel(xl); a_.set_xscale(xs_)
-        a_.set_ylabel("16-way context decoding"); a_.set_ylim(0, 1.02)
+        a_.set_ylabel(f"{N_CONTEXTS}-way context decoding"); a_.set_ylim(0, 1.02)
         _despine(a_)
     ax[0].legend(frameon=False, fontsize=8)
     fig.suptitle(f"{arm} -- is context a MAJOR or a MINOR axis?  "
@@ -878,7 +996,8 @@ def pool_confusion(arm, seeds, site="z", tag=""):
     acc, wf = fig_confusion(arm, f"pooled over {len(got)} seeds", C, S,
                             os.path.join(d, f"confusion_{site}{tag}.png"), site)
     print(f"  {arm}: pooled over {len(got)} seeds {got} -- "
-          f"accuracy {acc:.3f}, {wf:.0%} of errors within family")
+          f"accuracy {acc:.3f}; {wf['family']:.0%} of errors stay in family "
+          f"(chance {wf['chance']:.0%})")
 
 
 if __name__ == "__main__":
@@ -901,7 +1020,7 @@ if __name__ == "__main__":
     ap.add_argument("--gif", action="store_true",
                     help="rotating 3D gif of the top 3 PCs at each site")
     ap.add_argument("--topk", action="store_true",
-                    help="16-way decoding from the top-k PCs -- major or minor "
+                    help="context decoding from the top-k PCs -- major or minor "
                          "axis")
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed average")
@@ -973,7 +1092,7 @@ if __name__ == "__main__":
                          **{f"{w}|{k}": T[k][w] for k in SITES
                             for w in ("ks", "acc", "cumvar")})
                 te = seq_split(d["sid"], seed=0)
-                full = float(_clf("linear", 0).fit(d["z"][~te], d["cid"][~te])
+                full = float(_clf(0).fit(d["z"][~te], d["cid"][~te])
                              .score(d["z"][te], d["cid"][te]))
                 fig_topk(arm, s, T, full, os.path.join(out, f"topk{tag}.png"))
         if a.pool:

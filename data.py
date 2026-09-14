@@ -1,78 +1,96 @@
 """
 data.py -- THE DATA: rolls the task out into sequences to train and test on.
-Draws an action, applies the current context's transformation through
-task.env_step, occasionally switches context, and records what the agent did and
-where it ended up.  Returns three aligned tensors -- the transitions the network
-sees, the context labels (used ONLY for decoding and scoring, never as input),
-and the steps since the last switch.
+Draws an action, applies the current context's force law through task.env_step,
+occasionally switches context, and records what the agent did and where it
+ended up.  Returns three aligned tensors -- the transitions the network sees,
+the context labels (used ONLY for decoding and scoring, never as input), and
+the steps since the last switch.
 
-FAST-switching contexts, AR(1) Gaussian actions.
+FAST-switching contexts, AR(1) Gaussian actions.  Both the action process and
+its scale now live in task.py (task.next_action / task.ACTION_SD), because the
+plant's effect-size calibration is measured at that scale and the two must not
+drift apart -- they did once, leaving the two factors' marginals 20% apart with
+nothing complaining.
 
-ACTIONS ARE AR(1) AND GAUSSIAN, both deliberately.
-
-  a_t = rho*a_{t-1} + sqrt(1-rho^2)*eps,   rho = 0.35,  eps ~ N(0, 1/3) - correlated actions. unbounded. 
-
-The sqrt(1-rho^2) keeps the marginal variance fixed at 1/3 whatever rho is, so
-rho changes ONLY the temporal correlation and not the action scale.  The
-Gaussian sd of 1/sqrt(3) matches the variance of the uniform[-1,1] this replaced
--- so the change is the shape of the support (unbounded vs a square), not the
-scale.  A square support leaks rotation: the corners tell you the axes.
+VELOCITY IS STORED EXPLICITLY, which it was not before.  The old format kept
+only positions and let model.build reconstruct V = (s_t - s_{t-1})/DT.  That
+identity IS EXACT in the interior of the new plant -- pos' = pos + vel'*DT --
+but it BREAKS at a wall: env_step clips the position and zeroes the velocity on
+the clipping axis, so the position difference is not the velocity there.  It is
+RARE AND SEVERE rather than common and mild -- measured on these sequences it
+hits 0.7% of steps (far below the ~13% of a uniform start, because sequences
+begin in the middle half), but where it hits, the reconstruction is off by
+0.0795 against a typical speed of 0.0251, i.e. wrong by 3x.  Since every bit of
+context information lives in the velocity (see multimodality.position_invariance)
+those steps would corrupt exactly the signal the circuit exists to extract, and
+they are unmarked.  Storing velocity costs four floats per step and removes the
+reconstruction entirely.
 
 Blocks: STAY_PROB 0.9 over SEQ_LEN 40 gives mean block ~8 steps and ~4.9 blocks
 per sequence, with 59% of steps at tss >= TSS_MIN.
+
+THE NOISE IS ON.  env_step is given the sequence rng, so the command noise that
+makes context inference require history (task.CMD_NOISE) is present in the
+training data.  Passing rng=None here would generate a deterministic plant that
+an ideal observer solves in two steps -- see tests/test_task.py.
 """
 import numpy as np
 import torch
 
-from task import (CONTEXTS, N_CONTEXTS, GRID_SIZE, SEQ_LEN, STAY_PROB, RHO,
-                  env_step)
+from task import (CONTEXTS, N_CONTEXTS, POS_LIM, SEQ_LEN, STAY_PROB, RHO,
+                  FAMILY, ACTION_SD, env_step, next_action,
+                  initial_action)
 
-GAUSS_SD = float(np.sqrt(1 / 3))
+GAUSS_SD = ACTION_SD          # kept as a name for callers that imported it
 
 
-def generate_sequences(n_seqs, seq_len=SEQ_LEN, seed=0, stay=STAY_PROB, rho=RHO):
+def generate_sequences(n_seqs, seq_len=SEQ_LEN, seed=0, stay=STAY_PROB,
+                       rho=RHO, contexts=None):
     """Returns (transitions, labels, time-since-switch).
 
-        transitions[b, t] = [x, y, ax, ay, x', y']
+        transitions[b, t] = [x, y, vx, vy, ax, ay, x', y', vx', vy']   (10)
         labels[b, t]      = [context_id, family]
         tss[b, t]         = steps since the last context switch
 
-    VELOCITY IS NOT STORED, only positions and actions.  model.build
-    reconstructs V_{t-1} = (s_t - s_{t-1})/DT for the observation and
-    V_{t+1} = (s_{t+1} - s_t)/DT for the target.  Keeping them separate is what
-    lets velocity appear in the LOSS without appearing in MTL's INPUT.
+    LABELS CARRY THE FAMILY as well as the context, because "which of the 16"
+    and "which family" are different questions with different chance levels
+    (1/16 and 1/2) and the second is the one the rotation/reflection contrast
+    is about.
 
-    A NEW CONTEXT IS ALWAYS A DIFFERENT ONE -- `nxt + (nxt >= c)` samples from
-    the other 15 -- so tss = 0 always marks a real change.
+    `contexts` restricts which contexts are drawn -- a subset for a held-out
+    experiment.  Default None means all of them.
+
+    A NEW CONTEXT IS ALWAYS A DIFFERENT ONE -- the resample below draws from
+    the other cells only -- so tss = 0 always marks a real change.
     """
+    pool = list(range(N_CONTEXTS)) if contexts is None else list(contexts)
+    if len(pool) < 2:
+        raise ValueError("need at least two contexts to switch between")
     rng = np.random.default_rng(seed)
-    sd = np.sqrt(1 - rho ** 2)
     T_, C_, S_ = [], [], []
     for _ in range(n_seqs):
-        pos = rng.uniform(.25 * GRID_SIZE, .75 * GRID_SIZE, 2).astype(np.float32)
+        # start in the middle half, away from the walls: a sequence that begins
+        # pinned spends its first steps on clipped transitions, which carry no
+        # context information at all
+        pos = rng.uniform(-0.5 * POS_LIM, 0.5 * POS_LIM, 2).astype(np.float32)
         vel = np.zeros(2, np.float32)
-        a = rng.normal(0.0, GAUSS_SD, 2).astype(np.float32)
-        c, tss = int(rng.integers(N_CONTEXTS)), 0
+        a = initial_action(rng)
+        c, tss = int(pool[rng.integers(len(pool))]), 0
         st, sc, ss = [], [], []
         for t in range(seq_len):
             if t > 0 and rng.random() > stay:
-                nxt = int(rng.integers(N_CONTEXTS - 1))
-                c = nxt + (nxt >= c)          # sample a DIFFERENT context
+                others = [x for x in pool if x != c]
+                c = int(others[rng.integers(len(others))])
                 tss = 0
             # The action process is NOT reset at a switch: it is a property of
             # the agent, not the environment, so resetting it would leak the
             # switch time into the actions themselves.
             if t > 0:
-                # the draw is cast to float32 BEFORE the sd multiply, not
-                # after: doing it the other way rounds differently and the
-                # trajectories drift apart by ~5e-07, enough that the trained
-                # checkpoints no longer see the data they were trained on
-                eps = rng.normal(0.0, GAUSS_SD, 2).astype(np.float32)
-                a = (rho * a + sd * eps).astype(np.float32)
-            kind, param, bx, by, c_id, _, fam = CONTEXTS[c]
-            pn, vn, _ = env_step(pos, vel, a, kind, param, bx, by)
-            st.append([pos[0], pos[1], a[0], a[1], pn[0], pn[1]])
-            sc.append([float(c_id), float(fam)])
+                a = next_action(a, rng, rho=rho)
+            pn, vn, _F = env_step(pos, vel, a, c, rng)
+            st.append([pos[0], pos[1], vel[0], vel[1], a[0], a[1],
+                       pn[0], pn[1], vn[0], vn[1]])
+            sc.append([float(c), float(FAMILY[c])])
             ss.append(float(tss))
             pos, vel = pn, vn
             tss += 1

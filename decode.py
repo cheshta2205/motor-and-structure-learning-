@@ -5,7 +5,7 @@ THE DECODER-
     Multinomial logistic regression (a GLM) on standardised z.
         64 features (z) -> K classes,  K = 4 or 16 [distinguish Family OR individual C]
     sklearn: StandardScaler -> LogisticRegression(max_iter=3000).
-    An MLP variant exists for the training-time tracking curve; the figures use
+    One decoder, multinomial logistic -- see _clf for why the MLP went.
     linear only, because the two sat on top of each other. 
 
 EXAMPLE  (the 16-way readout, one condition, one split)
@@ -54,7 +54,7 @@ WHAT CHANGES BETWEEN PANELS -- only the label and the mask
     splits).
 
 THE `seed` ARGUMENT IS NOT THE NETWORK'S SEED
-    It picks which sequences go to test, and seeds the MLP.  Callers loop it
+    It picks which sequences go to test.  Callers loop it
     0..7 for 8 splits of the SAME rollout; that spread is the band inside a
     per-seed figure.  The band across NETWORK seeds is the error bar to quote.
 
@@ -65,17 +65,28 @@ CAVEAT
 """
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-def _clf(kind, seed=0):
-    return (make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000))
-            if kind == "linear" else
-            make_pipeline(StandardScaler(),
-                          MLPClassifier(hidden_layer_sizes=(128,), max_iter=800,
-                                        random_state=seed)))
+def _clf(seed=0):
+    """The decoder.  MULTINOMIAL LOGISTIC, and only that.
+
+    An MLP variant ran alongside every linear decode for the whole of the
+    earlier work and sat ON TOP of the linear curve -- so the question it was
+    there to answer, "is the code merely PRESENT in z or actually linearly
+    READABLE", came back as: linearly readable, everywhere it was checked.
+
+    Removing it is not only tidying.  The MLP fits dominated the cost: 3.2s
+    against 0.1s per fit in model.track, and ~40x in the figure curves (16.5s
+    against 0.4s), which is what made the training-time tracking and the
+    per-seed figures slow enough to discourage running them.
+
+    `seed` is accepted and ignored, so call sites that passed it for the MLP's
+    random_state keep working; the split itself is seeded by the caller.
+    """
+    del seed
+    return make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000))
 
 
 def seq_split(seq_id, frac=0.3, seed=0):
@@ -87,7 +98,7 @@ def seq_split(seq_id, frac=0.3, seed=0):
     return np.isin(seq_id, list(te))
 
 
-def acc(X, y, groups, kind, seed=0):
+def acc(X, y, groups, seed=0):
     """Single pooled accuracy, no tss binning.  Used for the training-time
     tracking curve."""
     if len(np.unique(y)) < 2:
@@ -95,7 +106,7 @@ def acc(X, y, groups, kind, seed=0):
     te = seq_split(groups.ravel() if groups.ndim > 1 else groups, seed=seed)
     if te.all() or (~te).all() or len(np.unique(y[~te])) < 2:
         return np.nan
-    return _clf(kind, seed).fit(X[~te], y[~te]).score(X[te], y[te])
+    return _clf(seed).fit(X[~te], y[~te]).score(X[te], y[te])
 
 
 def family_by_tss(z, cid, fam, seq_id, tss, ks, fam_of, seed=0, min_test=30):
@@ -117,7 +128,7 @@ def family_by_tss(z, cid, fam, seq_id, tss, ks, fam_of, seed=0, min_test=30):
     te = seq_split(seq_id, seed=seed)
     if te.all() or (~te).all() or len(np.unique(cid[~te])) < 2:
         return [np.nan] * len(ks)
-    model = _clf("linear", seed).fit(z[~te], cid[~te])
+    model = _clf(seed).fit(z[~te], cid[~te])
     out = []
     for k in ks:
         sel = te & (tss == k)
@@ -127,7 +138,7 @@ def family_by_tss(z, cid, fam, seq_id, tss, ks, fam_of, seed=0, min_test=30):
     return out
 
 
-def by_tss(z, y, seq_id, tss, ks, kind="linear", mask=None, seed=0,
+def by_tss(z, y, seq_id, tss, ks, mask=None, seed=0,
            min_test=30):
     """Fit one decoder on the pooled training split, score each tss bin.
 
@@ -147,7 +158,7 @@ def by_tss(z, y, seq_id, tss, ks, kind="linear", mask=None, seed=0,
     z, y, seq_id, tss, te = z[m], y[m], seq_id[m], tss[m], te[m]
     if te.all() or (~te).all() or len(np.unique(y[~te])) < 2:
         return [np.nan] * len(ks)
-    model = _clf(kind, seed).fit(z[~te], y[~te])
+    model = _clf(seed).fit(z[~te], y[~te])
     out = []
     for k in ks:
         sel = te & (tss == k)

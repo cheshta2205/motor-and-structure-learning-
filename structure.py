@@ -53,8 +53,10 @@ import numpy as np
 import torch
 
 import model as M
-from task import (GRID_SIZE, SEQ_LEN, STAY_PROB, RHO, TSS_MIN, DT, LAMBDA,
-                  S_SCALE, N_TRAIN, BATCH, EPOCHS, LR, rot_mat, refl_mat)
+from task import (POS_LIM, SEQ_LEN, STAY_PROB, RHO, TSS_MIN, DT, MASS, V_MAX,
+                  DAMPING, N_TRAIN, BATCH, EPOCHS, LR,
+                  rot_mat, refl_mat, env_step_ab, next_action,
+                  initial_action)
 from data import GAUSS_SD
 from decode import seq_split
 
@@ -62,9 +64,6 @@ FAMILIES = {
     "rotation": {"train": [0.0, 45.0, 90.0],
                  "test": np.arange(-30.0, 121.0, 5.0),
                  "unit": "deg", "label": r"rotation angle $\theta$ (deg)"},
-    "drift":    {"train": [0.4, 0.8, 1.2],
-                 "test": np.round(np.arange(0.0, 1.61, 0.05), 3),
-                 "unit": "", "label": "drift magnitude $d$"},
     # Same sweep as rotation so the two are directly comparable: same units,
     # same anchors, same held-out values.  The difference is that reflection is
     # orientation-REVERSING (det -1) and its angular offset depends on the
@@ -72,15 +71,46 @@ FAMILIES = {
     "reflection": {"train": [0.0, 45.0, 90.0],
                    "test": np.arange(-30.0, 121.0, 5.0),
                    "unit": "deg", "label": r"mirror-line angle $\phi$ (deg)"},
-    # Curl gain.  Bounded by stability, not by taste: the iteration matrix has
-    # spectral radius sqrt(LAMBDA^2 + k^2 + 2*LAMBDA*k*cos(90deg)) =
-    # sqrt(0.09 + k^2), which reaches 1 at k = 0.954.  The sweep stops at 0.9
-    # (radius 0.949); anything past that diverges and the comparison would be
-    # measuring blow-up rather than structure.
-    "curl":     {"train": [0.25, 0.5, 0.75],
-                 "test": np.round(np.arange(0.0, 0.91, 0.05), 3),
+    # DRAG AND CURL ARE NO LONGER CONTEXTS, and sweeping them here is now a
+    # GENERALIZATION probe rather than an interpolation one.  The context set
+    # is flat -- rotations and reflections only -- and a light drag is baked
+    # into the plant, so a circuit trained on it has never seen a
+    # velocity-dependent field VARY.  Asking whether it nonetheless represents
+    # a curl gain as an axis is a strictly harder question than the rotation
+    # sweep, and the two should not be read as the same test.
+    #
+    # Both sweeps ride ON TOP of the plant's constant DAMPING, so `drag` here
+    # means EXTRA drag beyond it and 0.0 means the plant's own value.
+    "drag":     {"train": [0.5 * float(DAMPING), float(DAMPING),
+                           2.0 * float(DAMPING)],
+                 "test": np.round(np.arange(0.0, 2.51 * DAMPING, DAMPING / 8), 2),
+                 "unit": "", "label": "extra drag coefficient $b$"},
+    "curl":     {"train": [10.0, 20.0, 30.0],
+                 "test": np.round(np.arange(0.0, 75.1, 2.5), 2),
                  "unit": "", "label": "curl gain $k$"},
 }
+
+
+def speed_diagnostics(family, params, n_seqs=40, seed=0):
+    """Mean speed and cap-saturated fraction at each parameter value.
+
+    REPORT THIS BESIDE ANY SWEEP RESULT.  The field factor is only identifiable
+    while the agent is moving and below the cap -- at |v| = 0 only the aim
+    levels separate (4 modes of 16) and at |v| = V_MAX the contexts merge again
+    (13 of 16).  Curl's sweep leaves that band at the top by saturating, drag's
+    by stalling, and in both cases the accuracy drop looks identical to a
+    failure to extrapolate.  Reporting it makes the difference visible instead
+    of arguable.
+    """
+    out = []
+    for p in np.atleast_1d(np.asarray(params, dtype=float)):
+        tr, _ = gen(family, [float(p)], n_seqs, seed=seed, switch=False)
+        spd = np.sqrt((tr[..., 8:10].numpy() ** 2).sum(-1))
+        out.append((float(p), float(spd.mean()),
+                    float(np.mean(spd >= V_MAX * 0.999))))
+    return out
+
+
 def out_dir(seed):
     """figures/main/seed<N>/ -- the same folders as every other figure.
 
@@ -94,38 +124,57 @@ def out_dir(seed):
     return M.fig_dir("main", seed)
 
 
-def force(family, param, action, vel=None):
-    """The perturbation, matching task.env_step's conventions exactly.
+def matrices(family, param):
+    """(A, B) for a continuous parameter, in task's own F = A a + B v form.
 
-    curl needs the current velocity -- it is the one family whose force depends
-    on the state rather than only on the action, which is also why it is the one
-    with a stability bound.
+    This is the whole point of the rewrite: the families ARE the two factors of
+    the factorial, swept continuously instead of at four levels.  rotation and
+    reflection move A with B = 0; drag and curl move B with A = I.  Feeding
+    these to task.env_step_ab means the sweep runs on the SAME plant as
+    everything else rather than on a copy -- structure.py used to carry its own
+    integration, and that copy still had the damping term and the [0, GRID]
+    clip long after both were removed from the task.
     """
+    I = np.eye(2, dtype=np.float32)
+    Z = np.zeros((2, 2), dtype=np.float32)
     if family == "rotation":
-        return rot_mat(np.deg2rad(param)) @ action
+        return rot_mat(np.deg2rad(param)), Z
     if family == "reflection":
-        return refl_mat(np.deg2rad(param)) @ action
+        return refl_mat(np.deg2rad(param)), Z
     if family == "curl":
-        return action + param * (rot_mat(np.pi / 2) @ vel)
-    return action + param * np.array([1.0, 0.0], dtype=np.float32)
+        # the exact discrete rotation, not param * R(90): the naive form is
+        # expansive under explicit Euler and the sweep would measure the cap
+        return I, (MASS * (rot_mat(param / MASS) - I)).astype(np.float32)
+    if family == "drag":
+        return I, (-param * I).astype(np.float32)
+    raise KeyError(f"unknown family {family!r}; known: {list(FAMILIES)}")
 
 
 def gen(family, params, n_seqs, seed=0, seq_len=SEQ_LEN, switch=True,
         stay=STAY_PROB, rho=RHO):
-    """Sequences over a set of parameter values, in the (N, T, 6) format
+    """Sequences over a set of parameter values, in the (N, T, 10) format
     model.build expects.  switch=False holds one value for the whole sequence.
+
+    VELOCITY IS STORED, not reconstructed from positions -- see data.py: the
+    identity pos' = pos + vel'*DT is exact in the interior but wrong at a wall,
+    and all the context information lives in the velocity.
+
+    NOISE IS ON.  env_step_ab gets the sequence rng, so these sequences carry
+    the same command noise the main task does.  Without it an ideal observer
+    identifies the parameter from two steps and the whole question of whether
+    structure is learned over time becomes moot.
 
     The action process is AR(1) Gaussian and is NOT reset at a switch, exactly
     as in data.generate_sequences -- resetting it would leak the switch time.
     """
     rng = np.random.default_rng(seed)
-    sd = np.sqrt(1 - rho ** 2)
     P = np.asarray(params, dtype=float)
+    mats = [matrices(family, float(p)) for p in P]
     T_, L_ = [], []
     for _ in range(n_seqs):
-        pos = rng.uniform(.25 * GRID_SIZE, .75 * GRID_SIZE, 2).astype(np.float32)
+        pos = rng.uniform(-0.5 * POS_LIM, 0.5 * POS_LIM, 2).astype(np.float32)
         vel = np.zeros(2, np.float32)
-        a = rng.normal(0.0, GAUSS_SD, 2).astype(np.float32)
+        a = initial_action(rng)
         k = int(rng.integers(len(P)))
         st, lb = [], []
         for t in range(seq_len):
@@ -133,14 +182,13 @@ def gen(family, params, n_seqs, seed=0, seq_len=SEQ_LEN, switch=True,
                 nxt = int(rng.integers(len(P) - 1))
                 k = nxt + (nxt >= k)
             if t > 0:
-                eps = rng.normal(0.0, GAUSS_SD, 2).astype(np.float32)
-                a = (rho * a + sd * eps).astype(np.float32)
-            F = force(family, P[k], a, vel)
-            vel_new = LAMBDA * vel + F
-            pos_new = np.clip(pos + DT * vel_new, 0.0, GRID_SIZE)
-            st.append([pos[0], pos[1], a[0], a[1], pos_new[0], pos_new[1]])
+                a = next_action(a, rng, rho=rho)
+            A, B = mats[k]
+            pos_new, vel_new, _F = env_step_ab(pos, vel, a, A, B, rng)
+            st.append([pos[0], pos[1], vel[0], vel[1], a[0], a[1],
+                       pos_new[0], pos_new[1], vel_new[0], vel_new[1]])
             lb.append(P[k])
-            pos, vel = pos_new.astype(np.float32), vel_new.astype(np.float32)
+            pos, vel = pos_new, vel_new
         T_.append(st); L_.append(lb)
     return (torch.tensor(np.array(T_), dtype=torch.float32),
             np.array(L_, dtype=float))

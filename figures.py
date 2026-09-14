@@ -4,7 +4,7 @@ figures.py -- every figure we need.
 SIX PER SEED, into figures/<arm>/seed<N>/ :
 
   epoch_curves.png      training history: MSE and per-family decoding vs epoch
-  tss_curves.png        PER FAMILY vs steps-since-switch: prediction MSE against
+  tss_curves.png        PER FACTOR LEVEL vs steps-since-switch: velocity MSE against
                         that family's two oracle rungs, and its decoding curve
                         -- how fast the circuit recovers after a switch
   ablation.png          THE MAIN FIGURE.  intact / zero e / shuffle e, decoding
@@ -28,9 +28,12 @@ and ask which member it is -- chance 1/4.  The last two do not: "which family?"
 systematically optimistic, because MTL itself has to infer the family.  The
 16-way readout is the honest one and the ablation looks much larger there.
 
-LINEAR DECODERS ONLY.  An MLP was run alongside throughout and sat on top of the
-linear curve, so the question it answered -- is the code linearly readable, or
-merely present -- is settled.  Plotting both now costs clarity and adds nothing.
+LINEAR DECODERS ONLY, and the MLP code is now GONE rather than merely unplotted.
+It ran alongside every linear decode throughout the earlier work and sat on top
+of the linear curve, so the question it answered -- is the code linearly
+readable, or merely present -- came back settled.  It also dominated the cost
+(~40x per fit, 16.5s against 0.4s), which is what made these figures slow
+enough to avoid running.  See decode._clf.
 """
 import argparse
 import os
@@ -41,13 +44,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.lines import Line2D
+from plotting_utils import set_plt_params, make_axis_nice
 
 import model as M
 import oracle as O
 from data import generate_sequences
 from decode import by_tss, family_by_tss
-from task import (CONTEXTS, N_CONTEXTS, FAMILY, FAMS, DT, LAMBDA, S_SCALE,
-                  TSS_MIN, RHO, force_of)
+from task import (CONTEXTS, N_CONTEXTS, FAMILY, FAM_NAMES, DT, MASS,
+                  POS_SCALE, VEL_SCALE, POS_LIM, TSS_MIN, RHO, force_of)
 
 N_SEQ    = 1200
 N_SPLITS = 8
@@ -59,9 +63,12 @@ COND = [("intact", "intact", "#1a1a1a", "-"),
         ("zero", "$e$ zeroed", "#c0392b", "-"),
         ("shuffle", "$e$ shuffled", "#e67e22", "--"),
         ("mtl_noise", "MTL noise", "#7f8c8d", ":")]
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b",
-        "drift": "#1e8449", "curl": "#8e44ad"}
-READOUTS = FAMS + ["family", "all"]
+FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b"}
+# ONE grouping: the design is flat again, so a "level" is a family.
+LEVELS = list(FAM_NAMES)
+LEVEL_INDEX = {n: i for i, n in enumerate(FAM_NAMES)}
+# decode the context within each family, decode the family, decode all 16
+READOUTS = LEVELS + ["family", "all"]
 ARM_TITLE = {"main": "main (MTL denied $s_t$)",
              "control": "control (MTL given $s_t$)"}
 
@@ -72,9 +79,21 @@ def _handles():
 
 
 def _chance(readout):
+    """Chance for each readout.
+
+    A context decode WITHIN one family is over that family's members, so
+    chance is 1/8 rather than the 1/4 the crossed design had.
+    """
     if readout == "all":
         return 1.0 / N_CONTEXTS
-    return 1.0 / len(FAMS) if readout == "family" else 0.25
+    if readout == "family":
+        return 1.0 / len(FAM_NAMES)
+    return len(FAM_NAMES) / N_CONTEXTS
+
+
+def _level_mask(d, name):
+    """Boolean mask selecting one family out of a rollout dict."""
+    return d["fam"] == LEVEL_INDEX[name]
 
 
 def _despine(a):
@@ -107,10 +126,20 @@ def collect(arm, seed, n=N_SEQ):
         with torch.no_grad():
             z, pred, tgt = M.rollout(ec, cb, trans, arm, mode,
                                      torch.Generator().manual_seed(0))
+        e = (pred[:, :-1] - tgt[:, :-1]) ** 2
+        # VELOCITY, NOT POSITION.  `se` was the position half, which under this
+        # plant is the LEAST informative thing available: pos' = pos + vel'*DT,
+        # so echoing the input scores R2 = 0.9966 and 99.7% of the metric is
+        # free.  Every ablation then looked similar because the metric was
+        # mostly measuring a copy.  All the context lives in the velocity --
+        # see multimodality.position_invariance -- so that is what `se` is.
         out[mode] = {"z": z.numpy(), "pred": pred.numpy(),
-                     "se": ((pred[:, :-1, :2] - tgt[:, :-1, :2]) ** 2)
-                            .mean(-1).numpy()}
+                     "se": e[..., 2:].mean(-1).numpy(),
+                     "se_pos": e[..., :2].mean(-1).numpy()}
         out[mode]["mse"] = float(out[mode]["se"].mean())
+        # kept for the convergence check: the two should sit in the ratio
+        # (VEL_SCALE/POS_SCALE)^2 once the heads tie -- see model.ALPHA
+        out[mode]["mse_pos"] = float(out[mode]["se_pos"].mean())
         print(f"    [{arm} seed {seed}] {mode} rolled out", flush=True)
     return out
 
@@ -123,16 +152,18 @@ def curves(d):
         zf = d[mode]["z"].reshape(-1, d[mode]["z"].shape[-1])
         for r in READOUTS:
             y = d["fam"] if r == "family" else d["cid"]
-            mask = (d["fam"].ravel() == FAMS.index(r)) if r in FAMS else None
+            mask = _level_mask(d, r).ravel() if r in LEVELS else None
             runs = [by_tss(zf, y.ravel(), d["sid"].ravel(), d["tss"].ravel(),
-                           KS, "linear", mask=mask, seed=s)
+                           KS, mask=mask, seed=s)
                     for s in range(N_SPLITS)]
             R = np.array(runs, float)
             res[(mode, r)] = (np.nanmean(R, 0), np.nanstd(R, 0))
-        # family DERIVED from the 16-way decoder -- see decode.family_by_tss
-        fam_of = np.array([FAMILY[c] for c in range(N_CONTEXTS)])
+        # each FACTOR derived from the 16-way decoder -- see decode.family_by_tss.
+        # Both, because a code can support one factor and not the other, which
+        # is exactly the case the crossed design exists to expose.
+        grp = np.array([FAMILY[c] for c in range(N_CONTEXTS)])
         runs = [family_by_tss(zf, d["cid"].ravel(), d["fam"].ravel(),
-                              d["sid"].ravel(), d["tss"].ravel(), KS, fam_of,
+                              d["sid"].ravel(), d["tss"].ravel(), KS, grp,
                               seed=s) for s in range(N_SPLITS)]
         R = np.array(runs, float)
         res[(mode, "family_derived")] = (np.nanmean(R, 0), np.nanstd(R, 0))
@@ -186,7 +217,7 @@ def fig_mtl_control(arm, seed, r, path):
                  + ttl, fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.90))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fig.savefig(path, dpi=170); plt.close(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"    saved -> {path}", flush=True)
 
 
@@ -201,7 +232,7 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
     ax[0].bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62)
     ax[0].set_xticks(range(len(COND)))
     ax[0].set_xticklabels([l for _, l, _, _ in COND], fontsize=8.5)
-    ax[0].set_ylabel("position MSE")
+    ax[0].set_ylabel("velocity MSE")
     ax[0].set_title("prediction", fontsize=10)
     for k, v in enumerate(ms):
         ax[0].text(k, v * 1.02, f"{v:.4f}", ha="center", fontsize=7.5)
@@ -216,15 +247,18 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
         a.text(KS[-1], ch + .015, f"chance {ch:.2f}", fontsize=6.5,
                color="#888", ha="right")
         a.set_ylim(0, 1.05)
-        ttl = {"family": "which family?", "all": f"which context?  (all {N_CONTEXTS})"}
+        # LEVEL readouts are coloured by their level; the three WHOLE-FACTOR
+        # readouts (aim / field / all contexts) are not levels and have no
+        # entry in FCOL, so they take the neutral colour
+        ttl = {"family": "which family?",
+               "all": f"which context?  (all {N_CONTEXTS})"}
         a.set_title(ttl.get(ro, ro), fontsize=11,
-                    color="#1a1a1a" if ro in ttl else FCOL[ro])
+                    color="#1a1a1a" if ro in ttl else FCOL.get(ro, "#1a1a1a"))
         a.set_xlabel("steps since context switch")
         if i == 0:
             a.set_ylabel("linear decoding of context")
-        if ro in ("family", "all"):
-            a.set_ylabel(f"linear decoding, {'family' if ro=='family' else 'all contexts'}",
-                         fontsize=9)
+        if ro in ttl:
+            a.set_ylabel(f"linear decoding, {ttl[ro]}", fontsize=9)
     for a in ax:
         _despine(a)
     fig.legend(handles=_handles(), ncol=3, frameon=False, fontsize=10,
@@ -239,23 +273,30 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)} -- is the cerebellar error necessary?\n"
                  f"{sub}", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .91))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
 def fig_global(arm, seed, r, path):
-    """The two readouts that are NOT handed the family, on their own."""
+    """The readouts that are NOT handed a factor level, on their own.
+
+    THREE PANELS NOW, NOT TWO.  "which family" was one question; a crossing
+    poses two, and they are answered to very different degrees -- on the first
+    trained circuit the aim decodes at 0.88 and the field at 0.40 -- so
+    collapsing them into one curve would hide the main finding.
+    """
     keys = ["family", "all"]
     fig, ax = plt.subplots(1, 2, figsize=(10.6, 4.6))
-    ttl = {"family": "which FAMILY?   rotation / reflection / drift / curl",
+    ttl = {"family": "which FAMILY?   " + " / ".join(FAM_NAMES),
            "all": f"which CONTEXT?   all {N_CONTEXTS}"}
     for i, k in enumerate(keys):
         for mode, lab, col, ls in COND:
             mu, sd = r[(mode, k)]
             ax[i].plot(KS, mu, ls, color=col, marker="o", ms=4, lw=1.8)
             ax[i].fill_between(KS, mu - sd, mu + sd, color=col, alpha=.20, lw=0)
-            if k == "family" and (mode, "family_derived") in r:
-                mu2, _ = r[(mode, "family_derived")]
+            if k == "family" and (mode, f"{k}_derived") in r:
+                mu2, _ = r[(mode, f"{k}_derived")]
                 ax[i].plot(KS, mu2, ":", color=col, marker="^", ms=4, lw=1.5,
                            alpha=.85)
         ch = _chance(k)
@@ -269,23 +310,22 @@ def fig_global(arm, seed, r, path):
         _despine(ax[i])
     h = _handles() + [
         Line2D([], [], color="#555", ls="-", marker="o", ms=4, lw=1.8,
-               label="family: direct 4-way fit"),
+               label="factor: direct 4-way fit"),
         Line2D([], [], color="#555", ls=":", marker="^", ms=4, lw=1.5,
-               label="family: derived from the 16-way fit")]
+               label="factor: derived from the 16-way fit")]
     fig.legend(handles=h, ncol=3, frameon=False, fontsize=9,
-               loc="upper center", bbox_to_anchor=(.5, .93))
-    band = ("band is $\\pm$1 SD ACROSS TRAINING SEEDS"
-            if str(seed).startswith("pooled")
-            else f"band is $\\pm$1 SD across {N_SPLITS} decoder splits")
+               loc="upper center", bbox_to_anchor=(.5, .90))
+    band = ("$\\pm$1 SD across TRAINING SEEDS" if str(seed).startswith("pooled")
+            else f"$\\pm$1 SD across {N_SPLITS} decoder splits")
+    # ONE line, not three.  Three suptitle lines plus a legend overlapped into
+    # unreadable text at this figure size; the detail belongs in the docstring.
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}"
                  f"{'  (' + str(seed) + ')' if str(seed).startswith('pooled') else ''}"
-                 f": context decoding WITHOUT being told the family\n"
-                 f"the decoder faces the same problem MTL does -- nothing is "
-                 f"given away;  {band}.\nDotted: family is not linearly "
-                 f"separable as 4 regions (each is 4 clusters), but $z$ still "
-                 f"determines it.", fontsize=9.5)
-    fig.tight_layout(rect=(0, 0, 1, .84))
-    fig.savefig(path, dpi=170); plt.close(fig)
+                 f" -- context decoding, nothing given away;  band {band}",
+                 fontsize=10, y=0.99)
+    make_axis_nice(fig)
+    fig.tight_layout(rect=(0, 0, 1, .80))
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -306,9 +346,11 @@ def fig_tss(arm, seed, d, path):
     lad = O.load()
     fig, ax = plt.subplots(1, 2, figsize=(11.2, 4.3))
     se = d["intact"]["se"]
-    fam, tc = d["fam"][:, :-1], d["tss"][:, :-1]
-    for i, f in enumerate(FAMS):
-        m = fam == i
+    tc = d["tss"][:, :-1]
+    for i, f in enumerate(LEVELS):
+        # se and tc are (B, T-1) -- the last step has no target -- so the mask
+        # has to be sliced to match.  _level_mask returns the full (B, T).
+        m = _level_mask(d, f)[:, :-1]
         y = [se[m & (tc == k)].mean() if (m & (tc == k)).sum() else np.nan
              for k in KS]
         ax[0].plot(KS, y, "o-", ms=4, color=FCOL[f], label=f)
@@ -327,15 +369,15 @@ def fig_tss(arm, seed, d, path):
         print("  (no oracle ladder -- run `python oracle.py`; rungs omitted)")
     ax[0].set_yscale("log")
     ax[0].set_xlabel("steps since context switch")
-    ax[0].set_ylabel("held-out position MSE")
+    ax[0].set_ylabel("held-out velocity MSE")
     ax[0].set_title("prediction error, per family", fontsize=10)
     ax[0].legend(frameon=False, fontsize=7.5)
 
     zf = d["intact"]["z"].reshape(-1, d["intact"]["z"].shape[-1])
-    for i, f in enumerate(FAMS):
+    for i, f in enumerate(LEVELS):
         ax[1].plot(KS, by_tss(zf, d["cid"].ravel(), d["sid"].ravel(),
-                              d["tss"].ravel(), KS, "linear",
-                              mask=(d["fam"].ravel() == i)),
+                              d["tss"].ravel(), KS,
+                              mask=_level_mask(d, f).ravel()),
                    "o-", ms=4, color=FCOL[f], label=f)
     ax[1].axhline(.25, ls=":", color="#555", lw=1)
     ax[1].text(KS[-1], .265, "chance 0.25", fontsize=7.5, color="#888", ha="right")
@@ -350,8 +392,9 @@ def fig_tss(arm, seed, d, path):
         f"{ARM_TITLE.get(arm, arm)}  (AR(1), rho={RHO}).  x is time since "
         f"switch, not epoch:\ntss=0 is the step the context changes, where MTL "
         f"is at chance by construction.", fontsize=10)
+    make_axis_nice(fig)
     fig.tight_layout(rect=(0, 0, 1, .88))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -367,16 +410,20 @@ def fig_epochs(arm, seed, path):
     ep = np.arange(1, len(z["hist"]) + 1)
     ax[0].plot(ep, z["hist"], color="#1a1a1a", lw=1.6, label="overall")
     pf = z["per_fam"]
-    for i, f in enumerate(FAMS[:pf.shape[1]]):
+    for i, f in enumerate(LEVELS[:pf.shape[1]]):
         ax[0].plot(ep, pf[:, i], color=FCOL[f], lw=1.2, label=f)
     ax[0].set_yscale("log"); ax[0].set_xlabel("epoch")
-    ax[0].set_ylabel("held-out position MSE")
+    ax[0].set_ylabel("held-out velocity MSE")
     ax[0].legend(frameon=False, fontsize=8)
-    for f in FAMS:
-        k = f"{f}_linear"
-        if k in z.files:
-            ax[1].plot(z["dec_ep"], z[k], "o-", ms=3, color=FCOL[f], label=f)
-    ax[1].axhline(.25, ls=":", color="#888", lw=1)
+    for f in LEVELS:
+        # track() writes the level name ALONE.  It was "<level>_linear" while an
+        # MLP decoder existed alongside; dropping the MLP dropped the suffix.
+        if f in z.files:
+            ax[1].plot(z["dec_ep"], z[f], "o-", ms=3, color=FCOL[f], label=f)
+    # within a family the decode is over that family's members, so chance is
+    # 1/members -- not a hardcoded 0.25, which was right only when the families
+    # happened to have four members each
+    ax[1].axhline(len(FAM_NAMES) / N_CONTEXTS, ls=":", color="#888", lw=1)
     ax[1].set_ylim(0, 1.03); ax[1].set_xlabel("epoch")
     ax[1].set_ylabel("within-family linear decoding")
     ax[1].legend(frameon=False, fontsize=8)
@@ -385,7 +432,8 @@ def fig_epochs(arm, seed, path):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: training history (seed {seed})",
                  fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .92))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -398,19 +446,26 @@ def fig_forces(arm, seed, d, path):
     zero, so the curl family contributes exactly `a` to that mean whatever the
     velocity -- the vel=0 default is exact here, not an approximation.
     """
-    trans = d["trans"]
-    p = trans[:, :, :2].numpy(); a = trans[:, :, 2:4].numpy()
-    nxt = trans[:, :, 4:6].numpy()
-    v = np.zeros_like(p); v[:, 1:] = (p[:, 1:] - p[:, :-1]) / DT
-    Ft = (nxt - p) / DT - LAMBDA * v
+    trans = np.asarray(d["trans"])
+    p = trans[:, :, 0:2]; v = trans[:, :, 2:4]
+    a = trans[:, :, 4:6]
+    nxt_p = trans[:, :, 6:8]; nxt_v = trans[:, :, 8:10]
+    # F = MASS (v' - v) / DT, read from the STORED velocities.  Differencing
+    # positions would give the same answer in the interior and the wrong one at
+    # a wall, where the position clips and the velocity is zeroed.
+    Ft = MASS * (nxt_v - v) / DT
     Fb = np.stack([[np.mean([force_of(aa, k) for k in range(N_CONTEXTS)], 0)
                     for aa in row] for row in a])
-    pr = d["intact"]["pred"][..., :2] / S_SCALE
-    Fc = (pr - p) / DT - LAMBDA * v
-    keep = d["tss"] >= TSS_MIN
-    fig, ax = plt.subplots(1, len(FAMS), figsize=(4.35 * len(FAMS), 4.0))
-    for i, fm in enumerate(FAMS):
-        m = keep & (d["fam"] == i)
+    # the prediction is in build()'s scaled units; undo the VELOCITY scale
+    # collect() stores numpy, not tensors
+    pr_v = np.asarray(d["intact"]["pred"])[..., 2:] / VEL_SCALE
+    Fc = MASS * (pr_v - v) / DT
+    # drop wall steps: there the plant zeroed v' and F is not recoverable
+    interior = np.all(np.abs(nxt_p) < POS_LIM - 1e-6, axis=-1)
+    keep = (d["tss"] >= TSS_MIN) & interior
+    fig, ax = plt.subplots(1, len(LEVELS), figsize=(3.6 * len(LEVELS), 4.0))
+    for i, fm in enumerate(LEVELS):
+        m = keep & _level_mask(d, fm)
         A, B = ang(Fc, Ft)[m], ang(Fb, Ft)[m]
         bins = np.linspace(0, 180, 37)
         ax[i].hist(B, bins, color="#7f8c8d", alpha=.55,
@@ -427,106 +482,17 @@ def fig_forces(arm, seed, d, path):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)} -- does CB's predicted force track "
                  f"the context?", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .9))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
-def mlp_curves(d, n_splits=3):
-    """Per-family MLP decoding vs tss, for every condition.
-
-    Separated out because MLP fits are ~40x slower than linear (16.5 s vs 0.4 s
-    for a 4-way family fit), so they run at n_splits=3 against linear's 8 and
-    are computed ONCE here, then reused by both figures that need them.
-    """
-    out = {}
-    zs = {m: d[m]["z"].reshape(-1, d[m]["z"].shape[-1]) for m, _, _, _ in COND}
-    for mode, _, _, _ in COND:
-        for i, f in enumerate(FAMS):
-            runs = [by_tss(zs[mode], d["cid"].ravel(), d["sid"].ravel(),
-                           d["tss"].ravel(), KS, "mlp",
-                           mask=(d["fam"].ravel() == i), seed=sp)
-                    for sp in range(n_splits)]
-            out[(mode, f)] = np.nanmean(np.array(runs, float), 0)
-        print(f"    mlp: {mode} done", flush=True)
-    return out
-
-
-def fig_decoding_curves(arm, seed, r, mlp, path):
-    """What can be read out of z: the same four families under each decoder.
-
-    INTACT only -- the ablation lives in ablation.png.  Two panels rather than
-    one overlay so the families stay legible; the point is that the two panels
-    look the same, i.e. the context is not merely present in z but linearly
-    readable.
-    """
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4.3), sharey=True)
-    for j, (kind, lab) in enumerate((("linear", "linear decoder"),
-                                     ("mlp", "MLP decoder"))):
-        for i, f in enumerate(FAMS):
-            y = r[("intact", f)][0] if kind == "linear" else mlp[("intact", f)]
-            ax[j].plot(KS, y, "o-", ms=4, color=FCOL[f],
-                       label=f if j == 0 else None)
-        ax[j].axhline(.25, ls=":", color="#555", lw=1)
-        ax[j].set_ylim(0, 1.03)
-        ax[j].set_xlabel("steps since context switch")
-        ax[j].set_title(lab, fontsize=10)
-        _despine(ax[j])
-    ax[0].set_ylabel("within-family context decoding")
-    ax[0].legend(frameon=False, fontsize=8)
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)}  (AR(1) actions, rho={RHO}) -- "
-                 f"what can be read out of $z$", fontsize=10.5)
-    fig.tight_layout(rect=(0, 0, 1, .9))
-    fig.savefig(path, dpi=170); plt.close(fig)
-    print(f"  saved -> {path}")
-
-
-def fig_linear_vs_mlp(arm, seed, r, mlp, path, n_mlp_splits=3):
-    """Both decoders under ABLATION -- the evidence for plotting linear only.
-
-    The MLP asks whether context is PRESENT in z at all; the linear decoder asks
-    whether it is present in an explicit, linearly readable format.  Those can
-    come apart: an ablation could leave the information intact while destroying
-    the format, and a linear-only figure would then overstate the damage.  This
-    is the check that they do not come apart here -- including under zeroed and
-    shuffled e, which decoding_curves.png does not show.
-    """
-    fig, ax = plt.subplots(1, len(FAMS), figsize=(3.5 * len(FAMS), 4.2))
-    diffs = []
-    for i, f in enumerate(FAMS):
-        for mode, lab, col, ls in COND:
-            mu_lin, mu_mlp = r[(mode, f)][0], mlp[(mode, f)]
-            ax[i].plot(KS, mu_lin, "-", color=col, marker="o", ms=3.5, lw=1.7)
-            ax[i].plot(KS, mu_mlp, ":", color=col, marker="^", ms=4, lw=1.5,
-                       alpha=.9)
-            diffs.append(np.nanmean(np.abs(mu_mlp - mu_lin)))
-        ax[i].axhline(.25, ls=":", color="#888", lw=1)
-        ax[i].set_ylim(0, 1.05)
-        ax[i].set_title(f, fontsize=11, color=FCOL[f])
-        ax[i].set_xlabel("steps since context switch")
-        if i == 0:
-            ax[i].set_ylabel("within-family context decoding")
-        _despine(ax[i])
-    md = float(np.nanmean(diffs))
-    h = _handles() + [
-        Line2D([], [], color="#555", ls="-", marker="o", ms=4, lw=1.7,
-               label=f"linear ({N_SPLITS} splits)"),
-        Line2D([], [], color="#555", ls=":", marker="^", ms=4, lw=1.5,
-               label=f"MLP ({n_mlp_splits} splits)")]
-    fig.legend(handles=h, ncol=5, frameon=False, fontsize=9,
-               loc="upper center", bbox_to_anchor=(.5, .96))
-    fig.suptitle(
-        f"{ARM_TITLE.get(arm, arm)}: why the other figures plot LINEAR only\n"
-        f"the two decoders coincide (mean |MLP - linear| = {md:.3f}), so the "
-        f"context is not merely present in $z$ -- it is linearly readable, and "
-        f"the ablation destroys the format as well as the information.",
-        fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, .85))
-    fig.savefig(path, dpi=170); plt.close(fig)
-    print(f"  saved -> {path}   mean |MLP-linear| = {md:.3f}")
-    return md
-
-
-# ── switch-aligned lesion ────────────────────────────────────────────────────
+# Window around a context switch, for switch_aligned: PRE steps before and
+# POST after, so OFFSETS runs -PRE..POST-1 with 0 the switch step itself.
+# (These sat between two MLP functions and were deleted with them when the MLP
+# decoder was removed by splitting the file on `def` boundaries -- a reminder
+# that a block-level edit takes whatever module-level code happens to follow
+# the block.)
 PRE, POST = 4, 4
 OFFSETS = list(range(-PRE, POST))
 
@@ -565,18 +531,18 @@ def switch_aligned(arm, seed, n=N_SEQ):
             idx = [(i, j + off) for i, j in sw if 0 <= j + off < T]
             bi = np.array([i for i, _ in idx]); bj = np.array([j for _, j in idx])
             Z = zn[bi, bj]; Y = cid[bi, bj]; F = fam[bi, bj]
-            for fi, f in enumerate(FAMS):
-                m = F == fi
+            for f in LEVELS:
+                m = F == LEVEL_INDEX[f]
                 if m.sum() < 60:
                     continue
                 from decode import acc
-                out[(mode, f, off)] = acc(Z[m], Y[m], bi[m], "linear", 0)
+                out[(mode, f, off)] = acc(Z[m], Y[m], bi[m], 0)
     return out
 
 
 def fig_switch(arm, seed, out, path, band=None, n_seed=None):
-    fig, ax = plt.subplots(1, len(FAMS), figsize=(3.4 * len(FAMS), 4.0))
-    for i, f in enumerate(FAMS):
+    fig, ax = plt.subplots(1, len(LEVELS), figsize=(3.4 * len(LEVELS), 4.0))
+    for i, f in enumerate(LEVELS):
         for mode, lab, col, ls in COND:
             if band is None:
                 y = [out.get((mode, f, o), np.nan) for o in OFFSETS]
@@ -601,15 +567,18 @@ def fig_switch(arm, seed, out, path, band=None, n_seed=None):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: $e$ lesioned only in the window shown "
                  f"-- decoding falls on BOTH sides of the switch{tail}", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .86))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
 
 # ── drivers ──────────────────────────────────────────────────────────────────
-def per_seed(arm, seed, with_mlp=False):
+
+
+def per_seed(arm, seed):
     d = collect(arm, seed)
     if d is None:
-        print(f"  no checkpoint for {arm} seed {seed}"); return
+        print(f"  no checkpoint for {arm} seed {seed} "
+              ); return
     out = M.fig_dir(arm, seed)
     r = curves(d)
     np.savez(os.path.join(out, "decoding.npz"),
@@ -625,22 +594,13 @@ def per_seed(arm, seed, with_mlp=False):
     fig_tss(arm, seed, d, os.path.join(out, "tss_curves.png"))
     fig_epochs(arm, seed, os.path.join(out, "epoch_curves.png"))
     fig_forces(arm, seed, d, os.path.join(out, "forces.png"))
-    if with_mlp:
-        mlp = mlp_curves(d)
-        np.savez(os.path.join(out, "mlp.npz"),
-                 ks=np.array(KS, float),
-                 **{f"{m}|{f}": mlp[(m, f)] for m, _, _, _ in COND for f in FAMS})
-        fig_decoding_curves(arm, seed, r, mlp,
-                            os.path.join(out, "decoding_curves.png"))
-        fig_linear_vs_mlp(arm, seed, r, mlp,
-                          os.path.join(out, "linear_vs_mlp.png"))
     sa = switch_aligned(arm, seed)
     if sa:
         np.savez(os.path.join(out, "switch_aligned.npz"),
                  offsets=np.array(OFFSETS),
                  **{f"{m}|{f}": np.array([sa.get((m, f, o), np.nan)
                                           for o in OFFSETS])
-                    for m, _, _, _ in COND for f in FAMS})
+                    for m, _, _, _ in COND for f in LEVELS})
         fig_switch(arm, seed, sa, os.path.join(out, "switch_aligned.png"))
     print(f"\n{arm} seed {seed}, linear decoding, mean +- SD over {N_SPLITS} splits")
     print(f"  {'readout':<11}{'mode':<10}" + "".join(f"{k:>13}" for k in KS))
@@ -694,7 +654,7 @@ def across_seeds(arm, seeds):
     if sw:
         band = {}
         for m, _, _, _ in COND:
-            for f in FAMS:
+            for f in LEVELS:
                 R = np.array([z[f"{m}|{f}"] for z in sw.values()], float)
                 band[(m, f)] = (np.nanmean(R, 0), np.nanstd(R, 0))
         fig_switch(arm, None, None, os.path.join(out, "switch_aligned_seeds.png"),
@@ -713,13 +673,11 @@ if __name__ == "__main__":
     ap.add_argument("--arms", nargs="+", default=list(M.ARMS),
                     help="main (MTL denied s_t) and/or control (MTL given s_t)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
-    ap.add_argument("--mlp", action="store_true",
-                    help="also make linear_vs_mlp.png (slow: ~10 min per seed)")
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed figures")
     a = ap.parse_args()
     for arm in a.arms:
         for s in a.seeds:
-            per_seed(arm, s, with_mlp=a.mlp)
+            per_seed(arm, s)
         if a.pool:
             across_seeds(arm, a.seeds)
