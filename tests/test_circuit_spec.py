@@ -7,7 +7,7 @@ What has to hold:
   a spec in the slot selects tag, path, stamp, rollout distribution and
     figure directory -- the same ones the loose knobs select
   a spec beside conflicting loose knobs is refused, not merged
-  every CLI (run, figures, representation_analysis, conjunctivity) parses the
+  every CLI (run, figures, representation_analysis) parses the
     same four flags into the same spec, with beta/sigma implying noisy
   data.generate_sequences follows the spec's mode and rejects garbage
 """

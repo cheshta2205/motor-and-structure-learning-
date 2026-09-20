@@ -50,11 +50,17 @@ ACTION_MODES = ("gp", "ar1", "iid", "policy")
 
 # ── the "policy" action process: a trained oracle agent's recorded actions ──
 #
-# Built by action_bank.py (which needs sac; data cannot import it). The file
-# holds one action stream, reach after reach in random order, and a stamp that
-# identifies its contents; model.convention_for puts the stamp into every
-# circuit trained on it. Missing bank -> a clear error naming the builder, not
-# a fallback to another process.
+# The file holds one action stream, reach after reach in random order, and a
+# stamp that identifies its contents; model.convention_for puts the stamp into
+# every circuit trained on it. Missing bank -> a clear error, not a fallback to
+# another process.
+#
+# The builder (action_bank.py, which recorded a trained oracle agent's actions)
+# was removed in the 2026-09-20 cleanup: it existed to fix z's collapse under
+# the policy by refitting the circuit on deployment-like actions, and that
+# question closed when the input structure turned out to be controlled by CB's
+# relu-vs-tanh instead. The mode itself still works if you supply a bank; the
+# builder is in git history if you need it back.
 ACTION_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "checkpoints", "action_bank_oracle.npz")
 
@@ -66,9 +72,9 @@ def load_action_bank(path=None):
     path = ACTION_BANK_PATH if path is None else path
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"action_mode='policy' needs the recorded action bank at {path}; "
-            f"build it with `python action_bank.py` (records the oracle agents' "
-            f"actions in their four contexts).")
+            f"action_mode='policy' needs a recorded action bank at {path}. "
+            f"Its builder (action_bank.py) was removed in the 2026-09-20 "
+            f"cleanup; recover it from git history to rebuild one.")
     z = np.load(path)
     return {"actions": np.asarray(z["actions"], dtype=np.float32),
             "episode_start": np.asarray(z["episode_start"]),
@@ -116,9 +122,9 @@ def generate_sequences(n_seqs, seq_len=SEQ_LEN, seed=0, stay=STAY_PROB,
                 bit for bit what the pre-2026-09-16 checkpoints were trained
                 on ("fitted" is the legacy spelling).
       "iid"     the AR(0) control: ar1 at rho = 0.
-      "policy"  windows of a trained oracle agent's recorded actions (the bank
-                action_bank.py writes): the deployment distribution itself,
-                replayed open loop -- see that module. Drawn before the loop
+      "policy"  windows of a trained oracle agent's recorded actions: the
+                deployment distribution itself, replayed open loop -- see the
+                bank section above. Drawn before the loop
                 like a GP draw, so still independent of the context stream.
 
     WHY "gp" EXISTS: the circuit is fitted under one action distribution and

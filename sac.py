@@ -154,8 +154,9 @@ def make_cb_proj(seed: int = 0, device="cpu", n_in: int = None, n_out: int = CB_
 #               INCLUDED. This is the geometry MC actually receives, and the
 #               one to use: the shared component is not inert to learning even
 #               though it carries no context information, because it puts a
-#               shared term in every context's gradient (see center_ec, and
-#               policy_sensitivity's overlap calibration). Measured +0.645 mean
+#               shared term in every context's gradient (see center_ec; the
+#               overlap calibration came from the since-removed
+#               policy_sensitivity probe). Measured +0.645 mean
 #               off-diagonal, which is the "~0.62" the paragraph above cites.
 #   z_centered   the same with that shared component removed: the DISCRIMINATIVE
 #               geometry alone, mean off-diagonal -0.142. The control that
@@ -1585,8 +1586,8 @@ class AblationConfig:
     a large component shared by every context's z puts a large shared
     component in every context's gradient, and a step taken in one context
     then moves the others. z's context means carry 71% of their energy in one
-    common vector, which is the regime policy_sensitivity's calibration shows
-    produces near-total gradient sharing (first-layer overlap ~0.95 for
+    common vector, which is the regime that produces near-total gradient
+    sharing (first-layer overlap ~0.95 for
     collinear codes against ~0.00 for orthogonal ones).
 
     So this is a test of the MECHANISM, not a fix bolted on: it removes the
@@ -1821,7 +1822,7 @@ def circuit_state(pos, vel) -> np.ndarray:
     EC and CB see is scaled.
 
     GETTING IT WRONG IS SILENT AND EXPENSIVE, which is the whole reason this
-    lives in one function that circuit_probe.py also drives through.  When
+    lives in one function that rollout_z also drives through.  When
     sac.py once fed raw positions where model.build fed scaled ones, z's
     context decode fell from 1.00 to 0.28 (chance 0.17) with nothing raising an
     error, and both frozen arms looked exactly like the no-circuit baseline --
@@ -2788,9 +2789,9 @@ assert EVAL_RADIUS + GOAL_RADIUS <= T.POS_LIM, (
 # for reasons unrelated to the policy.
 #
 # Randomising the START DISTRIBUTION is the right thing in a different place:
-# conjunctivity.collect_policy draws starts from sample_pos_goal, so the data
-# the representational bins are built from covers the state space the way the
-# supervised rollout does.  That is a question about the CODE; this is a
+# a representational analysis draws its starts from sample_pos_goal, so the
+# data its bins are built from covers the state space the way the supervised
+# rollout does.  That is a question about the CODE; this is a
 # yardstick for BEHAVIOUR, and they want opposite things.
 EVAL_START_ANYWHERE = False
 EVAL_BATTERY_SEED = 12345
@@ -3102,26 +3103,121 @@ def eval_center_out(trainer, ec, cb, config, context_id, family_idx, *,
     }
 
 
+# ── Driving a frozen circuit, for calibration ─────────────────────────────
+#
+# These two came from circuit_probe.py, which was removed in the 2026-09-20
+# cleanup once its diagnostic half (the context decoder over z) had answered
+# its question: the input-scaling mismatch it was built to catch is fixed, and
+# CB's relu-vs-tanh, not any scaling, turned out to control context learning.
+# The rollout itself is load-bearing and stays -- every frozen-circuit run
+# calibrates against it -- so it lives here now, next to its only callers,
+# which also retires the circular import the split forced.
+
+ROLLOUT_N_EPISODES = 140      # per context; 6 x 140 x 50 steps = 42k rows
+
+
+def rollout_z(arm, ckpt_seed, contexts=None, *, n_episodes=ROLLOUT_N_EPISODES,
+              max_steps=None, seed=0, device="cpu"):
+    """Drive a frozen checkpoint through sac's OWN rollout and collect z.
+
+    Through sac's own step functions -- circuit_state, augmented_obs_step,
+    cb_predict, sample_pos_goal, env_step_params -- rather than a private copy
+    of the loop, so that if sac drives the circuit wrongly this is driven
+    wrongly in the same way. A private copy is exactly how the scaling bug hid:
+    it kept reading a 1.00 decode while training quietly read 0.28.
+
+    Actions are uniform random -- what run_sac itself takes before
+    learning_starts, and the distribution the circuit has to work on while the
+    policy is still exploring.
+
+    Returns arrays aligned on one row per (episode, step):
+      z, cb_h2, base_obs, y (context index), episode, t
+
+    cb_h2 is the CB hidden state AS THE OBSERVATION SAW IT -- one step stale,
+    zero on an episode's first step -- so it is also what the fixed input
+    scales must be calibrated against (see source_rms).
+    """
+    contexts = list(PHASE_CONTEXT_IDS if contexts is None else contexts)
+    max_steps = MAX_STEPS if max_steps is None else max_steps
+
+    config = AblationConfig(name="probe", use_ec=True, use_cb=True,
+                            freeze=True, arm=arm)
+    cb_proj = make_cb_proj(seed, device)
+    ec, cb = M.load(arm, ckpt_seed)
+    freeze_module(ec)
+    freeze_module(cb)
+
+    rng = np.random.default_rng(seed)
+    z_rows, h2_rows, base_rows, y, episode, step = [], [], [], [], [], []
+
+    for ctx_i, context_id in enumerate(contexts):
+        for ep in range(n_episodes):
+            pos, goal = sample_pos_goal(rng)
+            vel_sim = np.zeros(2, dtype=np.float32)
+            vel_obs = np.zeros(2, dtype=np.float32)
+            h = torch.zeros(1, EC_HIDDEN, device=device)
+            s_tm1 = torch.zeros(1, SDIM, device=device)
+            a_tm1 = torch.zeros(1, ACTION_DIM, device=device)
+            s_t = torch.tensor(circuit_state(pos, vel_obs),
+                               device=device).unsqueeze(0)
+            e_t = torch.zeros(1, SDIM, device=device)
+            cb_h2 = torch.zeros(1, CB_HIDDEN, device=device)
+
+            for t in range(max_steps):
+                obs, z_t, h = augmented_obs_step(
+                    ec, config, h, s_tm1, a_tm1, s_t, e_t, cb_h2, cb_proj,
+                    pos, vel_obs, goal, None, device)
+                z_rows.append(z_t.squeeze(0).detach().cpu().numpy())
+                h2_rows.append(cb_h2.squeeze(0).detach().cpu().numpy())
+                base_rows.append(obs[:SDIM + 2].copy())
+                y.append(ctx_i)
+                episode.append(ctx_i * 1_000_000 + ep)
+                step.append(t)
+
+                action = rng.uniform(-1.0, 1.0, size=ACTION_DIM).astype(np.float32)
+                action_t = torch.tensor(action, device=device).unsqueeze(0)
+                pos_new, vel_sim = env_step_params(
+                    pos, vel_sim, action, context_id, rng)
+                vel_obs_new = ((pos_new - pos) / DT).astype(np.float32)
+
+                s_pred, cb_h2 = cb_predict(cb, s_t, action_t, z_t, device)
+                s_next = torch.tensor(circuit_state(pos_new, vel_obs_new),
+                                      device=device).unsqueeze(0)
+                s_tm1, a_tm1, s_t = s_t, action_t, s_next
+                e_t = s_next - s_pred
+                pos, vel_obs = pos_new, vel_obs_new
+
+    return {"z": np.asarray(z_rows, dtype=np.float32),
+            "cb_h2": np.asarray(h2_rows, dtype=np.float32),
+            "base_obs": np.asarray(base_rows, dtype=np.float32),
+            "y": np.asarray(y), "episode": np.asarray(episode),
+            "t": np.asarray(step)}
+
+
+# circuit_probe also carried source_rms, which calibrated the per-source input
+# scales KIN_RMS / EC_STATE_RMS / CB_STATE_RMS. Those constants are gone --
+# per-channel POS_SCALE/VEL_SCALE in circuit_state replaced the whole scheme --
+# so it had no remaining caller and was dropped with the rest.
+
+
 # ── Per-seed training loop ────────────────────────────────────────────────
 
 def calibrate_ec_offset(config: AblationConfig, *, n_episodes=10, max_steps=30,
                         device="cpu") -> np.ndarray:
     """Mean z_ec over a random-action rollout across the phase contexts.
 
-    Reuses circuit_probe.rollout_z rather than rolling out here, so the
-    calibration is driven through sac's own step functions and cannot drift
-    from what training does. Imported inside the function because
-    circuit_probe imports sac at module level.
+    Reuses rollout_z rather than rolling out here, so the calibration is
+    driven through sac's own step functions and cannot drift from what
+    training does.
     """
     if not config.use_ec:
         return np.zeros(0, dtype=np.float32)
     if not config.freeze:
         raise ValueError("center_ec is only defined for a frozen circuit; an "
                          "end-to-end EC moves under a fixed offset")
-    import circuit_probe
-    data = circuit_probe.rollout_z(config.arm, config.arm_seed,
-                                    n_episodes=n_episodes, max_steps=max_steps,
-                                    device=device)
+    data = rollout_z(config.arm, config.arm_seed,
+                     n_episodes=n_episodes, max_steps=max_steps,
+                     device=device)
     keep = data["t"] > 0        # t=0 has a reset hidden state and a zero error
     return data["z"][keep].mean(0).astype(np.float32)
 
@@ -3136,10 +3232,9 @@ def calibrate_ec_stats(config: AblationConfig, *, n_episodes=10, max_steps=30,
     if not config.freeze:
         raise ValueError("normalize_circuit is only defined for a frozen "
                          "circuit; an end-to-end EC moves under fixed stats")
-    import circuit_probe
-    data = circuit_probe.rollout_z(config.arm, config.arm_seed,
-                                    n_episodes=n_episodes, max_steps=max_steps,
-                                    device=device)
+    data = rollout_z(config.arm, config.arm_seed,
+                     n_episodes=n_episodes, max_steps=max_steps,
+                     device=device)
     keep = data["t"] > 0
     z = data["z"][keep]
     # floor the divisor: a unit that never varies would otherwise divide by
@@ -3162,7 +3257,7 @@ def calibrate_cb_stats(config: AblationConfig, cb_proj, *, n_episodes=10,
     What it does NOT preserve is the cross-dimension covariance or the
     temporal correlation. That is the manipulation, not an oversight.
 
-    Uses the RUN'S OWN cb_proj rather than the probe's, because the block MC
+    Uses the RUN'S OWN cb_proj rather than rollout_z's, because the block MC
     sees is h2 @ cb_proj and cb_proj is drawn per run seed; calibrating
     against a different projection would match the wrong moments.
     """
@@ -3175,10 +3270,9 @@ def calibrate_cb_stats(config: AblationConfig, cb_proj, *, n_episodes=10,
     if config.cb_noise and config.center_cb:
         raise ValueError("cb_noise already draws from the calibrated mean; "
                          "centering it on top is not a distinct manipulation")
-    import circuit_probe
-    data = circuit_probe.rollout_z(config.arm, config.arm_seed,
-                                    n_episodes=n_episodes, max_steps=max_steps,
-                                    device=device)
+    data = rollout_z(config.arm, config.arm_seed,
+                     n_episodes=n_episodes, max_steps=max_steps,
+                     device=device)
     h2 = torch.as_tensor(np.asarray(data["cb_h2"], dtype=np.float32),
                          device=device)
     blk = (h2 @ cb_proj).cpu().numpy()

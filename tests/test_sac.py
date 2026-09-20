@@ -1017,34 +1017,38 @@ def test_channel_widths_match_the_ported_design():
         assert spec.feature_dim == want, name
 
 
-@pytest.mark.parametrize("variant", list(M.INPUT_VARIANTS))
-def test_circuit_state_matches_model_build_exactly(variant):
+def test_circuit_state_matches_model_build_exactly():
     """The frozen checkpoints were fitted on model.build's units, which scale
-    position by task.S_SCALE and derive velocity from the SCALED positions.
-    Tied to model.build itself rather than to a hardcoded 15, so the two
-    cannot drift apart.
+    position by POS_SCALE and velocity by VEL_SCALE -- each channel by its own
+    bound. Tied to model.build itself rather than to hardcoded constants, so
+    the two cannot drift apart.
 
-    Regression: sac.py originally fed raw units, running the checkpoints 15x
+    Regression: sac.py originally fed raw units, running the checkpoints far
     below their input scale. Nothing errored -- z simply stopped carrying
     context (6-way decode 0.28 vs 1.00, chance 0.17), and both frozen arms
     looked identical to the baseline.
+
+    Was parametrized over model.INPUT_VARIANTS; that registry went with the
+    old plant (one convention now, guarded by model.CONVENTION), which left
+    this test uncollectable until the 2026-09-20 cleanup.
     """
     torch.manual_seed(0)
     B, L = 2, 4
-    # trans[b, t] = [x, y, ax, ay, x', y']  (see data.generate_sequences)
-    pos = torch.rand(B, L, 2) * T.GRID_SIZE
-    trans = torch.cat([pos, torch.rand(B, L, 2) * 2 - 1,
-                       torch.rand(B, L, 2) * T.GRID_SIZE], dim=-1)
-    obs, _act, _tgt = M.build(trans, variant)
+    # trans[b, t] = [x, y, vx, vy, ax, ay, x', y', vx', vy']
+    # (see data.generate_sequences); velocity is READ, not reconstructed
+    pos = torch.rand(B, L, 2) * T.POS_LIM
+    vel = (torch.rand(B, L, 2) * 2 - 1) * T.V_MAX
+    trans = torch.cat([pos, vel,
+                       torch.rand(B, L, 2) * 2 - 1,
+                       torch.rand(B, L, 2) * T.POS_LIM,
+                       (torch.rand(B, L, 2) * 2 - 1) * T.V_MAX], dim=-1)
+    obs, _act, _tgt = M.build(trans)
 
     for b in range(B):
         for t in range(L):
-            # raw finite-difference velocity, exactly as the rollout forms it;
-            # circuit_state is responsible for matching build's units
-            vel = (np.zeros(2, np.float32) if t == 0
-                   else ((pos[b, t] - pos[b, t - 1]).numpy() / sac.DT))
-            assert np.allclose(sac.circuit_state(pos[b, t].numpy(), vel, variant),
-                               obs[b, t].numpy(), atol=1e-3), (variant, b, t)
+            assert np.allclose(
+                sac.circuit_state(pos[b, t].numpy(), vel[b, t].numpy()),
+                obs[b, t].numpy(), atol=1e-3), (b, t)
 
 
 def test_rollout_feeds_the_circuit_scaled_state():
@@ -1265,8 +1269,7 @@ def test_input_scales_are_still_calibrated():
     invalidates them silently. Tolerance is loose (40%) because the constants
     are a single set shared across arms and seeds that vary by ~30%; it is
     there to catch a factor-of-several move, not to pin a digit."""
-    import circuit_probe as CP
-    got = CP.source_rms("main", 0, n_episodes=12, max_steps=25)
+    got = sac.source_rms("main", 0, n_episodes=12, max_steps=25)
     for key, stored in (("kin", sac.KIN_RMS), ("ec", sac.EC_STATE_RMS),
                         ("cb", sac.CB_STATE_RMS)):
         assert abs(got[key] - stored) / stored < 0.40, (key, got[key], stored)
@@ -1529,12 +1532,11 @@ def test_ec_channel_subtracts_the_offset_only_when_asked():
 def test_calibrated_offset_actually_centers_z():
     """The offset has to be z's mean under the rollout, or centering removes
     the wrong vector and the control tests nothing."""
-    import circuit_probe as CP
     cfg = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb_centered"], arm_seed=0)
     off = sac.calibrate_ec_offset(cfg, n_episodes=8, max_steps=20)
     assert off.shape == (sac.LATENT_DIM,)
 
-    data = CP.rollout_z(cfg.arm, cfg.arm_seed, n_episodes=8, max_steps=20)
+    data = sac.rollout_z(cfg.arm, cfg.arm_seed, n_episodes=8, max_steps=20)
     z = data["z"][data["t"] > 0]
     assert np.linalg.norm(z.mean(0) - off) < 1e-4
     # and the centered version really is near zero-mean

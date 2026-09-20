@@ -1,5 +1,6 @@
 """The "policy" action process: windows of a recorded oracle-agent action
-stream (action_bank.py) as the circuit's training actions.
+stream as the circuit's training actions. Its builder, action_bank.py, was
+removed in the 2026-09-20 cleanup; the mode and its guards stay.
 
 What has to hold:
 

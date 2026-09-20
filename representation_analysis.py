@@ -113,10 +113,9 @@ def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN,
     obs, act, _ = M.build(trans)
     obs = obs.numpy().reshape(-1, obs.shape[-1])[keep]
     out["pos"], out["vel"] = obs[:, :2], obs[:, 2:]
-    # THE ACTION, which the conjunctivity measures bin on. It is the variable
-    # the contexts actually transform (F = A(c) a), so it is where an
-    # interaction between context and state is theoretically expected -- see
-    # the conjunctivity section.
+    # THE ACTION. It is the variable the contexts actually transform
+    # (F = A(c) a), so it is where an interaction between context and state is
+    # theoretically expected.
     out["act"] = act.numpy().reshape(-1, act.shape[-1])[keep]
     return out
 

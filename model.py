@@ -167,8 +167,9 @@ CONVENTION = "flat-families-v2"
 #          leakage. Checkpoint main_iid_seed*.pt, figures/main_iid.
 DEFAULT_ACTION_MODE = "gp"
 #   "policy"  windows of a trained oracle agent's recorded actions -- the
-#             deployment distribution itself (action_bank.py; data's bank
-#             section). Tag main_policy; the bank's stamp is in the convention.
+#             deployment distribution itself (see data's bank section; the
+#             builder was removed in the 2026-09-20 cleanup and is in git
+#             history). Tag main_policy; the bank's stamp is in the convention.
 ACTION_MODES = ("gp", "ar1", "iid", "policy")
 LEGACY_ACTION_MODES = {"fitted": "ar1"}
 
@@ -260,7 +261,7 @@ def readout_tag(readout=DEFAULT_READOUT, beta=RATE_BETA, sigma=NOISE_SIGMA) -> s
 
 # ── which circuit: one object instead of four loose knobs ─────────────────
 #
-# Every analysis in this repo (figures, conjunctivity, representation_analysis,
+# Every analysis in this repo (figures, representation_analysis,
 # sac's frozen load) selects the circuit through an `action_mode` argument that
 # it hands to load()/fig_dir()/generate_sequences(). When the readout became a
 # second axis, those call sites kept passing the mode alone -- so `run.py
@@ -337,8 +338,8 @@ class CircuitSpec:
 
 def add_circuit_args(ap):
     """The four circuit-selecting flags, identically on every CLI that loads a
-    supervised circuit (run.py, figures.py, representation_analysis.py,
-    conjunctivity.py). Pair with circuit_from_args."""
+    supervised circuit (run.py, figures.py, representation_analysis.py).
+    Pair with circuit_from_args."""
     ap.add_argument("--action-mode", default=DEFAULT_ACTION_MODE,
                     choices=list(ACTION_MODES) + list(LEGACY_ACTION_MODES),
                     help="action process the circuit was fitted on; selects the "
@@ -514,9 +515,9 @@ def fig_dir(arm, seed, sub=None,             # seed required -- see ckpt_path
     mtime.
 
     `sub` keeps a family of related panels together without inventing a
-    parallel tree somewhere else -- conjunctivity's two figures live at
-    fig_dir(arm, seed, "conjunctivity", mode) rather than under a figures/ root
-    of their own, so everything for one (arm, seed, mode) stays in one place.
+    parallel tree somewhere else -- a sub-analysis's figures live at
+    fig_dir(arm, seed, "<sub>", mode) rather than under a figures/ root of
+    their own, so everything for one (arm, seed, mode) stays in one place.
     """
     d = os.path.join(FIG_DIR, arm_tag(arm, action_mode, readout, beta, sigma), f"seed{seed}")
     if sub:

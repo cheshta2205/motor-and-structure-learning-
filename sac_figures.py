@@ -274,7 +274,7 @@ def plot_aim_by_step(seed, probes, out_dir, config_name=None, max_blocks=16):
     the two on first_angle compares a config that cannot yet know the context
     against one that always does.
 
-    Context reaches EC a few steps in (circuit_probe: 6-way decodability 0.74
+    Context reaches EC a few steps in (6-way decodability 0.74
     over t in [0,5), 0.99 by [5,15)), so this is where a circuit config's
     context dependence can appear at all. Lines that stay superimposed past
     ~5 steps are genuine context-blindness; lines that separate are not.

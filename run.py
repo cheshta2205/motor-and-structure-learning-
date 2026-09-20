@@ -135,18 +135,11 @@ def train(arms, seeds, workers=None, action_mode=M.DEFAULT_ACTION_MODE,
 circuit_from_args = M.circuit_from_args      # one rule for every CLI
 
 
-def figures(arms, seeds, pool, conjunctivity=True,
-            action_mode=M.DEFAULT_ACTION_MODE):
+def figures(arms, seeds, pool, action_mode=M.DEFAULT_ACTION_MODE):
     import figures as F
     for arm in arms:
         for s in seeds:
             F.per_seed(arm, s, action_mode=action_mode)
-            if conjunctivity:
-                # its own module and its own subdirectory, because it is the
-                # only analysis here that needs sklearn decoders per (site,
-                # bin, context pair) and is therefore far slower than the rest
-                import conjunctivity as CJ
-                CJ.main(arm, s, action_mode=action_mode)
         if pool:
             F.across_seeds(arm, seeds, action_mode=action_mode)
 
@@ -167,11 +160,6 @@ if __name__ == "__main__":
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed figures")
-    ap.add_argument("--no-conjunctivity", dest="conjunctivity",
-                    action="store_false", default=True,
-                    help="skip the conjunctivity panels, which fit a decoder "
-                         "per (site, bin, context pair) and dominate the "
-                         "figure time")
     # which circuit: --action-mode / --readout / --rate-beta / --noise-sigma,
     # the same four flags on every CLI (model.add_circuit_args). For --train
     # they say what to fit; for --figures which checkpoint to render, on its
@@ -198,5 +186,4 @@ if __name__ == "__main__":
     if a.figures or a.all:
         # the SAME spec selects the checkpoint, the rollout distribution and
         # the figure directory -- see model's CircuitSpec section
-        figures(a.arms, a.seeds, a.pool or a.all,
-                conjunctivity=a.conjunctivity, action_mode=spec)
+        figures(a.arms, a.seeds, a.pool or a.all, action_mode=spec)
