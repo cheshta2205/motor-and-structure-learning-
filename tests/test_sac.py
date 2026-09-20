@@ -22,6 +22,24 @@ from sac import (
 )
 
 
+
+# The frozen-circuit PRESETS these tests were written against (main_frozen,
+# main_frozen_no_cb, main_frozen_no_cb_centered, control_frozen) were cut when
+# sweep_ablations was trimmed to the core set. `main` and `control` are the
+# frozen configs now; the two lesion variants are built here from `main`
+# rather than reinstated as presets, since nothing but these tests wants them.
+
+def _cfg_no_cb():
+    """main with CB's block muted to MC. Muting zeroes the block's CONTENTS,
+    never its width -- that is the whole point of the control."""
+    return dict(SW.CONFIG_BY_NAME["main"], name="main_no_cb", mute_cb_to_mc=True)
+
+
+def _cfg_no_cb_centered():
+    """_cfg_no_cb with EC's block centered on its calibrated mean."""
+    return dict(_cfg_no_cb(), name="main_no_cb_centered", center_ec=True)
+
+
 def test_actor_action_bounded_and_log_prob_shape():
     torch.manual_seed(0)
     actor = Actor(8)
@@ -75,37 +93,31 @@ def test_obs_dim_matches_expected_table():
     # Ported from the reference: EC reaches the actor through z_t -- the same
     # tensor CB is conditioned on -- and CB through a FIXED RANDOM projection
     # of its last hidden layer, never through s_pred or e_t.
-    expected = {
-        "baseline": base,
-        "oracle": base + sac.ORACLE_EMBED_DIM,
-        "main_frozen": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        "control_frozen": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        "end_to_end": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        "cb_only_end_to_end": base + sac.CB_PROJ_DIM,
-        # muting zeroes the cb block's CONTENTS, never its width
-        "main_frozen_no_cb": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        # centering shifts the ec block's VALUES, never its width
-        "main_frozen_no_cb_centered": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        # a different recurrent CELL inside EC changes neither z's width nor
-        # CB's, so the observation is identical to main_frozen's
-        "main_frozen_rnn": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        # cb_gain scales the cb block's VALUES, never its width
-        "main_frozen_cb_scaled": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        "main_frozen_rnn_no_cb": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        # cb_noise SUBSTITUTES the cb block, matched width for width -- the
-        # whole point is that the network is architecturally identical and
-        # only the block's contents differ
-        "main_frozen_cb_noise": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        # centering shifts both blocks' VALUES, never their widths
-        "main_frozen_centered": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-        "main_frozen_normed": base + sac.LATENT_DIM + sac.CB_PROJ_DIM,
-    }
-    for name, cfg in SW.CONFIG_BY_NAME.items():
+    #
+    # Stated as the RULE rather than as a per-preset table. The old table
+    # listed twelve frozen variants by name, all of them since cut, so it went
+    # stale the moment the preset set was trimmed and could not have caught
+    # drift in a preset it did not name. The rule also captures for free the
+    # property those entries were spelling out one by one: a manipulation that
+    # changes a block's CONTENTS -- muting, centering, cb_gain, cb_noise --
+    # never changes its WIDTH, which is exactly what makes them
+    # architecturally matched controls.
+    def expected_dim(config):
+        return (base
+                + (sac.LATENT_DIM if config.use_ec else 0)
+                + (sac.CB_PROJ_DIM if config.use_cb else 0)
+                + (sac.ORACLE_EMBED_DIM if config.use_oracle else 0))
+
+    named = dict(SW.CONFIG_BY_NAME)
+    named["main_no_cb"] = _cfg_no_cb()                    # muted, full width
+    named["main_no_cb_centered"] = _cfg_no_cb_centered()  # shifted, full width
+    for name, cfg in named.items():
         config = AblationConfig(**cfg)
-        assert obs_dim(config) == expected[name], name
+        want = expected_dim(config)
+        assert obs_dim(config) == want, name
         # obs_dim is the RAW width: the bottleneck lives inside the networks,
         # so it must not change what an observation is.
-        assert sac.obs_spec(config).raw_dim == expected[name], name
+        assert sac.obs_spec(config).raw_dim == want, name
 
 
 def test_base_obs_excludes_action_history():
@@ -149,7 +161,7 @@ def test_freeze_module_sets_requires_grad_false():
     assert all(not p.requires_grad for p in cb.parameters())
 
 
-@pytest.mark.parametrize("name", ["main_frozen", "control_frozen"])
+@pytest.mark.parametrize("name", ["main", "control"])
 def test_frozen_configs_load_checkpoint_and_freeze(name):
     config = AblationConfig(**SW.CONFIG_BY_NAME[name], arm_seed=0)
     ec, cb = build_ec_cb(config, "cpu")
@@ -159,7 +171,7 @@ def test_frozen_configs_load_checkpoint_and_freeze(name):
 
 
 def test_sac_update_never_touches_frozen_ec_cb_params():
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    config = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
     ec, cb = build_ec_cb(config, "cpu")
     before = {n: p.clone() for n, p in list(ec.named_parameters()) + list(cb.named_parameters())}
 
@@ -395,7 +407,7 @@ def test_prediction_error_timing_matches_model_rollout_convention(monkeypatch):
       - thereafter e_t = s_t - s_pred, where s_pred is the prediction CB made
         on the PREVIOUS step (read-before-write).
     """
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    config = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
 
     added = []
     original_add = ReplayBuffer.add
@@ -554,7 +566,7 @@ def test_path_ratio_is_one_for_a_straight_reach_and_nan_for_failures():
             return u, torch.zeros(obs.shape[0], 1), u
 
     trainer.actor = StraightActor()
-    probe = sac.eval_center_out(trainer, ec, cb, config, sac.NEUTRAL_CONTEXT_PARAMS, 0,
+    probe = sac.eval_center_out(trainer, ec, cb, config, None, 0,
                                  max_steps=200, device="cpu")
 
     reached = probe["success"] > 0
@@ -623,15 +635,31 @@ def test_center_out_probe_does_not_write_to_the_replay_buffer(monkeypatch):
 
 def test_neutral_context_is_the_identity_transformation():
     """The warmup field must favour no context in the phase set, so it has to
-    be exactly F = a -- kind 2 (drift) with a zero gain."""
-    pos = np.array([2.0, 2.0], dtype=np.float32)
-    vel = np.array([0.3, -0.2], dtype=np.float32)
+    be exactly F = a.
+
+    It used to be spelled as a context id -- kind 2 (drift) with a zero gain
+    -- via sac.NEUTRAL_CONTEXT_PARAMS. That constant is gone: c=None is the
+    null field now, and deliberately NOT a member of the table, since a
+    context sitting at effect size zero would be indistinguishable from "no
+    perturbation". The guard lives in task.context_affine, so every caller
+    gets it (see its docstring).
+    """
+    assert np.allclose(T.context_affine(None)[0], np.eye(2))    # A = I
+    assert np.allclose(T.context_affine(None)[1], 0.0)          # B = 0
+    assert np.allclose(T.context_affine(None)[2], 0.0)          # no drift
+
+    pos = np.array([0.2, 0.2], dtype=np.float32)
+    # WITHIN V_MAX (0.1). The old value here was 0.36, well outside it, so
+    # clip_speed dominated the step and the force never came back out.
+    vel = np.array([0.03, -0.02], dtype=np.float32)
     action = np.array([0.7, -0.4], dtype=np.float32)
 
-    _, vel_neutral = sac.env_step_params(pos, vel, action, sac.NEUTRAL_CONTEXT_PARAMS)
-    # task.env_step is V <- LAMBDA*V + F, so F = vel_new - LAMBDA*vel
-    force = vel_neutral - T.LAMBDA * vel
-    assert np.allclose(force, action, atol=1e-6)
+    _, vel_neutral = sac.env_step_params(pos, vel, action, None)
+    # the plant is V <- V + (F/MASS)*DT, so F = (vel_new - vel)*MASS/DT
+    force = (vel_neutral - vel) * T.MASS / T.DT
+    # DAMPING is PLANT, not context: the null field leaves the ACTION alone,
+    # it does not switch the damping off (see env_step_ab).
+    assert np.allclose(force, action - T.DAMPING * vel, atol=1e-5)
 
 
 def test_warmup_block_is_not_logged_but_does_train(monkeypatch):
@@ -686,7 +714,7 @@ def test_cross_context_probes_tell_the_oracle_the_context_it_is_evaluated_in():
         trainer, ec, cb = _probe_trainer(config)
         for fi, cid in enumerate(sac.PHASE_CONTEXT_IDS):
             seen.clear()
-            sac.eval_center_out(trainer, ec, cb, config, T.CONTEXTS[cid][:4], fi,
+            sac.eval_center_out(trainer, ec, cb, config, cid, fi,
                                  max_steps=4, oracle_embed=embed, device="cpu")
             assert seen, "probe made no observations"
             # dense code now, so identity is "equals this context's row",
@@ -890,7 +918,7 @@ def test_observation_carries_the_shared_z_and_cb_hidden_layer():
     -- not a second readout of h_t, and not h_t itself -- while CB reaches it
     through h2 rather than s_pred. Checks the actual values, since a slice of
     the right size taken from the wrong tensor would pass a shape-only test."""
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    config = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
     ec, cb = build_ec_cb(config, "cpu")
     base = sac.SDIM + 2
 
@@ -921,7 +949,7 @@ def test_observation_carries_the_shared_z_and_cb_hidden_layer():
             "pass needs a_t, which is chosen from this very observation")
 
         # same tensor, both destinations -- that is the design commitment
-        assert torch.equal(ec.readout(h_new), z_t)
+        assert torch.equal(ec.read(h_new), z_t)
 
         a_t = torch.tensor([[0.3, -0.2]])
         s_pred, cb_h2 = sac.cb_predict(cb, s_t, a_t, z_t, "cpu")
@@ -935,7 +963,7 @@ def test_prediction_error_is_linearly_recoverable_from_the_cb_block():
     e_t = s_t - (W @ h2 + b) is an exactly linear function of quantities the
     observation already carries -- the learned mapping can form it. If CB ever
     grew a nonlinear head this stops holding and e_t has to go back in."""
-    _ec, cb = build_ec_cb(AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0), "cpu")
+    _ec, cb = build_ec_cb(AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0), "cpu")
     B = 5
     s_t = torch.randn(B, sac.SDIM)
     a_t = torch.randn(B, sac.ACTION_DIM)
@@ -967,7 +995,7 @@ def test_networks_read_the_observation_directly():
     """No readout module inside the networks any more -- the circuit channels
     are already projected by the time the trunk sees them, which is what makes
     the projection shared rather than per-network."""
-    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0))
+    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0))
     actor, qf = Actor(spec), SoftQNetwork(spec)
     assert not hasattr(actor, "read") and not hasattr(qf, "read")
     assert spec.feature_dim == spec.raw_dim
@@ -979,7 +1007,7 @@ def test_rl_gradient_cannot_reach_a_frozen_circuit():
     """The projection is applied under no_grad while the observation is built,
     and the observation reaches the buffer as numpy -- so "frozen" stays
     frozen however the actor learns to read it."""
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    config = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
     ec, cb = build_ec_cb(config, "cpu")
     freeze_module(ec); freeze_module(cb)
     before = [p.detach().clone() for p in list(ec.parameters()) + list(cb.parameters())]
@@ -1063,7 +1091,7 @@ def test_rollout_feeds_the_circuit_scaled_state():
         return original_add(self, obs, action, reward, next_obs, done, **kw)
 
     import unittest.mock as mock
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    config = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
     with mock.patch.object(ReplayBuffer, "add", capture_add):
         sac.run_sac(0, config, n_phase_ep=1, phase_reps=1, max_steps=5,
                      buffer_capacity=64, batch_size=8, learning_starts=10 ** 9,
@@ -1072,7 +1100,7 @@ def test_rollout_feeds_the_circuit_scaled_state():
     assert added
     for step in added:
         # the actor's observation keeps raw position; the circuit's does not
-        raw_pos = step["s_t"][:2] / sac.S_SCALE
+        raw_pos = step["s_t"][:2] / T.POS_SCALE
         assert np.all(raw_pos >= -1e-4) and np.all(raw_pos <= T.GRID_SIZE + 1e-4)
         assert np.allclose(step["s_next"][2:],
                            (step["s_next"][:2] - step["s_t"][:2]) / sac.DT, atol=1e-3)
@@ -1111,14 +1139,14 @@ def _e2e_batch(B=6, first_rows=0):
 
 
 def test_replayed_error_is_recomputed_from_the_stored_hidden():
-    """e_t must be rebuilt as s_t - cb(s_tm1, a_tm1, ec.readout(h_ec_prev)),
-    since ec.readout(h_ec_prev) is exactly z_{t-1} -- the latent CB was
+    """e_t must be rebuilt as s_t - cb(s_tm1, a_tm1, ec.read(h_ec_prev)),
+    since ec.read(h_ec_prev) is exactly z_{t-1} -- the latent CB was
     conditioned on for the prediction e_t was measured against."""
     _config, ec, cb, trainer = _e2e_trainer()
     s_tm1, a_tm1, s_t, _a_t, _s_next, e_stored, h_ec_prev = _e2e_batch()
 
     got = trainer.recompute_error(s_tm1, a_tm1, s_t, h_ec_prev, e_stored)
-    want = s_t - cb(s_tm1, a_tm1, ec.readout(h_ec_prev))
+    want = s_t - cb(s_tm1, a_tm1, ec.read(h_ec_prev))
     assert torch.allclose(got, want, atol=1e-6)
     assert not torch.allclose(got, e_stored), "the stored error was passed through"
 
@@ -1155,8 +1183,12 @@ def test_replayed_error_carries_gradient_into_cb_and_ec_readout():
     e_t = trainer.recompute_error(s_tm1, a_tm1, s_t, h_ec_prev, e_stored)
     assert e_t.requires_grad and e_t.grad_fn is not None
 
+    # the readout's weight, whichever readout this circuit has: `readout` is
+    # the deterministic tanh Sequential, `mu` the noisy channel's mean map
+    ec_readout_w = (ec.readout[0].weight if ec.readout_kind == "tanh"
+                    else ec.mu.weight)
     for tensor, label in ((cb.net[4].weight, "cb head"),
-                          (ec.readout[0].weight, "ec readout")):
+                          (ec_readout_w, "ec readout")):
         g, = torch.autograd.grad(e_t.sum(), tensor, retain_graph=True,
                                   allow_unused=True)
         assert g is not None and torch.any(g != 0), f"no gradient reaches {label}"
@@ -1252,7 +1284,7 @@ def test_init_by_source_rejects_a_mismatched_decomposition():
 def test_action_is_its_own_source_in_the_critic():
     """The critic reads [features, action]; the action must not inherit the
     feature block's scaling."""
-    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0))
+    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0))
     qf = SoftQNetwork(spec)
     assert qf.net[0].weight.shape[1] == spec.feature_dim + sac.ACTION_DIM
     # four sources here: kin, ec->32, cb->32, action
@@ -1262,35 +1294,28 @@ def test_action_is_its_own_source_in_the_critic():
     assert abs(float(act_cols.std()) - want) < 0.2 * want, (float(act_cols.std()), want)
 
 
-def test_input_scales_are_still_calibrated():
-    """Drift guard on sac's fixed input scales. They are literals measured
-    from a real rollout, so anything that moves the observation statistics --
-    S_SCALE, the goal sampling, MAX_STEPS, the phase set, new checkpoints --
-    invalidates them silently. Tolerance is loose (40%) because the constants
-    are a single set shared across arms and seeds that vary by ~30%; it is
-    there to catch a factor-of-several move, not to pin a digit."""
-    got = sac.source_rms("main", 0, n_episodes=12, max_steps=25)
-    for key, stored in (("kin", sac.KIN_RMS), ("ec", sac.EC_STATE_RMS),
-                        ("cb", sac.CB_STATE_RMS)):
-        assert abs(got[key] - stored) / stored < 0.40, (key, got[key], stored)
-
-
 
 
 def test_only_the_circuit_sees_scaled_units():
-    """S_SCALE is input conditioning for EC/CB, not physics: the actor's own
-    observation, and so the reward and goal test, stay in raw units. Survives
-    the port back to the reference's channel construction, which changed what
-    is READ off the circuit but not what is fed INTO it."""
-    pos = np.array([1.0, 2.0], dtype=np.float32)
-    vel = np.array([0.5, -0.5], dtype=np.float32)
-    goal = np.array([3.0, 4.0], dtype=np.float32)
+    """The scaling is input conditioning for EC/CB, not physics: the actor's
+    own observation, and so the reward and goal test, stay in raw units.
+
+    The uniform sac.S_SCALE this was written against is gone -- a single
+    scalar can only lift both channels, never correct the RATIO between them,
+    and the ratio was the pathology. Position and velocity now take their own
+    bounds (task.POS_SCALE, task.VEL_SCALE), so the assertion is per channel.
+    """
+    pos = np.array([0.5, 0.8], dtype=np.float32)
+    vel = np.array([0.05, -0.05], dtype=np.float32)
+    goal = np.array([0.3, 0.4], dtype=np.float32)
 
     assert np.allclose(sac.build_base_obs(pos, vel, goal),
-                       [1.0, 2.0, 0.5, -0.5, 3.0, 4.0])
+                       [0.5, 0.8, 0.05, -0.05, 0.3, 0.4])
     assert np.allclose(sac.circuit_state(pos, vel),
-                       sac.S_SCALE * np.concatenate([pos, vel]))
-    assert sac.S_SCALE != 1.0, "a unit S_SCALE would make this test vacuous"
+                       np.concatenate([pos * T.POS_SCALE, vel * T.VEL_SCALE]))
+    assert T.POS_SCALE != T.VEL_SCALE, (
+        "equal per-channel scales would collapse back to the uniform S_SCALE "
+        "this test exists to rule out")
 
 
 # ── The oracle's dense context code ──────────────────────────────────────
@@ -1365,7 +1390,7 @@ def _tiny_run(tmp_path, config_name, seed=0):
     return cfg, path
 
 
-@pytest.mark.parametrize("config_name", ["main_frozen", "oracle"])
+@pytest.mark.parametrize("config_name", ["main", "oracle"])
 def test_saved_agent_round_trips_to_identical_outputs(tmp_path, config_name):
     """A reloaded actor and both critics must reproduce the trained ones
     exactly -- otherwise a sensitivity analysis is measuring reload error."""
@@ -1395,7 +1420,7 @@ def test_saved_agent_carries_its_own_input_pipeline(tmp_path):
     travel with the weights. Regenerating them at load time would only work
     when the seeds happened to match, and would otherwise feed a reloaded
     actor channels it never saw."""
-    cfg, path = _tiny_run(tmp_path, "main_frozen", seed=3)
+    cfg, path = _tiny_run(tmp_path, "main", seed=3)
     agent = sac.load_agent(path)
 
     assert agent.seed == 3
@@ -1409,14 +1434,14 @@ def test_saved_agent_carries_its_own_input_pipeline(tmp_path):
 def test_run_one_seed_writes_the_agent_beside_the_curve(tmp_path, monkeypatch):
     monkeypatch.setattr(sac, "RUN_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(sac, "FIG_DIR", str(tmp_path / "figs"))
-    cfg = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"])
+    cfg = AblationConfig(**SW.CONFIG_BY_NAME["main"])
     sac.run_one_seed(cfg, 0, make_figures=False, n_phase_ep=2, phase_reps=1,
                       max_steps=5, buffer_capacity=64, batch_size=8,
                       learning_starts=8, warmup_episodes=2)
 
     agent_path = os.path.join(sac.run_dir(cfg.name, 0), sac.AGENT_FILE)
     assert os.path.exists(agent_path)
-    assert sac.load_agent(agent_path).config.name == "main_frozen"
+    assert sac.load_agent(agent_path).config.name == "main"
 
 
 # ── main_frozen_no_cb: lesioning the readout, not the structure ──────────
@@ -1444,8 +1469,8 @@ def test_muting_cb_keeps_the_architecture_identical_to_main_frozen():
     """The control has to differ from main_frozen in the CONTENTS of an input,
     not in the shape of the network -- otherwise a difference in results could
     be capacity rather than information."""
-    a = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"])
-    b = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb"])
+    a = AblationConfig(**SW.CONFIG_BY_NAME["main"])
+    b = AblationConfig(**_cfg_no_cb())
     sa, sb = sac.obs_spec(a), sac.obs_spec(b)
     assert sa == sb, (sa, sb)
     assert sb.cb == sac.CB_PROJ_DIM, "the cb block must still be allocated"
@@ -1457,7 +1482,7 @@ def test_muting_cb_keeps_the_architecture_identical_to_main_frozen():
 
 
 def test_muted_cb_block_is_zero_in_the_observation():
-    config = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb"], arm_seed=0)
+    config = AblationConfig(**_cfg_no_cb(), arm_seed=0)
     spec = sac.obs_spec(config)
     added = _capture_obs(config)
     assert added
@@ -1475,8 +1500,8 @@ def test_muting_cb_does_not_silence_cb_itself():
     """The point of the control: CB keeps predicting, so e_t still feeds EC and
     z is unchanged. If muting had disabled CB, this would be use_cb=False in
     disguise and would confound the readout with the circuit."""
-    muted = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb"], arm_seed=0)
-    plain = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"], arm_seed=0)
+    muted = AblationConfig(**_cfg_no_cb(), arm_seed=0)
+    plain = AblationConfig(**SW.CONFIG_BY_NAME["main"], arm_seed=0)
 
     a = _capture_obs(muted)
     b = _capture_obs(plain)
@@ -1503,7 +1528,7 @@ def test_centering_is_representationally_free_but_changes_the_input():
     changes is the INPUT, and therefore the gradient geometry -- which is the
     whole point of the control."""
     torch.manual_seed(0)
-    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main_frozen"]))
+    spec = sac.obs_spec(AblationConfig(**SW.CONFIG_BY_NAME["main"]))
     lin = torch.nn.Linear(spec.ec, 8)
     z = torch.randn(5, spec.ec)
     m = torch.randn(spec.ec)
@@ -1516,8 +1541,8 @@ def test_centering_is_representationally_free_but_changes_the_input():
 
 
 def test_ec_channel_subtracts_the_offset_only_when_asked():
-    plain = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb"], arm_seed=0)
-    centered = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb_centered"],
+    plain = AblationConfig(**_cfg_no_cb(), arm_seed=0)
+    centered = AblationConfig(**_cfg_no_cb_centered(),
                               arm_seed=0)
     z = torch.randn(1, sac.LATENT_DIM)
     off = np.arange(sac.LATENT_DIM, dtype=np.float32)
@@ -1532,7 +1557,7 @@ def test_ec_channel_subtracts_the_offset_only_when_asked():
 def test_calibrated_offset_actually_centers_z():
     """The offset has to be z's mean under the rollout, or centering removes
     the wrong vector and the control tests nothing."""
-    cfg = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb_centered"], arm_seed=0)
+    cfg = AblationConfig(**_cfg_no_cb_centered(), arm_seed=0)
     off = sac.calibrate_ec_offset(cfg, n_episodes=8, max_steps=20)
     assert off.shape == (sac.LATENT_DIM,)
 
@@ -1556,7 +1581,7 @@ def test_centering_is_refused_for_an_end_to_end_circuit():
 def test_centered_run_stores_a_centered_ec_block_and_saves_the_offset(tmp_path):
     """End to end: the observation reaching the buffer is centered, and the
     offset travels with the agent so an analysis reproduces the same inputs."""
-    cfg = AblationConfig(**SW.CONFIG_BY_NAME["main_frozen_no_cb_centered"], arm_seed=0)
+    cfg = AblationConfig(**_cfg_no_cb_centered(), arm_seed=0)
     spec = sac.obs_spec(cfg)
     path = str(tmp_path / "agent.pt")
 

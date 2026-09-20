@@ -27,7 +27,7 @@ def _probe_all_contexts(max_steps=12):
     trainer = SimpleNamespace(actor=sac.Actor(sac.obs_spec(cfg)))
     out = []
     for fi, cid in enumerate(sac.PHASE_CONTEXT_IDS):
-        p = sac.eval_center_out(trainer, ec, cb, cfg, T.CONTEXTS[cid][:4], fi,
+        p = sac.eval_center_out(trainer, ec, cb, cfg, cid, fi,
                                  max_steps=max_steps)
         p.update({"eval_label": T.C_LABEL[cid], "eval_context_id": cid,
                   "label": T.C_LABEL[sac.PHASE_CONTEXT_IDS[0]], "occurrence": 0,
