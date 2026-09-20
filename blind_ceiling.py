@@ -54,7 +54,7 @@ fixed map serves two of them. rot +-45, curl and drift resist it on neither
 metric.
 
     python blind_ceiling.py                  # the current PHASE_CONTEXT_IDS
-    python blind_ceiling.py --all            # all 16 contexts, one by one
+    python blind_ceiling.py --all            # every context in the table, one by one
     python blind_ceiling.py --contexts 0 2 4 6
 """
 from __future__ import annotations
