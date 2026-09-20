@@ -1,4 +1,14 @@
 __pycache__/
 *.pyc
-figures/
 .DS_Store
+.pytest_cache/
+.vscode/
+
+# figure output -- regenerable from checkpoints (figures.py / sac_figures.py)
+figures/
+figures_old/
+
+# SAC run output: learning curves, agents, probes. Hundreds of MB per sweep,
+# rebuilt by sweep_ablations.py. Never commit these.
+sac_runs/
+sac_runs_copy/

@@ -50,13 +50,14 @@ def _train_one(job):
     is patched here in normal use, but it is why the tests cover job selection
     and picklability rather than redirecting CKPT_DIR through a worker.
     """
-    arm, seed = job
+    arm, seed, action_mode, readout, beta, sigma = job
     import torch
     # each worker gets one thread: 16 processes each spawning N BLAS threads
     # oversubscribes the machine and runs slower than serial
     torch.set_num_threads(1)
     t0 = time.time()
-    M.train(arm, seed=seed)
+    M.train(arm, seed=seed, action_mode=action_mode, readout=readout, beta=beta,
+            sigma=sigma)
     return arm, seed, (time.time() - t0) / 60.0
 
 
@@ -83,25 +84,40 @@ def resolve_workers(n_jobs, workers=None):
     return max(1, min(workers, n_jobs))
 
 
-def train(arms, seeds, workers=None):
+def train(arms, seeds, workers=None, action_mode=M.DEFAULT_ACTION_MODE,
+          readout=M.DEFAULT_READOUT, beta=M.RATE_BETA, sigma=M.NOISE_SIGMA):
     jobs = []
     for arm in arms:
         for s in seeds:
-            p = M.ckpt_path(arm, s)
+            p = M.ckpt_path(arm, s, action_mode, readout, beta, sigma)
             if os.path.exists(p):
-                print(f"== {arm} seed {s}: checkpoint exists, skipping -> {p}",
-                      flush=True)
-                continue
-            jobs.append((arm, s))
+                # skip only a checkpoint of the CURRENT convention. A stale one
+                # at this path (an older context table, another readout
+                # default) would otherwise be skipped as "done" and every
+                # downstream load would then refuse it -- or, worse, be
+                # overwritten here. Neither silently.
+                import torch
+                stored = torch.load(p, map_location="cpu").get("convention")
+                expected = M.convention_for(action_mode, readout, beta, sigma)
+                if stored == expected:
+                    print(f"== {arm} seed {s}: checkpoint exists, skipping -> {p}",
+                          flush=True)
+                    continue
+                raise FileExistsError(
+                    f"{p} holds a checkpoint of convention {stored!r}, not the "
+                    f"current {expected!r}. Move it aside (e.g. into "
+                    f"checkpoints/<old convention>/) before training this circuit.")
+            jobs.append((arm, s, action_mode, readout, beta, sigma))
     if not jobs:
         return
 
     workers = resolve_workers(len(jobs), workers)
     if workers == 1:
-        for arm, s in jobs:
+        for arm, s, *_knobs in jobs:
             t0 = time.time()
             print(f"\n{'='*64}\n== {arm} seed {s}\n{'='*64}", flush=True)
-            M.train(arm, seed=s)
+            M.train(arm, seed=s, action_mode=action_mode, readout=readout, beta=beta,
+                    sigma=sigma)
             print(f"== done in {(time.time()-t0)/60:.1f} min", flush=True)
         return
 
@@ -116,13 +132,23 @@ def train(arms, seeds, workers=None):
                   flush=True)
 
 
-def figures(arms, seeds, pool):
+circuit_from_args = M.circuit_from_args      # one rule for every CLI
+
+
+def figures(arms, seeds, pool, conjunctivity=True,
+            action_mode=M.DEFAULT_ACTION_MODE):
     import figures as F
     for arm in arms:
         for s in seeds:
-            F.per_seed(arm, s)
+            F.per_seed(arm, s, action_mode=action_mode)
+            if conjunctivity:
+                # its own module and its own subdirectory, because it is the
+                # only analysis here that needs sklearn decoders per (site,
+                # bin, context pair) and is therefore far slower than the rest
+                import conjunctivity as CJ
+                CJ.main(arm, s, action_mode=action_mode)
         if pool:
-            F.across_seeds(arm, seeds)
+            F.across_seeds(arm, seeds, action_mode=action_mode)
 
 
 if __name__ == "__main__":
@@ -141,6 +167,16 @@ if __name__ == "__main__":
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed figures")
+    ap.add_argument("--no-conjunctivity", dest="conjunctivity",
+                    action="store_false", default=True,
+                    help="skip the conjunctivity panels, which fit a decoder "
+                         "per (site, bin, context pair) and dominate the "
+                         "figure time")
+    # which circuit: --action-mode / --readout / --rate-beta / --noise-sigma,
+    # the same four flags on every CLI (model.add_circuit_args). For --train
+    # they say what to fit; for --figures which checkpoint to render, on its
+    # own distribution, into its own figures/<arm_tag>/ directory.
+    M.add_circuit_args(ap)
     ap.add_argument("--workers", type=int, default=None,
                     help="parallel processes over (arm, seed) pairs. Default "
                          "is one per job, capped at the core count, so more "
@@ -149,7 +185,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if not (a.oracle or a.train or a.figures or a.all):
         ap.error("nothing to do: pass --oracle, --train, --figures or --all")
-    print(f"arms {a.arms} | seeds {a.seeds}", flush=True)
+    spec = circuit_from_args(a)
+    print(f"arms {a.arms} | seeds {a.seeds} | circuit {spec}", flush=True)
     if a.oracle or a.all:
         import oracle as O
         if os.path.exists(O.LADDER) and not a.oracle:
@@ -157,6 +194,9 @@ if __name__ == "__main__":
         else:
             O.main()
     if a.train or a.all:
-        train(a.arms, a.seeds, workers=a.workers)
+        train(a.arms, a.seeds, workers=a.workers, action_mode=spec)
     if a.figures or a.all:
-        figures(a.arms, a.seeds, a.pool or a.all)
+        # the SAME spec selects the checkpoint, the rollout distribution and
+        # the figure directory -- see model's CircuitSpec section
+        figures(a.arms, a.seeds, a.pool or a.all,
+                conjunctivity=a.conjunctivity, action_mode=spec)

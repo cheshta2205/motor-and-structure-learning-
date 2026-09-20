@@ -42,13 +42,33 @@ def _spread(per_family=2):
 
 # ── structural ───────────────────────────────────────────────────────────
 
-def test_contexts_are_two_flat_families():
-    assert T.N_CONTEXTS == len(T.ROT_ANGLES) + len(T.REFL_ANGLES)
-    assert set(T.FAMILY.values()) == {0, 1}
+def test_contexts_are_three_flat_families_of_four():
+    assert T.FAM_NAMES == ["rotation", "curl", "drift"]
+    assert T.N_CONTEXTS == len(T.ROT_ANGLES) + len(T.CURL_GAINS) + len(T.DRIFT_ANGLES) == 12
+    assert set(T.FAMILY.values()) == {0, 1, 2}
     per = [sum(1 for c in range(T.N_CONTEXTS) if T.FAMILY[c] == f)
            for f in range(len(T.FAM_NAMES))]
-    assert per == [len(T.ROT_ANGLES), len(T.REFL_ANGLES)]
+    assert per == [4, 4, 4]
     assert len(set(T.C_LABEL.values())) == T.N_CONTEXTS       # labels unique
+    assert T.ROT_ANGLES == [-60.0, -30.0, 30.0, 60.0]
+
+
+def test_each_family_switches_on_one_term_of_the_law():
+    """rotation moves A alone, curl moves B alone (an antisymmetric matrix:
+    a force perpendicular to the velocity), drift moves the velocity
+    increment alone. That is what makes family a DIRECTION in the space of
+    force laws -- the property the reflection family lacked."""
+    I = np.eye(2)
+    for c in range(T.N_CONTEXTS):
+        A, B, w = T.context_affine(c)
+        kind = T.FAMILY[c]
+        assert (not np.allclose(A, I)) == (kind == 0), T.C_LABEL[c]
+        assert (not np.allclose(B, 0)) == (kind == 1), T.C_LABEL[c]
+        assert (not np.allclose(w, 0)) == (kind == 2), T.C_LABEL[c]
+        if kind == 1:
+            assert np.allclose(B + B.T, 0), T.C_LABEL[c]          # perpendicular
+        if kind == 2:
+            assert np.linalg.norm(w) == pytest.approx(T.DRIFT_VEL, rel=1e-5)
 
 
 def test_context_table_and_lookups_agree():
@@ -62,12 +82,16 @@ def test_context_table_and_lookups_agree():
 
 def test_no_context_is_the_identity():
     """An identity context would sit at effect size zero and be
-    indistinguishable from 'no perturbation', which is not a member of either
-    sweep.  rot 0 is excluded from ROT_ANGLES for exactly that reason; refl 0
-    is a genuine reflection, diag(1, -1), not the identity."""
+    indistinguishable from 'no perturbation', which is not a member of any
+    sweep.  rot 0, curl 0 and a zero drift are excluded for exactly that
+    reason. Judged on the WHOLE law: curl and drift leave A alone, so the
+    action transform is not where their effect is."""
     a = np.array([0.7, -0.3], dtype=np.float32)
+    v = np.array([0.03, 0.02], dtype=np.float32)
     for c in range(T.N_CONTEXTS):
-        assert not np.allclose(T.context_matrix(c) @ a, a, atol=1e-3), T.C_LABEL[c]
+        A, B, w = T.context_affine(c)
+        same_force = np.allclose(A @ a + B @ v, a, atol=1e-3)
+        assert not (same_force and np.allclose(w, 0)), T.C_LABEL[c]
 
 
 def test_the_null_field_sentinel_is_the_identity():
@@ -111,43 +135,57 @@ def test_every_context_matrix_is_orthogonal():
         assert abs(abs(np.linalg.det(A)) - 1.0) < 1e-6, T.C_LABEL[c]
 
 
-def test_families_split_on_determinant():
-    """rotation (det +1) against reflection (det -1).  The contrast is KIND,
-    not magnitude: |M(phi)a - a| = sqrt(2)|a| for every axis, and rotation
-    matches that only at theta = +-90, so the families overlap in effect size
-    while never overlapping in determinant."""
+def test_every_action_transform_preserves_the_determinant_sign():
+    """No context reverses orientation any more (the reflection family is
+    retired): every A is a proper rotation or the identity, det +1."""
     for c in range(T.N_CONTEXTS):
-        d = float(np.linalg.det(T.context_matrix(c)))
-        assert (d > 0) == (T.FAMILY[c] == 0), T.C_LABEL[c]
+        assert float(np.linalg.det(T.context_matrix(c))) == pytest.approx(1.0, abs=1e-6), T.C_LABEL[c]
 
 
 def test_damping_is_plant_not_context():
     """DAMPING must be applied by the PLANT and appear in no context.
 
     It WAS a context dimension and is not one any more, so a context whose B
-    carried damping would silently reintroduce the velocity-dependent factor
-    that was removed.  Two halves: every context's B is zero, and env_step
-    damps anyway.
+    carried damping would silently reintroduce the drag factor that was
+    removed.  Curl's B is the one velocity-dependent term allowed and it is
+    ANTISYMMETRIC, so it never damps (v . B v = 0); every other B is zero.
+    And env_step damps anyway, in every context.
     """
     for c in range(T.N_CONTEXTS):
         _A, B = T.context_matrices(c)
-        assert np.allclose(B, 0.0), T.C_LABEL[c]
+        if T.FAMILY[c] == 1:
+            assert np.allclose(B + B.T, 0.0), T.C_LABEL[c]
+        else:
+            assert np.allclose(B, 0.0), T.C_LABEL[c]
 
     v = np.array([0.05, 0.0], dtype=np.float32)
     _p, v2, _F = T.env_step(np.zeros(2, np.float32), v,
-                            np.zeros(2, np.float32), 0)     # no action
+                            np.zeros(2, np.float32), 0)     # rotation, no action
     assert np.allclose(v2, (1.0 - T.DAMPING / T.MASS) * v, atol=1e-6)
     assert float(np.linalg.norm(v2)) < float(np.linalg.norm(v))
 
 
-def test_force_is_exactly_A_action():
+def test_force_is_exactly_A_action_plus_B_velocity():
     rng = np.random.default_rng(0)
     for c in range(T.N_CONTEXTS):
-        A = T.context_matrix(c)
+        A, B = T.context_matrices(c)
         for _ in range(20):
             a = rng.standard_normal(2).astype(np.float32)
             v = rng.uniform(-T.V_MAX, T.V_MAX, 2).astype(np.float32)
-            assert np.allclose(T.context_force(a, v, c), A @ a, atol=1e-5)
+            assert np.allclose(T.context_force(a, v, c), A @ a + B @ v, atol=1e-5)
+
+
+def test_drift_is_a_velocity_increment_not_a_force():
+    """The drift adds to the velocity AFTER the force has acted, so the
+    returned F does not contain it and the next velocity does -- by exactly w,
+    off the cap and the walls."""
+    c = next(c for c in range(T.N_CONTEXTS) if T.C_LABEL[c] == "drift 90")
+    _A, _B, w = T.context_affine(c)
+    p = np.zeros(2, np.float32); v = np.array([0.01, 0.0], np.float32); a = np.array([0.2, 0.0], np.float32)
+    pn, vn, F = T.env_step(p, v, a, c, rng=None)
+    assert np.allclose(F, a - T.DAMPING * v, atol=1e-6)                    # F is action + damping only
+    assert np.allclose(vn, v + (F / T.MASS) * T.DT + w, atol=1e-6)         # w rides on top
+    assert w[1] > 0 and abs(w[0]) < 1e-7                                    # drift 90 pushes +y
 
 
 def test_force_never_depends_on_position():
@@ -228,10 +266,11 @@ def test_env_step_is_shape_polymorphic():
 def test_velocity_is_zeroed_on_the_axis_that_clips():
     """Inelastic collision.  Without it an agent would keep integrating force
     into the wall and need as many steps to escape as it spent arriving."""
-    # `refl 0` is diag(1, -1), so an x-only action stays x-only and the y axis
-    # is genuinely untouched.  A rotation context would turn the action and put
-    # force on y, which is the plant working, not the clip leaking.
-    c = next(c for c in range(T.N_CONTEXTS) if T.C_LABEL[c] == "refl 0")
+    # `drift 0` leaves the action alone and pushes along x, so an x-only action
+    # stays x-only and the y axis is genuinely untouched.  A rotation context
+    # would turn the action and put force on y, which is the plant working,
+    # not the clip leaking.
+    c = next(c for c in range(T.N_CONTEXTS) if T.C_LABEL[c] == "drift 0")
     p = np.array([T.POS_LIM - 1e-4, 0.0], np.float32)
     v = np.array([T.V_MAX, 0.0], np.float32)
     a = np.array([1.0, 0.0], np.float32)
@@ -270,14 +309,26 @@ def test_command_noise_magnitude_does_not_depend_on_the_context():
             p = rng.uniform(-0.5, 0.5, 2).astype(np.float32)
             v = np.zeros(2, np.float32)
             a = T.initial_action(rng)
+            _A, _B, w = T.context_affine(c)
             for _t in range(30):
                 a = T.next_action(a, rng)
                 clean = T.context_force(a, v, c) - T.DAMPING * v
                 pn, vn, _ = T.env_step(p, v, a, c, rng)
-                res.append(vn - v - (clean / T.MASS) * T.DT)
+                # only steps the cap and the walls left alone carry the noise
+                # unclipped; the drift increment is known and subtracted
+                free = (np.linalg.norm(vn) < T.V_MAX * 0.999
+                        and np.all(np.abs(pn) < T.POS_LIM - 1e-6))
+                if free:
+                    res.append(vn - v - (clean / T.MASS) * T.DT - w)
                 p, v = pn, vn
         rms.append(float(np.sqrt((np.array(res) ** 2).sum(-1).mean())))
-    assert max(rms) / min(rms) < 1.05, rms
+    # the bound is looser than the 1.05 it was at MASS 100 / DAMPING 17.7:
+    # at MASS 32 / DAMPING 1 the cap binds on ~25% of steps and dropping the
+    # clipped ones selects on the noise itself (outward kicks get clipped and
+    # removed), by a context-dependent amount. The property -- the injected
+    # noise has the same size in every context, |A eta| = |eta| -- is exact
+    # by construction; this test guards the plant from breaking it grossly.
+    assert max(rms) / min(rms) < 1.15, rms
 
 
 # ── calibration guards ───────────────────────────────────────────────────
@@ -288,7 +339,7 @@ def _one_step_effect(c, n=90, seed=0):
     rng = np.random.default_rng(seed)
     I = np.eye(2, dtype=np.float32)
     Z = np.zeros((2, 2), dtype=np.float32)
-    A, B = T.context_matrices(c)
+    A, B, w = T.context_affine(c)
     num, den = [], []
     for _ in range(n):
         p = rng.uniform(-0.9, 0.9, 2).astype(np.float32)
@@ -296,35 +347,38 @@ def _one_step_effect(c, n=90, seed=0):
         a = T.initial_action(rng)
         for _t in range(T.SEQ_LEN):
             a = T.next_action(a, rng)
-            _, vc, _ = T.env_step_ab(p, v, a, A, B)
-            _, vn, _ = T.env_step_ab(p, v, a, I, Z)
+            # compare UNCLIPPED one-step velocity changes, so the cap does not
+            # flatten the contrast between families at this mass
+            fc = A @ a + B @ v - T.DAMPING * v
+            fn = a - T.DAMPING * v
+            vc = v + (fc / T.MASS) * T.DT + w
+            vn = v + (fn / T.MASS) * T.DT
             num.append(((vc - vn) ** 2).sum())
             den.append((vn ** 2).sum())
             p, v, _ = T.env_step(p, v, a, c)
     return float(np.sqrt(np.mean(num)) / np.sqrt(np.mean(den)))
 
 
-def test_family_effect_sizes_are_where_geometry_says():
-    """THE TWO FAMILIES ARE NOT MATCHED AND CANNOT BE.  Reflections sit at
-    sqrt(2)|a| whatever the axis, so their effect size is constant; rotations
-    are graded as 2|sin(theta/2)||a| and cross the reflections only at +-90.
-    So pin reflection's flatness and rotation's grading, rather than assert a
-    balance the geometry forbids.  Loose bounds: this catches an angle table
-    drifting, not a third decimal.
+def test_family_effect_sizes_are_matched_across_families():
+    """THE THREE FAMILIES ARE CALIBRATED TO ONE ANOTHER (task.py's family
+    section): the low level of each -- rot +-30, curl +-7, one drift -- is
+    the same effect size, the high level of rotation and curl is ~2x that,
+    and drift is flat across its four directions. Loose bounds: this catches
+    a table or plant constant moving without the others being re-matched,
+    not a third decimal.
     """
-    rot = [_one_step_effect(c) for c in range(T.N_CONTEXTS) if T.FAMILY[c] == 0]
-    ref = [_one_step_effect(c) for c in range(T.N_CONTEXTS) if T.FAMILY[c] == 1]
-    assert max(ref) / min(ref) < 1.10, ref          # reflections: flat
-    # rotations are graded, but the SIZE of the grading is set by which angles
-    # are in the table: +-45/+-90 gives 2 sin(45)/2 sin(22.5) = 1.85, so the
-    # bound has to sit below that rather than at a round 2.0
-    assert max(rot) / min(rot) > 1.6, rot
-    # THE FAMILIES MEET AT +-90, and that is an identity rather than a
-    # coincidence: 2 sin(45) = sqrt(2), so the strongest rotation in the table
-    # has exactly the reflection effect size.  (They would only EXCEED it if
-    # the table carried angles past +-90, which it no longer does.)
-    assert abs(max(rot) - np.mean(ref)) < 0.05 * np.mean(ref), (max(rot), ref)
-    assert min(rot) < 0.7 * min(ref), (min(rot), min(ref))
+    by_fam = {f: [_one_step_effect(c) for c in range(T.N_CONTEXTS) if T.FAMILY[c] == f]
+              for f in range(3)}
+    rot, curl, drift = by_fam[0], by_fam[1], by_fam[2]
+    assert max(drift) / min(drift) < 1.10, drift                 # drift: flat
+    assert max(rot) / min(rot) > 1.6, rot                        # graded: 2 sin30 / 2 sin15 = 1.93
+    assert max(curl) / min(curl) > 1.5, curl                     # graded ~1.9 (velocity-dependent)
+    # low levels matched: exactly in force units (task.py's table), within
+    # ~1.5x in this one-step velocity measure, where curl's and drift's
+    # effects ride on the velocity they themselves build up
+    lows = [min(rot), min(curl), np.mean(drift)]
+    assert max(lows) / min(lows) < 1.5, lows
+    assert abs(max(rot) - max(curl)) < 0.3 * max(rot), (max(rot), max(curl))
 
 
 def test_the_plant_is_not_identifiable_from_one_step():
@@ -334,9 +388,10 @@ def test_the_plant_is_not_identifiable_from_one_step():
     def acc(k, noisy, n=320, seed=0):
         rng = np.random.default_rng(seed)
         cor = tot = 0
+        laws = [T.context_affine(cc) for cc in range(T.N_CONTEXTS)]
         for c in range(T.N_CONTEXTS):
             m = n // T.N_CONTEXTS + 1
-            A_, DV, MK = [], [], []
+            A_, V_, DV, MK = [], [], [], []
             for _ in range(m):
                 p = rng.uniform(-0.9, 0.9, 2).astype(np.float32)
                 v = np.zeros(2, np.float32)
@@ -347,18 +402,18 @@ def test_the_plant_is_not_identifiable_from_one_step():
                     hit = (np.any(np.abs(pn) >= T.POS_LIM - 1e-6)
                            or np.linalg.norm(vn) >= T.V_MAX * 0.999)
                     # the damping is known, so subtract it: what identifies the
-                    # context is the ACTION's contribution alone
-                    A_.append(a.copy())
+                    # context is the law's contribution alone
+                    A_.append(a.copy()); V_.append(v.copy())
                     DV.append(vn - v + (T.DAMPING / T.MASS) * v * T.DT)
                     MK.append(0.0 if hit else 1.0)
                     p, v = pn, vn
             s = (m, k, 2)
-            A_ = np.array(A_).reshape(s)
+            A_ = np.array(A_).reshape(s); V_ = np.array(V_).reshape(s)
             DV = np.array(DV).reshape(s)
             MK = np.array(MK).reshape(m, k, 1)
             ll = np.zeros((m, T.N_CONTEXTS))
-            for cc in range(T.N_CONTEXTS):
-                pred = (A_ @ T.context_matrix(cc).T) / T.MASS * T.DT
+            for cc, (A, B, w) in enumerate(laws):
+                pred = (A_ @ A.T + V_ @ B.T) / T.MASS * T.DT + w
                 ll[:, cc] = -((MK * (DV - pred) ** 2).sum(axis=(1, 2)))
             cor += (ll.argmax(1) == c).sum()
             tot += m
@@ -366,13 +421,15 @@ def test_the_plant_is_not_identifiable_from_one_step():
 
     # PIN THE PROPERTY, NOT THE LEVEL.  Absolute thresholds here encode one
     # particular CMD_NOISE and one particular context count, and both have
-    # moved: halving the table from 16 contexts to 8 took the noisy two-step
-    # accuracy from below 0.80 to 0.90 without anything being wrong.  What must
-    # stay true is the SHAPE -- deterministic is solved at once, noise costs
-    # something, and history recovers it.
-    clean1 = acc(1, noisy=False)
+    # moved.  What must stay true is the SHAPE -- deterministic is solved
+    # within a few steps, noise costs something, and history recovers it.
+    # ONE clean step no longer suffices by design: curl acts on velocity,
+    # which starts at zero, so the four curls are identical on the first step
+    # from rest (chance among them: 9/12 = 0.75 is the one-step ceiling).
+    clean1, clean3 = acc(1, noisy=False), acc(3, noisy=False)
     noisy1, noisy10 = acc(1, noisy=True), acc(10, noisy=True)
-    assert clean1 > 0.95, clean1                  # no noise: one step suffices
-    assert noisy1 < clean1 - 0.15, (noisy1, clean1)   # noise costs real accuracy
+    assert 0.65 < clean1 < 0.9, clean1            # the rotations and drifts, not the curls
+    assert clean3 > 0.9, clean3                   # a little velocity separates the curls
+    assert noisy1 < clean1 - 0.1, (noisy1, clean1)     # noise costs real accuracy
     assert noisy10 > noisy1 + 0.15, (noisy1, noisy10)  # history recovers it
-    assert noisy10 > 0.80, noisy10                # and gets there within a block
+    assert noisy10 > 0.75, noisy10                # and gets most of the way within a block

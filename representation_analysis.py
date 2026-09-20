@@ -66,11 +66,12 @@ import model as M
 from data import generate_sequences
 from decode import _clf, seq_split
 from task import (CONTEXTS, C_LABEL, FAMILY, FAM_NAMES, N_CONTEXTS, TSS_MIN)
+from plotting_utils import set_plt_params, make_axis_nice
 
 N_SEQ = 1200
 N_SPLITS = 8
 SITES = ("z", "mtl_hidden", "cb_layer1", "cb_layer2")
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b"}
+FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b", "curl": "#27ae60", "drift": "#e67e22"}
 # contexts grouped by family, which is the order that makes the block
 # structure visible in the confusion matrix
 ORDER = sorted(range(N_CONTEXTS), key=lambda c: (FAMILY[c], c))
@@ -82,14 +83,21 @@ def _despine(a):
         a.spines[s].set_visible(False)
 
 
-def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN):
+def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN,
+            action_mode=M.DEFAULT_ACTION_MODE):
     """Roll out and return the four sites plus labels, restricted to settled
-    steps."""
-    loaded = M.load(arm, seed)
+    steps.
+
+    `action_mode` selects WHICH supervised circuit -- the two live at different
+    checkpoint paths. It also selects the rollout distribution below, because
+    measuring a gp-trained circuit's geometry on fitted-mode sequences would
+    describe it on a distribution it was not fitted for.
+    """
+    loaded = M.load(arm, seed, action_mode)
     if loaded is None:
         return None
     ec, cb = loaded
-    trans, ctx, tss = generate_sequences(n, seed=123)
+    trans, ctx, tss = generate_sequences(n, seed=123, action_mode=action_mode)
     with torch.no_grad():
         _, _, _, sites = M.rollout(ec, cb, trans, arm, mode,
                                    torch.Generator().manual_seed(0), sites=True)
@@ -102,9 +110,14 @@ def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN):
     out.update(cid=cid[keep], fam=fam[keep], sid=sid[keep],
                tss=t.ravel()[keep])
     # kinematics, for the PCA colourings: the same observation the network sees
-    obs, _, _ = M.build(trans)
+    obs, act, _ = M.build(trans)
     obs = obs.numpy().reshape(-1, obs.shape[-1])[keep]
     out["pos"], out["vel"] = obs[:, :2], obs[:, 2:]
+    # THE ACTION, which the conjunctivity measures bin on. It is the variable
+    # the contexts actually transform (F = A(c) a), so it is where an
+    # interaction between context and state is theoretically expected -- see
+    # the conjunctivity section.
+    out["act"] = act.numpy().reshape(-1, act.shape[-1])[keep]
     return out
 
 
@@ -170,7 +183,8 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
                  f"of errors stay inside the true family "
                  f"(chance {within['chance']:.0%})", fontsize=10.5)
     fig.tight_layout()
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path); plt.close(fig)
     print(f"  saved -> {path}")
 
     wpath = path.replace("confusion_", "weightcos_")
@@ -203,7 +217,8 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
         fontsize=8.5, loc="left")
 
     fig.tight_layout()
-    fig.savefig(wpath, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(wpath); plt.close(fig)
     print(f"  saved -> {wpath}")
     return acc, within
 
@@ -295,6 +310,7 @@ def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
         f"context, context is a MINOR axis -- see the top-k decoding figure for "
         f"the quantitative version", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .96))
+    make_axis_nice(fig)
     fig.savefig(path, dpi=140); plt.close(fig)
     print(f"  saved -> {path}")
 
@@ -310,6 +326,12 @@ def pc_variance(d, P, n_pc=10):
         context   eta^2 -- between-context variance / total.  Exactly the R^2 of
                   regressing the PC on an N_CONTEXTS-way one-hot, no linearity
                   assumed.
+        family    eta^2 over the two families (rotation / reflection). Family
+                  is NESTED in context, so family <= context on every PC and
+                  the gap is what the PC encodes about WHICH member of a
+                  family. A PC with family ~ context has abstracted the
+                  family and nothing else; one with family ~ 0 and context
+                  high separates members but not families.
         position  R^2 of an OLS fit on (x, y)
         velocity  R^2 of an OLS fit on (vx, vy)
 
@@ -326,17 +348,18 @@ def pc_variance(d, P, n_pc=10):
     for site in SITES:
         pr = P[site]["proj"][:, :n_pc]
         var = P[site]["var"][:n_pc]
-        r2 = {"context": [], "position": [], "velocity": []}
+        r2 = {"context": [], "family": [], "position": [], "velocity": []}
         for k in range(n_pc):
             y = pr[:, k]
             yv = y.var()
-            # eta^2 for context: 1 - within-group variance / total
-            within = 0.0
-            for c in range(N_CONTEXTS):
-                m = d["cid"] == c
-                if m.sum() > 1:
-                    within += m.sum() * y[m].var()
-            r2["context"].append(1 - within / (len(y) * yv + 1e-12))
+            # eta^2: 1 - within-group variance / total, for each grouping
+            for name, labels in (("context", d["cid"]), ("family", d["fam"])):
+                within = 0.0
+                for g in np.unique(labels):
+                    m = labels == g
+                    if m.sum() > 1:
+                        within += m.sum() * y[m].var()
+                r2[name].append(1 - within / (len(y) * yv + 1e-12))
             for name, X in (("position", d["pos"]), ("velocity", d["vel"])):
                 A = np.column_stack([X, np.ones(len(X))])
                 beta, *_ = np.linalg.lstsq(A, y, rcond=None)
@@ -348,15 +371,20 @@ def pc_variance(d, P, n_pc=10):
 
 def fig_pc_variance(arm, seed, V, path, n_pc=10):
     """One panel per site: grouped bars of what each PC encodes."""
-    cols = {"context": "#8e44ad", "position": "#1e8449", "velocity": "#e67e22"}
+    cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
+            "velocity": "#e67e22"}
     fig, axes = plt.subplots(1, len(SITES), figsize=(4.6 * len(SITES), 4.4),
                              sharey=True)
     x = np.arange(n_pc)
+    nb = len(cols)
+    w = 0.8 / nb
     for ai, site in enumerate(SITES):
         a = axes[ai]
         v = V[site]
         for bi, (name, c) in enumerate(cols.items()):
-            a.bar(x + (bi - 1) * .27, v[name][:n_pc], width=.26, color=c,
+            if name not in v:                       # an older npz without family
+                continue
+            a.bar(x + (bi - (nb - 1) / 2) * w, v[name][:n_pc], width=w * 0.95, color=c,
                   label=name if ai == 0 else None)
         a2 = a.twinx()
         a2.plot(x, v["var"][:n_pc] * 100, "k.--", ms=5, lw=1, alpha=.6)
@@ -377,13 +405,14 @@ def fig_pc_variance(arm, seed, V, path, n_pc=10):
     fig.suptitle(
         f"{arm} seed {seed} -- what does each principal component encode?  "
         f"(tss >= {TSS_MIN})\n"
-        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts; position and velocity are "
-        f"linear $R^2$.  They may overlap -- drift contexts move the agent, so "
-        f"context and position are genuinely correlated.\n"
+        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts, family $\\eta^2$ over the 2 "
+        f"families (nested in context: family $\\leq$ context, the gap is within-family "
+        f"identity); position and velocity are linear $R^2$.  They may overlap.\n"
         f"dashed line: how much of the site's total variance that PC carries.",
         fontsize=10)
+    make_axis_nice(fig)
     fig.tight_layout(rect=(0, 0, 1, .88))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    fig.savefig(path); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -430,6 +459,7 @@ def gif_pca(arm, seed, d, P, site, path, n_show=3000, frames=72, rng_seed=0):
     fig.suptitle(f"{arm} seed {seed} -- {site}, top 3 PCs  "
                  f"({var[:3].sum():.0%} of variance, tss >= {TSS_MIN})",
                  fontsize=11)
+    make_axis_nice(fig)
     fig.tight_layout(rect=(0, 0, 1, .93))
     w = PillowWriter(fps=12)
     with w.saving(fig, path, dpi=70):
@@ -496,7 +526,8 @@ def fig_topk(arm, seed, T, full_acc, path):
         f"context needing PCs that carry little variance = a minor axis "
         f"(mixed selectivity)", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .84))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -553,12 +584,14 @@ def fig_clusters(arm, seed, d, P, site, path, n_show=4000, rng_seed=0):
         f"all three pairwise projections, so no viewing angle is chosen for "
         f"you.  Read DOWN a column: is the structure contextual, or kinematic?",
         fontsize=11.5)
+    make_axis_nice(fig)
     fig.tight_layout(rect=(0, 0, 1, .955))
     fig.savefig(path, dpi=150); plt.close(fig)
     print(f"  saved -> {path}")
 
 
-def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0):
+def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0,
+                    action_mode=M.DEFAULT_ACTION_MODE):
     """PAPER FIGURE.  What z encodes, and how consistent it is across seeds.
 
     Top row: PC1 vs PC2 of z for ONE seed, coloured by context, position and
@@ -584,16 +617,19 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0):
     var = P["z"]["var"]
     spd = np.linalg.norm(d["vel"][idx], axis=1)
     # pool the per-PC variance decomposition over whatever seeds have it
-    V = {k: [] for k in ("context", "position", "velocity")}
+    V = {k: [] for k in ("context", "family", "position", "velocity")}
     got = []
     for sd_ in seeds:
-        f = os.path.join(M.fig_dir(arm, sd_), "pc_variance.npz")
+        f = os.path.join(M.fig_dir(arm, sd_, action_mode=action_mode),
+                         "pc_variance.npz")
         if not os.path.exists(f):
             continue
         z = np.load(f)
         for k in V:
-            V[k].append(z[f"{k}|z"])
+            if f"{k}|z" in z.files:             # family is absent from older npz
+                V[k].append(z[f"{k}|z"])
         got.append(sd_)
+    V = {k: v for k, v in V.items() if v}
     fig = plt.figure(figsize=(15, 8.4))
     gs = fig.add_gridspec(2, 3, height_ratios=[1, .9], hspace=.38, wspace=.28)
     panels = [("context", d["cid"][idx], "tab20", None),
@@ -636,7 +672,8 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0):
         f"and velocity are linear $R^2$.  They need not sum to 1 -- drift "
         f"contexts move the agent, so context and position are correlated.",
         fontsize=11)
-    fig.savefig(path, dpi=170, bbox_inches="tight"); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path, bbox_inches="tight"); plt.close(fig)
     print(f"  saved -> {path}")
 
 
@@ -819,11 +856,13 @@ def fig_mds(arm, seed, panels, path, site="z"):
     fig.suptitle(f"{arm} seed {seed} -- context geometry in {site}  "
                  f"(tss >= {TSS_MIN});  colour = family", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .93))
-    fig.savefig(path, dpi=170); plt.close(fig)
+    make_axis_nice(fig)
+    fig.savefig(path); plt.close(fig)
     print(f"  saved -> {path}")
 
 
-def pool_pc_variance(arm, seeds, tag="", n_pc=10):
+def pool_pc_variance(arm, seeds, tag="", n_pc=10,
+                     action_mode=M.DEFAULT_ACTION_MODE):
     """The per-PC decomposition at ALL FOUR sites, pooled across seeds.
 
     The paper figure pools this too but only for z.  This is the version that
@@ -834,28 +873,33 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10):
     much of that site's TOTAL variance each PC carries.  The bars say what a
     component encodes, the dashed line says how much it matters.
     """
-    got, A = [], {s_: {k: [] for k in ("context", "position", "velocity",
+    got, A = [], {s_: {k: [] for k in ("context", "family", "position", "velocity",
                                        "var")} for s_ in SITES}
     for sd_ in seeds:
-        f = os.path.join(M.fig_dir(arm, sd_), f"pc_variance{tag}.npz")
+        f = os.path.join(M.fig_dir(arm, sd_, action_mode=action_mode),
+                         f"pc_variance{tag}.npz")
         if not os.path.exists(f):
             continue
         z = np.load(f)
         for s_ in SITES:
             for k in A[s_]:
-                A[s_][k].append(z[f"{k}|{s_}"])
+                if f"{k}|{s_}" in z.files:      # family is absent from older npz
+                    A[s_][k].append(z[f"{k}|{s_}"])
         got.append(sd_)
     if not got:
         print(f"  {arm}: no pc_variance to pool"); return
-    cols = {"context": "#8e44ad", "position": "#1e8449", "velocity": "#e67e22"}
+    cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
+            "velocity": "#e67e22"}
+    cols = {k: c for k, c in cols.items() if A["z"][k]}
     fig, axes = plt.subplots(1, len(SITES), figsize=(4.8 * len(SITES), 4.6),
                              sharey=True)
     x = np.arange(n_pc)
+    nb = len(cols); w = 0.8 / nb
     for ai, site in enumerate(SITES):
         a = axes[ai]
         for bi, (name, c) in enumerate(cols.items()):
             R = np.array(A[site][name])[:, :n_pc]
-            a.bar(x + (bi - 1) * .27, R.mean(0), yerr=R.std(0), width=.26,
+            a.bar(x + (bi - (nb - 1) / 2) * w, R.mean(0), yerr=R.std(0), width=w * 0.95,
                   color=c, label=name if ai == 0 else None, capsize=2,
                   error_kw={"lw": .8, "ecolor": "#444"})
         v = np.array(A[site]["var"])[:, :n_pc].mean(0)
@@ -868,6 +912,7 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10):
         a.set_xlabel("principal component"); a.set_title(site, fontsize=12)
         a.set_ylim(0, 1)
         _despine(a)
+        make_axis_nice(a)
         a2.spines["top"].set_visible(False)
     axes[0].set_ylabel("variance of that PC explained ($R^2$)")
     axes[0].legend(frameon=False, fontsize=10)
@@ -878,21 +923,24 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10):
         f"and velocity are linear $R^2$.  Only $z$ leads with context.",
         fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .89))
+    make_axis_nice(fig)
     d = os.path.join(M.FIG_DIR, arm, "across_seeds")
     os.makedirs(d, exist_ok=True)
     p_ = os.path.join(d, f"pc_variance{tag}.png")
-    fig.savefig(p_, dpi=170); plt.close(fig)
+    fig.savefig(p_); plt.close(fig)
     print(f"  saved -> {p_}   (pooled over {len(got)} seeds)")
 
 
-def pool_topk(arm, seeds, tag=""):
+def pool_topk(arm, seeds, tag="",
+              action_mode=M.DEFAULT_ACTION_MODE):
     """Pool the top-k curves.  These ARE comparable across seeds -- k and
     accuracy mean the same thing in every network -- so this is the version to
     quote, and the per-seed figure becomes a check rather than a result."""
     got, A = [], {site: [] for site in SITES}
     ks = cum = None
     for sd_ in seeds:
-        f = os.path.join(M.fig_dir(arm, sd_), f"topk{tag}.npz")
+        f = os.path.join(M.fig_dir(arm, sd_, action_mode=action_mode),
+                         f"topk{tag}.npz")
         if not os.path.exists(f):
             continue
         z = np.load(f)
@@ -925,12 +973,14 @@ def pool_topk(arm, seeds, tag=""):
                  f"context needing PCs that carry little variance = a minor "
                  f"axis (mixed selectivity)", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .87))
+    make_axis_nice(fig)
     p = os.path.join(d, f"topk{tag}.png")
-    fig.savefig(p, dpi=170); plt.close(fig)
+    fig.savefig(p); plt.close(fig)
     print(f"  saved -> {p}   (pooled over {len(got)} seeds)")
 
 
-def pool_mds(arm, seeds, site="z", tag=""):
+def pool_mds(arm, seeds, site="z", tag="",
+             action_mode=M.DEFAULT_ACTION_MODE):
     """Pool MDS by averaging the DISTANCE MATRICES, then embedding once.
 
     MDS coordinates cannot be averaged across seeds: each embedding is defined
@@ -941,7 +991,8 @@ def pool_mds(arm, seeds, site="z", tag=""):
     """
     dps, Ds, Drs, got = [], [], [], []
     for sd_ in seeds:
-        f = os.path.join(M.fig_dir(arm, sd_), f"mds_{site}{tag}.npz")
+        f = os.path.join(M.fig_dir(arm, sd_, action_mode=action_mode),
+                         f"mds_{site}{tag}.npz")
         if not os.path.exists(f):
             continue
         z = np.load(f)
@@ -971,7 +1022,8 @@ def pool_mds(arm, seeds, site="z", tag=""):
         os.path.join(d, f"mds_{site}{tag}.png"), site)
 
 
-def pool_confusion(arm, seeds, site="z", tag=""):
+def pool_confusion(arm, seeds, site="z", tag="",
+                   action_mode=M.DEFAULT_ACTION_MODE):
     """Average the row-normalised confusion and the weight-cosine across seeds.
 
     Both are already normalised per seed, so a plain mean is the right pooling
@@ -980,7 +1032,8 @@ def pool_confusion(arm, seeds, site="z", tag=""):
     """
     Cs, Ss, got = [], [], []
     for s in seeds:
-        p = os.path.join(M.fig_dir(arm, s), f"confusion_{site}{tag}.npz")
+        p = os.path.join(M.fig_dir(arm, s, action_mode=action_mode),
+                         f"confusion_{site}{tag}.npz")
         if not os.path.exists(p):
             continue
         z = np.load(p, allow_pickle=True)
@@ -1006,6 +1059,10 @@ if __name__ == "__main__":
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--mode", default="intact", choices=["intact", "zero", "shuffle"])
     ap.add_argument("--site", default="z", choices=SITES)
+    # --action-mode / --readout / --rate-beta / --noise-sigma: which supervised
+    # circuit to analyse. The checkpoint, the rollout distribution and the
+    # figure directory (figures/<arm_tag>/) all follow the one spec.
+    M.add_circuit_args(ap)
     ap.add_argument("--confusion", action="store_true")
     ap.add_argument("--pca", action="store_true",
                     help="PCA at all four sites, coloured by context, family, "
@@ -1025,29 +1082,39 @@ if __name__ == "__main__":
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed average")
     a = ap.parse_args()
+
+    set_plt_params(style="fast")
+
     if not (a.confusion or a.pca or a.topk or a.gif or a.mds or a.paper):
         ap.error("nothing to do: pass --confusion, --pca, --topk, --mds, --paper and/or --gif")
+    # the spec travels in the action_mode slot everywhere below (see model's
+    # CircuitSpec section), so the noisy circuits need no further plumbing
+    a.action_mode = M.circuit_from_args(a)
     for arm in a.arms:
+        # the label every figure carries: "main" or "main_gp"
+        atag = M.arm_tag(arm, a.action_mode)
         if a.paper:
-            d0 = collect(arm, a.seeds[0], a.mode)
+            d0 = collect(arm, a.seeds[0], a.mode, action_mode=a.action_mode)
             if d0 is not None:
                 P0 = pca_sites(d0)
-                fig_paper_pca_z(arm, a.seeds, d0, P0,
-                                os.path.join(M.FIG_DIR, arm,
-                                             f"paper_pca_z{'' if a.mode=='intact' else '_'+a.mode}.png"))
+                fig_paper_pca_z(atag, a.seeds, d0, P0,
+                                os.path.join(M.FIG_DIR, atag,
+                                             f"paper_pca_z{'' if a.mode=='intact' else '_'+a.mode}.png"),
+                                action_mode=a.action_mode)
         for s in a.seeds:
-            d = collect(arm, s, a.mode)
+            d = collect(arm, s, a.mode, action_mode=a.action_mode)
             if d is None:
-                print(f"  no checkpoint for {arm} seed {s}"); continue
-            print(f"  [{arm} seed {s}] {d['cid'].size} settled steps", flush=True)
-            out = M.fig_dir(arm, s)
+                print(f"  no checkpoint for {arm} seed {s} ({a.action_mode})")
+                continue
+            print(f"  [{atag} seed {s}] {d['cid'].size} settled steps", flush=True)
+            out = M.fig_dir(arm, s, action_mode=a.action_mode)
             tag = "" if a.mode == "intact" else f"_{a.mode}"
             if a.confusion:
                 C, S = confusion(d, a.site)
                 np.savez(os.path.join(out, f"confusion_{a.site}{tag}.npz"),
                          C=C, S=S, order=np.array(ORDER),
                          labels=np.array(LABELS))
-                fig_confusion(arm, s, C, S,
+                fig_confusion(atag, s, C, S,
                               os.path.join(out, f"confusion_{a.site}{tag}.png"),
                               a.site)
             if a.mds:
@@ -1059,7 +1126,7 @@ if __name__ == "__main__":
                 np.savez(os.path.join(out, f"mds_{a.site}{tag}.npz"),
                          weights=cw, centroids=cc, centroids_resid=cr,
                          dp=dp, D=Dc, D_resid=Dr)
-                fig_mds(arm, s, [
+                fig_mds(atag, s, [
                     ("MDS on decoder WEIGHTS",   cw,
                      f"1 - cosine, rank {N_CONTEXTS//2} truncated"),
                     ("MDS on CENTROIDS",         cc,
@@ -1072,19 +1139,19 @@ if __name__ == "__main__":
                 np.savez(os.path.join(out, f"pca{tag}.npz"),
                          **{f"var|{k}": P[k]["var"] for k in SITES})
             if a.pca:
-                fig_pca(arm, s, d, P, os.path.join(out, f"pca{tag}.png"))
+                fig_pca(atag, s, d, P, os.path.join(out, f"pca{tag}.png"))
                 for site in SITES:
-                    fig_clusters(arm, s, d, P, site,
+                    fig_clusters(atag, s, d, P, site,
                                  os.path.join(out, f"clusters_{site}{tag}.png"))
                 V = pc_variance(d, P)
                 np.savez(os.path.join(out, f"pc_variance{tag}.npz"),
                          **{f"{w}|{k}": V[k][w] for k in SITES
-                            for w in ("var", "context", "position", "velocity")})
-                fig_pc_variance(arm, s, V,
+                            for w in ("var", "context", "family", "position", "velocity")})
+                fig_pc_variance(atag, s, V,
                                 os.path.join(out, f"pc_variance{tag}.png"))
             if a.gif:
                 for site in SITES:
-                    gif_pca(arm, s, d, P, site,
+                    gif_pca(atag, s, d, P, site,
                             os.path.join(out, f"pca_{site}{tag}.gif"))
             if a.topk:
                 T = topk(d, P)
@@ -1094,14 +1161,17 @@ if __name__ == "__main__":
                 te = seq_split(d["sid"], seed=0)
                 full = float(_clf(0).fit(d["z"][~te], d["cid"][~te])
                              .score(d["z"][te], d["cid"][te]))
-                fig_topk(arm, s, T, full, os.path.join(out, f"topk{tag}.png"))
+                fig_topk(atag, s, T, full, os.path.join(out, f"topk{tag}.png"))
         if a.pool:
             tg = "" if a.mode == "intact" else f"_{a.mode}"
             if a.confusion:
-                pool_confusion(arm, a.seeds, a.site, tg)
+                pool_confusion(arm, a.seeds, a.site, tg,
+                               action_mode=a.action_mode)
             if a.pca:
-                pool_pc_variance(arm, a.seeds, tg)
+                pool_pc_variance(arm, a.seeds, tg,
+                                 action_mode=a.action_mode)
             if a.topk:
-                pool_topk(arm, a.seeds, tg)
+                pool_topk(arm, a.seeds, tg, action_mode=a.action_mode)
             if a.mds:
-                pool_mds(arm, a.seeds, a.site, tg)
+                pool_mds(arm, a.seeds, a.site, tg,
+                         action_mode=a.action_mode)

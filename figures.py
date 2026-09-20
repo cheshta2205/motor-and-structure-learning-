@@ -63,7 +63,7 @@ COND = [("intact", "intact", "#1a1a1a", "-"),
         ("zero", "$e$ zeroed", "#c0392b", "-"),
         ("shuffle", "$e$ shuffled", "#e67e22", "--"),
         ("mtl_noise", "MTL noise", "#7f8c8d", ":")]
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b"}
+FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b", "curl": "#27ae60", "drift": "#e67e22"}
 # ONE grouping: the design is flat again, so a "level" is a family.
 LEVELS = list(FAM_NAMES)
 LEVEL_INDEX = {n: i for i, n in enumerate(FAM_NAMES)}
@@ -72,6 +72,7 @@ READOUTS = LEVELS + ["family", "all"]
 ARM_TITLE = {"main": "main (MTL denied $s_t$)",
              "control": "control (MTL given $s_t$)"}
 
+set_plt_params(style='fast', file_format="png")
 
 def _handles():
     return [Line2D([], [], color=c, ls=ls, marker="o", ms=4, lw=1.8, label=l)
@@ -109,14 +110,21 @@ def ang(u, v):
 
 
 # ── data ── load ckpts 
-def collect(arm, seed, n=N_SEQ):
+def collect(arm, seed, n=N_SEQ, action_mode=M.DEFAULT_ACTION_MODE):
     """Roll the trained arm out under all three conditions.  One place, so every
-    figure below is looking at the same rollout."""
-    loaded = M.load(arm, seed)
+    figure below is looking at the same rollout.
+
+    `action_mode` picks WHICH circuit -- the two live at different checkpoint
+    paths -- and the rollout distribution with it.  Both, together: describing
+    a gp-trained circuit on fitted-mode sequences would characterise it on a
+    distribution it was never fitted for, and the figures would be labelled gp
+    while showing something else.
+    """
+    loaded = M.load(arm, seed, action_mode)
     if loaded is None:
         return None
     ec, cb = loaded
-    trans, ctx, tss = generate_sequences(n, seed=123)
+    trans, ctx, tss = generate_sequences(n, seed=123, action_mode=action_mode)
     out = {"trans": trans,
            "cid": ctx[:, :, 0].numpy().astype(int),
            "fam": ctx[:, :, 1].numpy().astype(int),
@@ -216,6 +224,7 @@ def fig_mtl_control(arm, seed, r, path):
     fig.suptitle("Is the decoding loss specific to the cerebellar channel?\n"
                  + ttl, fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.90))
+    make_axis_nice(fig)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fig.savefig(path, dpi=300); plt.close(fig)
     print(f"    saved -> {path}", flush=True)
@@ -398,9 +407,9 @@ def fig_tss(arm, seed, d, path):
     print(f"  saved -> {path}")
 
 
-def fig_epochs(arm, seed, path):
+def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     """Training history.  Needs track.npz, which only train() writes."""
-    p = os.path.join(M.fig_dir(arm, seed), "track.npz")
+    p = os.path.join(M.fig_dir(arm, seed, action_mode=action_mode), "track.npz")
     if not os.path.exists(p):
         print(f"  (no track.npz for {arm} seed {seed} -- only written during "
               f"training; skipping epoch_curves)")
@@ -497,18 +506,18 @@ PRE, POST = 4, 4
 OFFSETS = list(range(-PRE, POST))
 
 
-def switch_aligned(arm, seed, n=N_SEQ):
+def switch_aligned(arm, seed, n=N_SEQ, action_mode=M.DEFAULT_ACTION_MODE):
     """Lesion e ONLY in a window around each switch, and score the same window.
 
     Separates re-inferring a NEW context from maintaining one already known.
     Decoding falls on BOTH sides, which says the error is not just a change
     detector -- it feeds a continuous state-estimation loop.
     """
-    loaded = M.load(arm, seed)
+    loaded = M.load(arm, seed, action_mode)
     if loaded is None:
         return None
     ec, cb = loaded
-    trans, ctx, tss = generate_sequences(n, seed=123)
+    trans, ctx, tss = generate_sequences(n, seed=123, action_mode=action_mode)
     t = tss.numpy(); cid = ctx[:, :, 0].numpy().astype(int)
     fam = ctx[:, :, 1].numpy().astype(int)
     B, T = t.shape
@@ -567,6 +576,7 @@ def fig_switch(arm, seed, out, path, band=None, n_seed=None):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: $e$ lesioned only in the window shown "
                  f"-- decoding falls on BOTH sides of the switch{tail}", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .86))
+    make_axis_nice(fig)
     fig.savefig(path, dpi=300); plt.close(fig)
     print(f"  saved -> {path}")
 
@@ -574,12 +584,12 @@ def fig_switch(arm, seed, out, path, band=None, n_seed=None):
 # ── drivers ──────────────────────────────────────────────────────────────────
 
 
-def per_seed(arm, seed):
-    d = collect(arm, seed)
+def per_seed(arm, seed, action_mode=M.DEFAULT_ACTION_MODE):
+    d = collect(arm, seed, action_mode=action_mode)
     if d is None:
         print(f"  no checkpoint for {arm} seed {seed} "
               ); return
-    out = M.fig_dir(arm, seed)
+    out = M.fig_dir(arm, seed, action_mode=action_mode)
     r = curves(d)
     np.savez(os.path.join(out, "decoding.npz"),
              ks=np.array(KS, float),
@@ -592,9 +602,10 @@ def per_seed(arm, seed):
     fig_mtl_control(arm, seed, r, os.path.join(out, "mtl_control.png"))
     fig_global(arm, seed, r, os.path.join(out, "decoding_global.png"))
     fig_tss(arm, seed, d, os.path.join(out, "tss_curves.png"))
-    fig_epochs(arm, seed, os.path.join(out, "epoch_curves.png"))
+    fig_epochs(arm, seed, os.path.join(out, "epoch_curves.png"),
+               action_mode=action_mode)
     fig_forces(arm, seed, d, os.path.join(out, "forces.png"))
-    sa = switch_aligned(arm, seed)
+    sa = switch_aligned(arm, seed, action_mode=action_mode)
     if sa:
         np.savez(os.path.join(out, "switch_aligned.npz"),
                  offsets=np.array(OFFSETS),
@@ -611,19 +622,21 @@ def per_seed(arm, seed):
                 f"{a:>8.3f}+-{b:.3f}" for a, b in zip(mu, sd)))
 
 
-def across_seeds(arm, seeds):
+def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
     """Pool per-seed npz into figures banded ACROSS SEEDS -- the error bar to
     quote.  Missing seeds are skipped, never assumed, and the count actually
     used is stamped into the figure so an arm at n=2 and one at n=6 cannot be
     silently averaged as if equivalent."""
     d = {}
     for s in seeds:
-        p = os.path.join(M.fig_dir(arm, s), "decoding.npz")
+        p = os.path.join(M.fig_dir(arm, s, action_mode=action_mode), "decoding.npz")
         if os.path.exists(p):
             d[s] = np.load(p)
     if not d:
         print(f"  {arm}: nothing to pool"); return
-    out = os.path.join(M.FIG_DIR, arm, "across_seeds")
+    # the CIRCUIT'S tag, not the bare arm: this used to be figures/<arm>/, so
+    # pooling the ar1 (or any noisy) circuit overwrote the default's panels
+    out = os.path.join(M.FIG_DIR, M.arm_tag(arm, action_mode), "across_seeds")
     os.makedirs(out, exist_ok=True)
     n = len(d)
     mse = {m: float(np.mean([float(z[f"{m}|mse"]) for z in d.values()]))
@@ -648,7 +661,7 @@ def across_seeds(arm, seeds):
               "to pool decoding_global)")
     sw = {}
     for s in seeds:
-        p = os.path.join(M.fig_dir(arm, s), "switch_aligned.npz")
+        p = os.path.join(M.fig_dir(arm, s, action_mode=action_mode), "switch_aligned.npz")
         if os.path.exists(p):
             sw[s] = np.load(p)
     if sw:
@@ -675,9 +688,11 @@ if __name__ == "__main__":
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--pool", action="store_true",
                     help="also write the across-seed figures")
+    M.add_circuit_args(ap)
     a = ap.parse_args()
+    spec = M.circuit_from_args(a)
     for arm in a.arms:
         for s in a.seeds:
-            per_seed(arm, s)
+            per_seed(arm, s, action_mode=spec)
         if a.pool:
-            across_seeds(arm, a.seeds)
+            across_seeds(arm, a.seeds, action_mode=spec)

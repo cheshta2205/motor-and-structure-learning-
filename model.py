@@ -46,6 +46,7 @@ circuit RELIES on e rather than merely tolerating it.
 import math
 import os
 import pdb
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
@@ -53,7 +54,8 @@ import torch.nn as nn
 from task import (CONTEXTS, N_CONTEXTS, FAM_NAMES, FAMILY, C_LABEL,
                   DT, POS_LIM, V_MAX, POS_SCALE, VEL_SCALE, GRID_SIZE,
                   EC_HIDDEN, CB_HIDDEN, LATENT_DIM, N_TRAIN, BATCH, EPOCHS, LR, WD,
-                  TSS_MIN, RHO, rot_mat, refl_mat)
+                  TSS_MIN, RHO, rot_mat, refl_mat,
+                  ACTION_ELL_RANGE, ACTION_GAIN_RANGE, ACTION_SCALE_RANGE)
 from data import generate_sequences
 from decode import acc
 
@@ -133,7 +135,308 @@ FIG_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
 #
 #   factorial-v1       4x4 aim x field crossing, drag/curl as contexts
 #   flat-families-v1   rotation and reflection sweeps, damping in the plant
-CONVENTION = "flat-families-v1"
+# v2 (2026-09-18): the context table changed from rotation + reflection to
+# rotation + curl + drift (task.py's family section). Every v1 checkpoint is
+# refused by load(); the old artefacts were moved aside under */flat-families-v1/.
+CONVENTION = "flat-families-v2"
+
+# Which action process the sequences were drawn from.  A SEPARATE CHECKPOINT
+# PATH AND A SEPARATE CONVENTION STAMP for each, because the two differ in
+# nothing a shape check can see: same architecture, same weights layout, same
+# everything except the distribution they were fitted on.  Driving a circuit
+# with the wrong one is exactly the silent failure load() exists to catch --
+# it costs z its context and reads as a result.
+#
+#   "gp"   a different Matern x tanh-warp action process per sequence (task's
+#          GP family).  THE DEFAULT since 2026-09-16: unsuffixed checkpoint
+#          (main_seed0.pt), unsuffixed figure dir (figures/main).
+#   "ar1"  task.next_action's single AR(1) at RHO.  Was the default, and was
+#          called "fitted"; now the suffixed variant (main_ar1_seed0.pt,
+#          figures/main_ar1).  Its convention stamp is unchanged, so an AR(1)
+#          checkpoint written before the rename still loads -- only its file
+#          name moved.
+#
+# "fitted" is accepted everywhere as a legacy spelling of "ar1", because saved
+# agent blobs (sac.save_agent's asdict(config)) carry the old string and must
+# keep loading.
+#   "iid"  the AR(1) path at rho = 0: independent actions every step. The
+#          control for WHY z carries the previous action -- at rho = 0 the
+#          previous realised force says nothing about the current one, so any
+#          reliance CB shows on z's action content there cannot be the
+#          autocorrelation shortcut, and any a_{t-1} still present in z is pure
+#          leakage. Checkpoint main_iid_seed*.pt, figures/main_iid.
+DEFAULT_ACTION_MODE = "gp"
+#   "policy"  windows of a trained oracle agent's recorded actions -- the
+#             deployment distribution itself (action_bank.py; data's bank
+#             section). Tag main_policy; the bank's stamp is in the convention.
+ACTION_MODES = ("gp", "ar1", "iid", "policy")
+LEGACY_ACTION_MODES = {"fitted": "ar1"}
+
+# ── EC's readout to CB: deterministic, or a fixed-noise channel with a rate cost
+#
+# WHY. z carries the previous action -- 55-61% of its within-context variance
+# is linearly a_{t-1}, for every circuit on every action stream -- because EC
+# must process a_{t-1} to interpret the error, the GRU state keeps it, and a
+# linear readout has no reason to exclude it. That content is a one-step
+# context estimate CB profits from whenever a_t ~ a_{t-1}, so it is never
+# removed; and under a closed-loop policy it is what makes z conjunctive and
+# stops it from partitioning MC. A DIMENSIONALITY bottleneck cannot fix this:
+# the content is four numbers (a_{t-1} and the force it produced), and 32
+# dims or 8 pass it trivially.
+#
+# A RATE cost can. z = tanh(mu + NOISE_SIGMA * eps) in training, tanh(mu) at
+# inference, with beta * mean ||mu||^2 added to the loss. With the noise
+# FIXED, magnitude IS information: capacity per dimension is
+# 0.5 log(1 + mu^2/sigma^2), and CB cannot amplify its way out because
+# amplifying mu amplifies the noise with it. Without the noise the same
+# penalty is a scale cost the next layer undoes for free. The variance is
+# deliberately NOT learned (unlike a VIB): a learned sigma only lets EC
+# switch dimensions off, at the cost of a second knob and the chance to shrink
+# sigma back toward a noiseless channel.
+#
+# The belief is four well-separated points sent at low rate with a large
+# margin; the action content is continuous and needs high SNR to be worth
+# anything. The noise taxes the second disproportionately, which is the point.
+#
+# A THIRD CIRCUIT AXIS beside arm and action_mode: own checkpoint tag
+# (main_iid_noisy0.001_seed0.pt), own stamp (sigma and beta both in it, so a
+# mismatch raises in load), own figure dir.
+#
+# SIGMA IS A PARAMETER, NOT A CONSTANT (2026-09-17). At sigma = 1 no beta gave
+# an additive code: beta >= 1e-3 collapsed the channel (mu = 0), beta = 1e-4
+# and 1e-5 produced a purely conjunctive z (zero per-context mean), beta = 0
+# saturated every dimension and stayed context-blind. Additive noise on an
+# input acts as a Tikhonov penalty sigma^2 ||W_z||^2 on the weights reading
+# it, so sigma = 1 against a signal that starts at rms ~0.1 per dimension was
+# a hundredfold weight decay on CB's z weights -- the collapse was the noise
+# scale, not beta. The optimum is invariant to (sigma, beta) -> (1, beta
+# sigma^2) in the linear regime, but the DYNAMICS are not, which is what a
+# sigma sweep at fixed beta tests. The default keeps every existing tag: the
+# tag carries sigma only when it differs from NOISE_SIGMA, the stamp always did.
+#
+# THE NOISY CHANNEL IS THE DEFAULT since 2026-09-18 (user's decision after the
+# sigma sweeps): sigma = 0.3, beta = 1e-3 gave the largest between-context
+# fraction of z on GP data (0.45-0.48 against 0.15 deterministic) and the best
+# of the noisy circuits under a trained policy. The unsuffixed tag ("main")
+# now names that circuit; the deterministic readout is the "_tanh" variant.
+# Stamps describe CONTENT, not defaults, so both are explicit.
+READOUTS = ("tanh", "noisy")
+DEFAULT_READOUT = "noisy"
+NOISE_SIGMA = 0.3        # DEFAULT sd of the channel noise on the pre-tanh mean
+RATE_BETA = 1e-3         # weight on mean ||mu||^2 per step; sweep it
+
+
+def normalize_readout(readout):
+    if readout not in READOUTS:
+        raise KeyError(f"unknown readout {readout!r}; expected one of {READOUTS}")
+    return readout
+
+
+def readout_stamp(readout=DEFAULT_READOUT, beta=RATE_BETA, sigma=NOISE_SIGMA) -> str:
+    """The convention suffix a readout adds -- explicit for BOTH readouts,
+    since a stamp describes what the checkpoint is, not what the default was
+    when it was written."""
+    if normalize_readout(readout) == "tanh":
+        return "+tanh-readout"
+    return f"+noisy-sigma{float(sigma):g}-beta{float(beta):g}"
+
+
+def readout_tag(readout=DEFAULT_READOUT, beta=RATE_BETA, sigma=NOISE_SIGMA) -> str:
+    """The name suffix a readout adds, relative to the DEFAULT: "" for the
+    default noisy channel at (RATE_BETA, NOISE_SIGMA), "_tanh" for the
+    deterministic readout, "_noisy<beta>" for another beta at the default
+    sigma, "_noisy<beta>_sigma<sigma>" otherwise. ONE definition for arm_tag
+    (checkpoints, figure dirs) and for sac's run names, so a run directory
+    and the circuit it was driven with agree."""
+    if normalize_readout(readout) == "tanh":
+        return "_tanh"
+    if float(beta) == RATE_BETA and float(sigma) == NOISE_SIGMA:
+        return ""
+    tag = f"_noisy{float(beta):g}"
+    if float(sigma) != NOISE_SIGMA:
+        tag += f"_sigma{float(sigma):g}"
+    return tag
+
+
+# ── which circuit: one object instead of four loose knobs ─────────────────
+#
+# Every analysis in this repo (figures, conjunctivity, representation_analysis,
+# sac's frozen load) selects the circuit through an `action_mode` argument that
+# it hands to load()/fig_dir()/generate_sequences(). When the readout became a
+# second axis, those call sites kept passing the mode alone -- so `run.py
+# --figures --noise-sigma 0.1` would have rendered the DEFAULT circuit's panels
+# under the noisy circuit's flags, silently, the same failure the convention
+# stamp exists to prevent. Threading three more keyword arguments through
+# twenty signatures is the honest fix and the fragile one; instead the
+# `action_mode` slot accepts a CircuitSpec. A bare string still means "that
+# mode, deterministic readout", so nothing existing changes meaning, and a
+# spec carries the whole selection to every function already receiving the
+# slot. data.generate_sequences reads .action_mode off it (duck-typed; data
+# cannot import model), so the rollout distribution follows the circuit too.
+# ── the FOURTH circuit axis: which contexts the circuit was fitted on ──────
+#
+# The default is the whole table. "rotations" / "reflections" fit on one
+# family only (2026-09-18, the user's test of "the contexts we trained on are
+# the problem": z's code is a ring per family, additive WITHIN a family and
+# not across, so a circuit that never saw reflections should carry a purely
+# additive code). The set is in the tag (_trainrot) and the stamp
+# (+train-rotations); data.generate_sequences reads the ids off the spec, so
+# every analysis of such a circuit rolls it out on its own contexts.
+_FAMILY_SET = {f"{name}s": name for name in FAM_NAMES}        # "rotations" -> "rotation"
+TRAIN_CONTEXT_SETS = ("all",) + tuple(_FAMILY_SET)
+DEFAULT_TRAIN_CONTEXTS = "all"
+_SHORT_FAMILY = {"rotation": "rot", "reflection": "refl", "curl": "curl", "drift": "drift"}
+_TRAIN_TAG = {"all": "", **{s: f"_train{_SHORT_FAMILY.get(name, name)}"
+                            for s, name in _FAMILY_SET.items()}}
+
+
+def train_context_ids(train_contexts=DEFAULT_TRAIN_CONTEXTS):
+    """Context ids a training-set name selects; None means the whole table."""
+    if train_contexts not in TRAIN_CONTEXT_SETS:
+        raise KeyError(f"unknown train_contexts {train_contexts!r}; "
+                       f"expected one of {TRAIN_CONTEXT_SETS}")
+    if train_contexts == "all":
+        return None
+    fam = FAM_NAMES.index(_FAMILY_SET[train_contexts])
+    return [c for c in range(N_CONTEXTS) if FAMILY[c] == fam]
+
+
+def train_contexts_tag(train_contexts=DEFAULT_TRAIN_CONTEXTS) -> str:
+    train_context_ids(train_contexts)                 # validates
+    return _TRAIN_TAG[train_contexts]
+
+
+def train_contexts_stamp(train_contexts=DEFAULT_TRAIN_CONTEXTS) -> str:
+    train_context_ids(train_contexts)
+    return "" if train_contexts == "all" else f"+train-{train_contexts}"
+
+
+@dataclass(frozen=True)
+class CircuitSpec:
+    action_mode: str = DEFAULT_ACTION_MODE
+    readout: str = DEFAULT_READOUT
+    beta: float = RATE_BETA
+    sigma: float = NOISE_SIGMA
+    train_contexts: str = DEFAULT_TRAIN_CONTEXTS
+
+    def __post_init__(self):
+        object.__setattr__(self, "action_mode", normalize_action_mode(self.action_mode))
+        object.__setattr__(self, "readout", normalize_readout(self.readout))
+        object.__setattr__(self, "beta", float(self.beta))
+        object.__setattr__(self, "sigma", float(self.sigma))
+        train_context_ids(self.train_contexts)        # validates
+
+    @property
+    def context_ids(self):
+        """The contexts this circuit was fitted on (None = all). data reads it."""
+        return train_context_ids(self.train_contexts)
+
+    def __str__(self):
+        return arm_tag("", self)[1:] or DEFAULT_ACTION_MODE
+
+
+def add_circuit_args(ap):
+    """The four circuit-selecting flags, identically on every CLI that loads a
+    supervised circuit (run.py, figures.py, representation_analysis.py,
+    conjunctivity.py). Pair with circuit_from_args."""
+    ap.add_argument("--action-mode", default=DEFAULT_ACTION_MODE,
+                    choices=list(ACTION_MODES) + list(LEGACY_ACTION_MODES),
+                    help="action process the circuit was fitted on; selects the "
+                         "checkpoint, the rollout distribution and the figure "
+                         "directory figures/<arm_tag>/")
+    ap.add_argument("--readout", choices=list(READOUTS), default=None,
+                    help="EC's readout: 'tanh' (deterministic) or 'noisy' (fixed-"
+                         "noise channel with rate cost). --rate-beta or "
+                         "--noise-sigma alone imply 'noisy'.")
+    ap.add_argument("--rate-beta", type=float, default=None,
+                    help="beta of the noisy readout (default model.RATE_BETA)")
+    ap.add_argument("--noise-sigma", type=float, default=None,
+                    help="channel-noise sd of the noisy readout (default "
+                         "model.NOISE_SIGMA; in the tag only when not default)")
+    ap.add_argument("--train-contexts", default=DEFAULT_TRAIN_CONTEXTS,
+                    choices=list(TRAIN_CONTEXT_SETS),
+                    help="which contexts the circuit was (or is to be) fitted on: "
+                         "the whole table, or one family. Tag _trainrot/_trainrefl.")
+    return ap
+
+
+def circuit_from_args(a) -> "CircuitSpec":
+    """The CircuitSpec a parsed add_circuit_args namespace selects. A beta or
+    sigma without --readout implies the noisy readout (as sac.py's CLI does):
+    a sigma on a tanh circuit would otherwise be accepted and ignored."""
+    readout = a.readout
+    if readout is None:
+        readout = ("noisy" if (a.rate_beta is not None or a.noise_sigma is not None)
+                   else DEFAULT_READOUT)
+    return CircuitSpec(a.action_mode, readout,
+                       RATE_BETA if a.rate_beta is None else a.rate_beta,
+                       NOISE_SIGMA if a.noise_sigma is None else a.noise_sigma,
+                       getattr(a, "train_contexts", DEFAULT_TRAIN_CONTEXTS))
+
+
+def circuit(action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+            beta=RATE_BETA, sigma=NOISE_SIGMA,
+            train_contexts=DEFAULT_TRAIN_CONTEXTS) -> CircuitSpec:
+    """Resolve the (action_mode, readout, beta, sigma, train_contexts) slots
+    into a CircuitSpec. `action_mode` may already BE one; the loose knobs must
+    then be left at their defaults -- a spec that says noisy beside a
+    `readout` that says tanh is a contradiction, not a merge."""
+    if isinstance(action_mode, CircuitSpec):
+        loose = (normalize_readout(readout), float(beta), float(sigma), train_contexts)
+        if loose != (DEFAULT_READOUT, RATE_BETA, NOISE_SIGMA, DEFAULT_TRAIN_CONTEXTS):
+            raise ValueError(f"got both a CircuitSpec {action_mode} and loose "
+                             f"readout/beta/sigma/train_contexts {loose}; pass one or the other")
+        return action_mode
+    return CircuitSpec(action_mode, readout, beta, sigma, train_contexts)
+
+
+def normalize_action_mode(action_mode):
+    """Canonical mode name, or KeyError. Maps the legacy "fitted" to "ar1".
+    A CircuitSpec in the slot yields its mode."""
+    if isinstance(action_mode, CircuitSpec):
+        return action_mode.action_mode
+    mode = LEGACY_ACTION_MODES.get(action_mode, action_mode)
+    if mode not in ACTION_MODES:
+        raise KeyError(f"unknown action_mode {action_mode!r}; "
+                       f"expected one of {ACTION_MODES} (or legacy "
+                       f"{tuple(LEGACY_ACTION_MODES)})")
+    return mode
+
+
+def convention_for(action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+                   beta=RATE_BETA, sigma=NOISE_SIGMA):
+    """The stamp a checkpoint carries: the action process it was fitted on,
+    plus the readout's suffix. load() refuses anything else."""
+    c = circuit(action_mode, readout, beta, sigma)
+    return (_action_convention(c.action_mode) + train_contexts_stamp(c.train_contexts)
+            + readout_stamp(c.readout, c.beta, c.sigma))
+
+
+def _action_convention(action_mode=DEFAULT_ACTION_MODE):
+    action_mode = normalize_action_mode(action_mode)
+    if action_mode == "ar1":
+        return CONVENTION
+    if action_mode == "iid":
+        # its own stamp: an iid circuit is shape-identical to an ar1 one and
+        # nothing but the stamp could tell them apart
+        return f"{CONVENTION}+iid-actions"
+    if action_mode == "policy":
+        # THE BANK'S IDENTITY IS IN THE STAMP: a circuit fitted on one recording
+        # of the oracle's actions must not load as if fitted on another
+        import data
+        return f"{CONVENTION}+policy-actions+{data.action_bank_stamp()}"
+    # THE RANGES ARE IN THE STAMP, derived rather than hand-maintained.  Two
+    # circuits trained on different gp parameter ranges are the same shapes and
+    # the same architecture, so nothing else could tell them apart -- and the
+    # ranges DO move: ACTION_ELL_RANGE was truncated from (0.3, 30) to (0.3, 3)
+    # after the wide version measurably made the circuit worse.  Deriving the
+    # stamp means that truncation invalidated the checkpoints trained under it
+    # automatically, instead of leaving them loadable and wrong.
+    el, eh = ACTION_ELL_RANGE
+    gl, gh = ACTION_GAIN_RANGE
+    sl, sh = ACTION_SCALE_RANGE
+    return (f"{CONVENTION}+gp-actions"
+            f"+ell{el:g}-{eh:g}+gain{gl:g}-{gh:g}+scale{sl:g}-{sh:g}")
 
 # CB's hidden nonlinearity.  MEASURED, not chosen: with tanh the circuit tops
 # out at 0.51-0.65 rotation decoding against ReLU's 0.91, because tanh bounds
@@ -164,7 +467,25 @@ CB_ACTIVATION = "relu"
 CELL_TYPE = "gru" # "rnn"
 
 
-def ckpt_path(arm, seed):
+def arm_tag(arm, action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+            beta=RATE_BETA, sigma=NOISE_SIGMA):
+    """`arm` with the action-mode infix and the readout suffix: "main" for the
+    defaults, "main_ar1" for the AR(1) circuit, "main_iid_noisy0.001" for a
+    noisy-readout circuit at beta = 1e-3 on i.i.d. actions at the default
+    sigma, "main_iid_noisy0.001_sigma0.1" at sigma = 0.1.
+
+    ONE DEFINITION, used by both ckpt_path and fig_dir.  They have to agree:
+    figures written under "main" from a circuit loaded out of "main_ar1" are
+    mislabelled results, and nothing downstream could tell.  That is the same
+    failure the convention stamp exists to prevent, one directory level up.
+    """
+    c = circuit(action_mode, readout, beta, sigma)
+    tag = arm if c.action_mode == DEFAULT_ACTION_MODE else f"{arm}_{c.action_mode}"
+    return tag + train_contexts_tag(c.train_contexts) + readout_tag(c.readout, c.beta, c.sigma)
+
+
+def ckpt_path(arm, seed, action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+              beta=RATE_BETA, sigma=NOISE_SIGMA):
     """Checkpoint path.  `seed` is REQUIRED on purpose: a default would let a
     caller that forgot it silently read seed 0's weights while writing into
     another seed's folder.  That exact bug cost three figure scripts in the
@@ -176,11 +497,30 @@ def ckpt_path(arm, seed):
     load() rejects them on CONVENTION rather than on shape, because their
     shapes still match.
     """
-    return os.path.join(CKPT_DIR, f"{arm}_seed{seed}.pt")
+    return os.path.join(CKPT_DIR,
+                        f"{arm_tag(arm, action_mode, readout, beta, sigma)}_seed{seed}.pt")
 
 
-def fig_dir(arm, seed):                      # seed required -- see ckpt_path
-    d = os.path.join(FIG_DIR, arm, f"seed{seed}")
+def fig_dir(arm, seed, sub=None,             # seed required -- see ckpt_path
+            action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+            beta=RATE_BETA, sigma=NOISE_SIGMA):
+    """Per-seed figure directory, optionally one level deeper.
+
+    SPLIT BY ACTION MODE, via the same arm_tag as the checkpoint: the AR(1)
+    circuit writes to figures/main_ar1/seed0 rather than overwriting the
+    default (gp) circuit's panels at figures/main/seed0.  The checkpoints were
+    separated for exactly this reason and the figure tree has to follow, or
+    two circuits' results end up in one directory distinguishable only by
+    mtime.
+
+    `sub` keeps a family of related panels together without inventing a
+    parallel tree somewhere else -- conjunctivity's two figures live at
+    fig_dir(arm, seed, "conjunctivity", mode) rather than under a figures/ root
+    of their own, so everything for one (arm, seed, mode) stays in one place.
+    """
+    d = os.path.join(FIG_DIR, arm_tag(arm, action_mode, readout, beta, sigma), f"seed{seed}")
+    if sub:
+        d = os.path.join(d, sub)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -227,24 +567,68 @@ class EC(nn.Module):
 
     CELL_TYPES = {"gru": nn.GRUCell, "rnn": nn.RNNCell}
 
-    def __init__(self, no_current, cell_type="gru"):
+    def __init__(self, no_current, cell_type="gru", readout=DEFAULT_READOUT,
+                 beta=RATE_BETA, sigma=NOISE_SIGMA):
         super().__init__()
         if cell_type not in self.CELL_TYPES:
             raise KeyError(f"unknown cell_type {cell_type!r}; "
                            f"expected one of {list(self.CELL_TYPES)}")
         self.no_current = no_current
         self.cell_type = cell_type
+        self.readout_kind = normalize_readout(readout)
+        self.beta = float(beta)
+        self.sigma = float(sigma)                 # fixed, not a Parameter
         n_state = 1 if no_current else 2          # s_{t-1} alone, or with s_t
         self.cell = self.CELL_TYPES[cell_type](
             n_state * SDIM + ADIM + SDIM, EC_HIDDEN)
-        self.readout = nn.Sequential(nn.Linear(EC_HIDDEN, LATENT_DIM), nn.Tanh())
+        if self.readout_kind == "tanh":
+            # unchanged, parameter names included: every existing checkpoint
+            self.readout = nn.Sequential(nn.Linear(EC_HIDDEN, LATENT_DIM), nn.Tanh())
+        else:
+            # the channel MEAN; the noise is self.sigma, fixed -- see the
+            # readout section above
+            self.mu = nn.Linear(EC_HIDDEN, LATENT_DIM)
+        self.reset_rate()
 
     def init_hidden(self, B):
         return torch.zeros(B, EC_HIDDEN)
 
+    # ── rate bookkeeping (noisy readout only) ─────────────────────────────
+    def reset_rate(self):
+        """Call before each training rollout; rate() then covers that rollout."""
+        self._rate_sum = 0.0
+        self._rate_n = 0
+
+    def rate(self):
+        """Mean ||mu||^2 per step over the steps since reset_rate(), with
+        gradient. 0 for the deterministic readout or outside training."""
+        if self._rate_n == 0:
+            return torch.zeros(())
+        return self._rate_sum / self._rate_n
+
+    def rate_penalty(self):
+        return self.beta * self.rate() if self.readout_kind == "noisy" else torch.zeros(())
+
+    def read(self, h):
+        """z from a hidden state, under whichever readout this circuit has:
+        the deterministic tanh, or the noisy channel (sampled and rate-counted
+        in training, its mean at inference). ONE place, so a caller that reads
+        z from a stored hidden state (sac's end-to-end trainer re-reads the
+        previous step's) gets the same readout step() applies."""
+        if self.readout_kind == "tanh":
+            return self.readout(h)
+        mu = self.mu(h)
+        if self.training:
+            self._rate_sum = self._rate_sum + (mu ** 2).sum(-1).mean()
+            self._rate_n += 1
+            g = mu + self.sigma * torch.randn_like(mu)
+        else:
+            g = mu                                # deterministic at inference
+        return torch.tanh(g)
+
     def step(self, x, h):
         h = self.cell(x, h)
-        return self.readout(h), h
+        return self.read(h), h
 
 
 class CB(nn.Module):
@@ -327,7 +711,8 @@ def circuit_operating_point(ec, cb, trans, arm):
             # nothing to chunk -- the tanh argument is the whole story
             gate_pre.append(gi + gh)
         z, h = ec.step(x, h)
-        read_pre.append(ec.readout[0](h))
+        # the readout's pre-activation, whichever readout this circuit has
+        read_pre.append((ec.readout[0] if ec.readout_kind == "tanh" else ec.mu)(h))
         if t > 0:
             S.append(s_t); A.append(a_t); Z.append(z)
         s_pred = cb(s_t, a_t, z)
@@ -556,7 +941,8 @@ def weighted_loss(pred, tgt, alpha=None):
     return (e[..., :2] / DT ** 2).mean() + alpha * e[..., 2:].mean()
 
 
-def load(arm, seed):
+def load(arm, seed, action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+         beta=RATE_BETA, sigma=NOISE_SIGMA):
     """Load a trained arm.  Returns (ec, cb) in eval mode, or None if absent.
 
     REFUSES A CHECKPOINT FROM A DIFFERENT CONVENTION.  Shapes cannot catch
@@ -565,18 +951,21 @@ def load(arm, seed):
     predicts nonsense.  A checkpoint with no stamp predates the rewrite and is
     rejected for that reason, not treated as current.
     """
-    p = ckpt_path(arm, seed)
+    c = circuit(action_mode, readout, beta, sigma)
+    p = ckpt_path(arm, seed, c)
     if not os.path.exists(p):
         return None
     sd = torch.load(p, map_location="cpu")
     stored = sd.get("convention")
-    if stored != CONVENTION:
+    expected = convention_for(c)
+    if stored != expected:
         raise ValueError(
-            f"{p} was trained under convention {stored!r} but {CONVENTION!r} "
+            f"{p} was trained under convention {stored!r} but {expected!r} "
             f"is current. Driving a checkpoint with the wrong convention is "
             f"silent -- it costs z its context and looks like a result. "
             f"Retrain it.")
-    ec, cb = EC(_check(arm), CELL_TYPE), CB(CB_ACTIVATION)
+    ec = EC(_check(arm), CELL_TYPE, readout=c.readout, beta=c.beta, sigma=c.sigma)
+    cb = CB(CB_ACTIVATION)
     ec.load_state_dict(sd["ec"]); cb.load_state_dict(sd["cb"])
     ec.eval(); cb.eval()
     return ec, cb
@@ -620,13 +1009,16 @@ def track(ec, cb, arm, va, va_ctx, va_tss, seed=0):
     dec = {}
     for f in LEVELS:
         m = ok & (fam == LEVEL_OF[f])
-        dec[f] = acc(zn[m], cid[m], sid[m], seed)
+        # a circuit fitted on one family has no validation steps in the other
+        # (CircuitSpec.train_contexts): report nan rather than decode nothing
+        dec[f] = acc(zn[m], cid[m], sid[m], seed) if m.sum() > 0 else float("nan")
     ec.train(); cb.train()
     return out, dec
 
 
-def train(arm, seed, epochs=EPOCHS, decode_every=25,
-          save=True):
+def train(arm, seed, epochs=EPOCHS, decode_every=32,
+          save=True, action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
+          beta=RATE_BETA, sigma=NOISE_SIGMA):
     """Train one arm.  Writes the ONLY checkpoint, and track.npz beside it.
 
     `save=False` runs without writing anything.  Use it for a short diagnostic
@@ -639,10 +1031,18 @@ def train(arm, seed, epochs=EPOCHS, decode_every=25,
     retrain -- so do not delete it.
     """
     _check(arm)
+    c = circuit(action_mode, readout, beta, sigma)
     torch.manual_seed(seed)
-    trans, _, _ = generate_sequences(N_TRAIN, seed=seed)
-    va, va_ctx, va_tss = generate_sequences(300, seed=seed + 500)
-    ec, cb = EC(ARMS[arm], CELL_TYPE), CB(CB_ACTIVATION)
+    # the SPEC goes to the generator: it carries the action process AND the
+    # contexts this circuit is fitted on (CircuitSpec.context_ids)
+    trans, _, _ = generate_sequences(N_TRAIN, seed=seed, action_mode=c)
+    # VALIDATION TRACKS TRAINING. A gp-trained circuit scored on fitted-mode
+    # sequences would report held-out numbers from a distribution it is not
+    # being asked to work on, which is the comparison this whole change exists
+    # to stop making.
+    va, va_ctx, va_tss = generate_sequences(300, seed=seed + 500, action_mode=c)
+    ec = EC(ARMS[arm], CELL_TYPE, readout=c.readout, beta=c.beta, sigma=c.sigma)
+    cb = CB(CB_ACTIVATION)
     opt = torch.optim.AdamW(list(ec.parameters()) + list(cb.parameters()), lr=LR, weight_decay=WD)
     sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         opt, T_0=50, T_mult=2, eta_min=1e-5)
@@ -651,8 +1051,10 @@ def train(arm, seed, epochs=EPOCHS, decode_every=25,
         perm = torch.randperm(N_TRAIN); tot = 0.
         for i in range(0, N_TRAIN, BATCH):
             idx = perm[i:i + BATCH]
+            ec.reset_rate()                       # rate() covers this rollout
             _, pred, tgt = rollout(ec, cb, trans[idx], arm)
-            loss = weighted_loss(pred, tgt)
+            # + beta * mean ||mu||^2 for the noisy readout, 0 otherwise
+            loss = weighted_loss(pred, tgt) + ec.rate_penalty()
             opt.zero_grad(); loss.backward(); opt.step()
             tot += float(loss.detach()) * len(idx)
         sch.step()
@@ -683,13 +1085,20 @@ def train(arm, seed, epochs=EPOCHS, decode_every=25,
     os.makedirs(CKPT_DIR, exist_ok=True)
     # the convention is recorded IN the file: load() refuses a checkpoint driven
     # with a convention it was not fitted under
-    os.makedirs(os.path.dirname(ckpt_path(arm, seed)), exist_ok=True)
+    path = ckpt_path(arm, seed, c)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({"ec": ec.state_dict(), "cb": cb.state_dict(), "hist": hist,
-                "convention": CONVENTION},
-               ckpt_path(arm, seed))
-    np.savez(os.path.join(fig_dir(arm, seed), "track.npz"),
+                "convention": convention_for(c),
+                "action_mode": c.action_mode, "readout": c.readout,
+                "beta": c.beta, "sigma": c.sigma},
+               path)
+    # THE CIRCUIT'S OWN figure dir. This used to be fig_dir(arm, seed) -- the
+    # DEFAULT mode's dir whatever mode was being trained -- so training one
+    # circuit overwrote another's track.npz, which the docstring above says
+    # cannot be rebuilt.
+    np.savez(os.path.join(fig_dir(arm, seed, action_mode=c), "track.npz"),
              levels=np.array(LEVELS),
              hist=np.array(hist), per_fam=np.array(per_fam),
              dec_ep=np.array(dec_ep),
              **{k: np.array([d[k] for d in dec]) for k in dec[0]})
-    print(f"  saved -> {ckpt_path(arm, seed)}", flush=True)
+    print(f"  saved -> {path}", flush=True)
