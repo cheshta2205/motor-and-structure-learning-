@@ -66,12 +66,14 @@ import model as M
 from data import generate_sequences
 from decode import _clf, seq_split
 from task import (CONTEXTS, C_LABEL, FAMILY, FAM_NAMES, N_CONTEXTS, TSS_MIN)
-from plotting_utils import set_plt_params, make_axis_nice
+from plotting_utils import (use_paper_style, offset_spines, PALETTE, INK, figsize,
+                            colorbar, label_panels, save)
 
 N_SEQ = 1200
 N_SPLITS = 8
 SITES = ("z", "mtl_hidden", "cb_layer1", "cb_layer2")
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b", "curl": "#27ae60", "drift": "#e67e22"}
+FCOL = {"rotation": PALETTE["navy"], "reflection": PALETTE["rose"],
+        "curl": PALETTE["teal"], "drift": PALETTE["amber"]}
 # contexts grouped by family, which is the order that makes the block
 # structure visible in the confusion matrix
 ORDER = sorted(range(N_CONTEXTS), key=lambda c: (FAMILY[c], c))
@@ -160,12 +162,12 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
     full = [C_LABEL[c] for c in ORDER]
 
     fig, ax = plt.subplots(figsize=(10.5, 8.6))
-    im = ax.imshow(C, cmap="magma", vmin=0, vmax=1)
+    im = ax.imshow(C, cmap="paper_seq", vmin=0, vmax=1)
     for i in range(N_CONTEXTS):
         for j in range(N_CONTEXTS):
             v = C[i, j]
             ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=6.5,
-                    color="white" if v < .55 else "black")
+                    color="white" if v > .55 else INK)
     ax.set_xticks(range(N_CONTEXTS)); ax.set_yticks(range(N_CONTEXTS))
     ax.set_xticklabels(full, rotation=45, ha="right", fontsize=7.5)
     ax.set_yticklabels(full, fontsize=7.5)
@@ -174,7 +176,7 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
                      for f in range(len(FAM_NAMES))])[:-1] - .5
     for x in bnd:
         ax.axhline(x, color="w", lw=1.4); ax.axvline(x, color="w", lw=1.4)
-    fig.colorbar(im, ax=ax, fraction=.046)
+    colorbar(im, ax=ax, label="P(predicted | true)")
     ax.set_title(f"{arm} {seed if str(seed).startswith('pooled') else f'seed {seed}'}"
                  f" -- context confusion in {site}  "
                  f"(tss >= {TSS_MIN})\n"
@@ -182,24 +184,24 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
                  f"of errors stay inside the true family "
                  f"(chance {within['chance']:.0%})", fontsize=10.5)
     fig.tight_layout()
-    make_axis_nice(fig)
-    fig.savefig(path); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
     wpath = path.replace("confusion_", "weightcos_")
     fig, ax = plt.subplots(figsize=(11.5, 9.6))
-    im = ax.imshow(S, cmap="coolwarm", vmin=-1, vmax=1)
+    im = ax.imshow(S, cmap="paper_div", vmin=-1, vmax=1)
     for i in range(N_CONTEXTS):
         for j in range(N_CONTEXTS):
             ax.text(j, i, f"{S[i, j]:.2f}", ha="center", va="center",
                     fontsize=6.5,
-                    color="white" if abs(S[i, j]) > .6 else "#222")
+                    color="white" if abs(S[i, j]) > .6 else INK)
     ax.set_xticks(range(N_CONTEXTS)); ax.set_yticks(range(N_CONTEXTS))
     ax.set_xticklabels(full, rotation=45, ha="right", fontsize=7.5)
     ax.set_yticklabels(full, fontsize=7.5)
     for x in bnd:
-        ax.axhline(x, color="k", lw=1.4); ax.axvline(x, color="k", lw=1.4)
-    fig.colorbar(im, ax=ax, fraction=.046)
+        ax.axhline(x, color=INK, lw=1.0); ax.axvline(x, color=INK, lw=1.0)
+    colorbar(im, ax=ax, label="weight cosine")
     ax.set_title(
         f"{arm} {seed if str(seed).startswith('pooled') else f'seed {seed}'}"
         f" -- decoder weight cosine in {site}\n"
@@ -216,8 +218,8 @@ def fig_confusion(arm, seed, C, S, path, site="z"):
         fontsize=8.5, loc="left")
 
     fig.tight_layout()
-    make_axis_nice(fig)
-    fig.savefig(wpath); plt.close(fig)
+    offset_spines(fig)
+    save(fig, wpath)
     print(f"  saved -> {wpath}")
     return acc, within
 
@@ -309,8 +311,8 @@ def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
         f"context, context is a MINOR axis -- see the top-k decoding figure for "
         f"the quantitative version", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .96))
-    make_axis_nice(fig)
-    fig.savefig(path, dpi=140); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -371,7 +373,7 @@ def pc_variance(d, P, n_pc=10):
 def fig_pc_variance(arm, seed, V, path, n_pc=10):
     """One panel per site: grouped bars of what each PC encodes."""
     cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
-            "velocity": "#e67e22"}
+            "velocity": "#edb060"}
     fig, axes = plt.subplots(1, len(SITES), figsize=(4.6 * len(SITES), 4.4),
                              sharey=True)
     x = np.arange(n_pc)
@@ -409,9 +411,9 @@ def fig_pc_variance(arm, seed, V, path, n_pc=10):
         f"identity); position and velocity are linear $R^2$.  They may overlap.\n"
         f"dashed line: how much of the site's total variance that PC carries.",
         fontsize=10)
-    make_axis_nice(fig)
+    offset_spines(fig)
     fig.tight_layout(rect=(0, 0, 1, .88))
-    fig.savefig(path); plt.close(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -458,7 +460,7 @@ def gif_pca(arm, seed, d, P, site, path, n_show=3000, frames=72, rng_seed=0):
     fig.suptitle(f"{arm} seed {seed} -- {site}, top 3 PCs  "
                  f"({var[:3].sum():.0%} of variance, tss >= {TSS_MIN})",
                  fontsize=11)
-    make_axis_nice(fig)
+    offset_spines(fig)
     fig.tight_layout(rect=(0, 0, 1, .93))
     w = PillowWriter(fps=12)
     with w.saving(fig, path, dpi=70):
@@ -515,9 +517,9 @@ def fig_topk(arm, seed, T, full_acc, path):
         a.legend(frameon=False, fontsize=8)
         _despine(a)
     if full_acc is not None:
-        ax[0].axhline(full_acc, ls="--", color="#c0392b", lw=1)
+        ax[0].axhline(full_acc, ls="--", color="#c25b6b", lw=1)
         ax[0].text(t["ks"][-1], full_acc + .02, f"all dims ({full_acc:.2f})",
-                   fontsize=8, color="#c0392b", ha="right")
+                   fontsize=8, color="#c25b6b", ha="right")
     fig.suptitle(
         f"{arm} seed {seed} -- is context a MAJOR or a MINOR axis?\n"
         f"left: {N_CONTEXTS}-way decoding from the top-k PCs only.\n"
@@ -525,8 +527,8 @@ def fig_topk(arm, seed, T, full_acc, path):
         f"context needing PCs that carry little variance = a minor axis "
         f"(mixed selectivity)", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .84))
-    make_axis_nice(fig)
-    fig.savefig(path); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -583,9 +585,9 @@ def fig_clusters(arm, seed, d, P, site, path, n_show=4000, rng_seed=0):
         f"all three pairwise projections, so no viewing angle is chosen for "
         f"you.  Read DOWN a column: is the structure contextual, or kinematic?",
         fontsize=11.5)
-    make_axis_nice(fig)
+    offset_spines(fig)
     fig.tight_layout(rect=(0, 0, 1, .955))
-    fig.savefig(path, dpi=150); plt.close(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -629,50 +631,58 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0,
                 V[k].append(z[f"{k}|z"])
         got.append(sd_)
     V = {k: v for k, v in V.items() if v}
-    fig = plt.figure(figsize=(15, 8.4))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, .9], hspace=.38, wspace=.28)
+    # Built at double-column width, type from the style, methods prose in the
+    # caption file rather than a suptitle (plotting_utils follow-ups 1, 2, 5).
+    fig = plt.figure(figsize=figsize("double", height=4.6), layout="constrained")
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, .8])
     panels = [("context", d["cid"][idx], "tab20", None),
-              ("position (x)", d["pos"][idx][:, 0], "viridis", None),
-              ("speed |v|", spd, "plasma",
+              ("position (x)", d["pos"][idx][:, 0], "paper_seq", None),
+              ("speed |v|", spd, "paper_seq",
                (np.percentile(spd, 1), np.percentile(spd, 99)))]
+    top = []
     for i, (name, c, cmap, lim) in enumerate(panels):
-        a = fig.add_subplot(gs[0, i])
+        # one PC basis, so the three scatters share both axes and only the
+        # first carries the y label
+        a = fig.add_subplot(gs[0, i], sharex=top[0] if top else None,
+                            sharey=top[0] if top else None)
         kw = {} if lim is None else {"vmin": lim[0], "vmax": lim[1]}
-        sc = a.scatter(pr[:, 0], pr[:, 1], s=3, alpha=.45, c=c, cmap=cmap, **kw)
+        sc = a.scatter(pr[:, 0], pr[:, 1], s=2, alpha=.45, c=c, cmap=cmap, lw=0, **kw)
         a.set_xlabel(f"PC1 ({var[0]:.0%} of variance)")
-        a.set_ylabel(f"PC2 ({var[1]:.0%})" if i == 0 else "")
-        a.set_title(f"coloured by {name}", fontsize=11)
-        _despine(a)
+        if i == 0:
+            a.set_ylabel(f"PC2 ({var[1]:.0%})")
+        else:
+            a.tick_params(labelleft=False)
+        a.set_title(name)
         if name != "context":
-            fig.colorbar(sc, ax=a, fraction=.046)
+            colorbar(sc, ax=a)
+        top.append(a)
     ax = fig.add_subplot(gs[1, :])
     if got:
         n_pc = len(V["context"][0])
         x = np.arange(n_pc)
-        cols = {"context": "#8e44ad", "position": "#1e8449",
-                "velocity": "#e67e22"}
+        cols = {"context": PALETTE["violet"], "position": PALETTE["teal"],
+                "velocity": PALETTE["amber"]}
         for bi, (name, col) in enumerate(cols.items()):
             A = np.array(V[name])
             ax.bar(x + (bi - 1) * .27, A.mean(0), yerr=A.std(0), width=.26,
-                   color=col, label=name, capsize=2,
-                   error_kw={"lw": .8, "ecolor": "#444"})
+                   color=col, label=name, error_kw={"lw": .6, "ecolor": INK})
         ax.set_xticks(x); ax.set_xticklabels([str(i + 1) for i in x])
         ax.set_xlabel("principal component of $z$")
-        ax.set_ylabel("variance of that PC explained ($R^2$)")
+        ax.set_ylabel("variance explained ($R^2$)")
         ax.set_ylim(0, 1)
-        ax.legend(frameon=False, fontsize=10)
-        ax.set_title(f"what each PC encodes -- mean $\\pm$ SD across "
-                     f"{len(got)} seeds {got}", fontsize=11)
-        _despine(ax)
-    fig.suptitle(
-        f"{arm}: $z$ encodes CONTEXT in its dominant components  "
-        f"(tss >= {TSS_MIN}; scatter from seed {seeds[0]})\n"
-        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts, assumption-free; position "
-        f"and velocity are linear $R^2$.  They need not sum to 1 -- drift "
-        f"contexts move the agent, so context and position are correlated.",
-        fontsize=11)
-    make_axis_nice(fig)
-    fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+        ax.legend(ncol=3, loc="upper right")
+        ax.set_title(f"what each PC encodes (mean $\\pm$ SD, {len(got)} seeds)")
+    caption = (
+        f"{arm}: z encodes context in its dominant components (tss >= {TSS_MIN}; "
+        f"scatter from seed {seeds[0]}; pooled seeds {got}). Top: PC1 vs PC2 of z "
+        f"for one seed, coloured by context, x position and speed. Bottom: for each "
+        f"of the top PCs, the share of its variance explained by context (eta^2 "
+        f"over the {N_CONTEXTS} contexts, assumption-free), position and velocity "
+        f"(linear R^2), mean +- SD across seeds. The shares need not sum to 1: "
+        f"drift contexts move the agent, so context and position are correlated.")
+    offset_spines(fig)
+    label_panels(fig, top + [ax])
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -855,8 +865,8 @@ def fig_mds(arm, seed, panels, path, site="z"):
     fig.suptitle(f"{arm} seed {seed} -- context geometry in {site}  "
                  f"(tss >= {TSS_MIN});  colour = family", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .93))
-    make_axis_nice(fig)
-    fig.savefig(path); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -888,7 +898,7 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10,
     if not got:
         print(f"  {arm}: no pc_variance to pool"); return
     cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
-            "velocity": "#e67e22"}
+            "velocity": "#edb060"}
     cols = {k: c for k, c in cols.items() if A["z"][k]}
     fig, axes = plt.subplots(1, len(SITES), figsize=(4.8 * len(SITES), 4.6),
                              sharey=True)
@@ -911,7 +921,7 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10,
         a.set_xlabel("principal component"); a.set_title(site, fontsize=12)
         a.set_ylim(0, 1)
         _despine(a)
-        make_axis_nice(a)
+        offset_spines(a)
         a2.spines["top"].set_visible(False)
     axes[0].set_ylabel("variance of that PC explained ($R^2$)")
     axes[0].legend(frameon=False, fontsize=10)
@@ -922,11 +932,11 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10,
         f"and velocity are linear $R^2$.  Only $z$ leads with context.",
         fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, .89))
-    make_axis_nice(fig)
+    offset_spines(fig)
     d = os.path.join(M.FIG_DIR, arm, "across_seeds")
     os.makedirs(d, exist_ok=True)
     p_ = os.path.join(d, f"pc_variance{tag}.png")
-    fig.savefig(p_); plt.close(fig)
+    save(fig, p_)
     print(f"  saved -> {p_}   (pooled over {len(got)} seeds)")
 
 
@@ -972,9 +982,9 @@ def pool_topk(arm, seeds, tag="",
                  f"context needing PCs that carry little variance = a minor "
                  f"axis (mixed selectivity)", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .87))
-    make_axis_nice(fig)
+    offset_spines(fig)
     p = os.path.join(d, f"topk{tag}.png")
-    fig.savefig(p); plt.close(fig)
+    save(fig, p)
     print(f"  saved -> {p}   (pooled over {len(got)} seeds)")
 
 
@@ -1082,7 +1092,7 @@ if __name__ == "__main__":
                     help="also write the across-seed average")
     a = ap.parse_args()
 
-    set_plt_params(style="fast")
+    use_paper_style()
 
     if not (a.confusion or a.pca or a.topk or a.gif or a.mds or a.paper):
         ap.error("nothing to do: pass --confusion, --pca, --topk, --mds, --paper and/or --gif")

@@ -487,6 +487,11 @@ class OracleNoise:
 # informative: whatever `main` loses relative to this, it loses to its code.
 BAYES_SWITCH_HAZARD = 1e-3
 
+# Weight of the visit-count term in an inferred oracle's transition prior; see
+# AblationConfig.observer_count_prior for what it does and why it is 1.
+DEFAULT_COUNT_PRIOR = 1.0
+NOCPRIOR_SUFFIX = "_nocprior"    # the run-name tag for turning it back off
+
 
 ORACLE_SOURCES = ("given", "bayes", "cb")
 
@@ -1036,7 +1041,10 @@ def apply_phase_set(phase_set: str) -> list:
 #       with no error to discriminate contexts its belief relaxes toward the
 #       more frequent one. HERE that relaxation comes from the experience
 #       prior over EC's start state (ExperienceBank) and, for the inferred
-#       oracles, from the visit-count prior (_ContextPosterior.count_prior).
+#       oracles, from the visit-count prior (_ContextPosterior.count_prior),
+#       which is ON by default since 2026-09-20 -- before that an inferred
+#       oracle relaxed toward UNIFORM and this paragraph described something
+#       none of its runs did. See AblationConfig.observer_count_prior.
 #   evoked_recovery        ... | CHANNEL (short) | P+ (two reaches) | CHANNEL
 #   savings_washout        P0 | P+ | P0 (washout) | P+
 #       Savings with a NULL washout: recognition shows as the second P+
@@ -1431,13 +1439,25 @@ class AblationConfig:
     plant observer ("bayes") can carry it. No run-name suffix: the saved
     config records it. Savings-washout runs on a trained baseline
     (savings_pair) and resolves to no."""
-    observer_count_prior: float = 0.0
+    observer_count_prior: float = DEFAULT_COUNT_PRIOR
     """Weight (0..1) of a visit-count term in the inferred oracles' transition
-    prior: with 0 (the default) the jump target is uniform, as before; with w
-    it is (1-w) uniform + w counts/sum, where counts accumulate each reach's
-    posterior (_ContextPosterior.note_visit). COIN's learned global
-    transition distribution. Needs an inferred oracle_source. Run name:
-    _cprior."""
+    prior: the jump target is (1-w) uniform + w counts/sum, where counts
+    accumulate each reach's posterior (_ContextPosterior.note_visit). COIN's
+    learned global transition distribution. Needs an inferred oracle_source.
+
+    DEFAULT 1.0 SINCE 2026-09-20 (user), was 0.0. At 0 the jump target is
+    uniform, so a channel belief relaxes to 1/K and carries no trace of how
+    often each context was visited -- which is the mechanism the schedule
+    comment above attributes spontaneous recovery to, so an inferred oracle
+    was not testing the account it exists to test. Measured on coin_rot_sr
+    (K=5, 150 channel reaches): the belief left P- at 0.97 and ran to 0.31,
+    heading for 0.20, where the visit ratio after P0/P+/P- (100/300/50) puts
+    the fixed point at P+ 0.67 / P- 0.11.
+
+    Run name: _nocprior at 0, _cprior at any other non-default weight. EVERY
+    INFERRED-ORACLE RUN MADE BEFORE THIS CHANGE USED 0 and its name says
+    nothing about it -- the saved config does. The plain `coin*` runs in
+    sac_runs/ predate it and are not comparable to new ones."""
     phase_set: str = DEFAULT_PHASE_SET
     """Which contexts the RL task cycles through: "mixed" (two per family,
     derived by _phase_ids -- six contexts under the three-family table) or
@@ -3282,6 +3302,58 @@ def calibrate_cb_stats(config: AblationConfig, cb_proj, *, n_episodes=10,
             np.maximum(blk.std(0), 1e-3).astype(np.float32))
 
 
+# ── A belief readout for a run with no observer (2026-09-20, user) ────────
+#
+# The inferred-oracle configs log a real posterior (curve["belief_*"]). `main`
+# has no observer at all: its context signal is z, and what stands in for a
+# belief is how much this reach's z looks like each context. So: the softmax
+# over the phase contexts of the RECIPROCAL distance from z to that context's
+# centroid. A reciprocal because near means likely, a softmax over all the
+# contexts rather than over the schedule's two so that the result is a
+# distribution on the same footing as the observer's -- the plot then reads
+# the P+/P- pair out of either the same way, and "how much belief is on the
+# pair at all" means the same thing for both.
+#
+# The sharpness is set by the scale of z, not by a temperature: 1/d is large
+# when a centroid is close, so a run whose contexts are well separated in z
+# gives a peakier distribution than one whose are not. That is a property of
+# the representation and is the point of measuring it, but it does mean the
+# values are not comparable across circuits with different z scales.
+#
+# Centroids come from rollout_z -- the same rollout the ec/cb calibrations
+# use, under uniform actions, through sac's own step functions -- and from
+# the RAW z, because augmented_obs_step returns z before ec_channel applies
+# center_ec / normalize_circuit. Both sides are therefore in one space.
+
+def calibrate_z_centroids(config: AblationConfig, *, n_episodes=10, max_steps=30,
+                          device="cpu"):
+    """(context ids, centroids) of z per phase context, or None without EC.
+
+    t=0 is dropped, as in calibrate_ec_offset: its hidden state is reset and
+    its prediction error is zero, so its z says nothing about context."""
+    if not config.use_ec:
+        return None
+    data = rollout_z(config.arm, config.arm_seed, n_episodes=n_episodes,
+                     max_steps=max_steps, device=device)
+    keep = data["t"] > 0
+    z, y = data["z"][keep], np.asarray(data["y"])[keep]
+    ids = list(PHASE_CONTEXT_IDS)
+    cen = np.stack([z[y == i].mean(0) for i in range(len(ids))]).astype(np.float32)
+    return ids, cen
+
+
+def z_centroid_belief(z_mean, centroids, eps=1e-6):
+    """softmax over contexts of 1 / ||z_mean - centroid_c||, as an array
+    aligned with the centroids. `eps` floors the distance so a z sitting
+    exactly on a centroid cannot divide by zero."""
+    d = np.linalg.norm(np.asarray(centroids, dtype=np.float64)
+                       - np.asarray(z_mean, dtype=np.float64), axis=1)
+    inv = 1.0 / np.maximum(d, eps)
+    inv = inv - inv.max()               # softmax, shifted for overflow
+    p = np.exp(inv)
+    return p / p.sum()
+
+
 AGENT_FILE = "agent.pt"
 
 
@@ -3399,6 +3471,12 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     cb_stats = (calibrate_cb_stats(config, cb_proj, device=device)
                 if (config.cb_noise or config.center_cb
                     or config.normalize_circuit) else None)
+    # the z-centroid belief readout (calibrate_z_centroids). Paradigm runs
+    # only: it costs one extra calibration rollout, and a cycle run has no
+    # P+/P- pair to report a belief over -- which also keeps those runs
+    # bit-identical to every run made before this existed.
+    z_centroids = (calibrate_z_centroids(config, device=device)
+                   if config.schedule != DEFAULT_SCHEDULE else None)
 
     ec, cb = build_ec_cb(config, device)
     spec = obs_spec(config, cb_proj_dim=cb_proj_dim)
@@ -3454,6 +3532,11 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # field (nan without an observer, when the pair is not in the context
         # set, or -- for the null -- when the observer has no null hypothesis)
         "channel", "prior_src", "belief_pplus", "belief_pminus", "belief_base",
+        # the same three roles read off z rather than a posterior, for the
+        # runs with no observer: softmax over the phase contexts of the
+        # reciprocal distance from the reach's mean z to each centroid
+        # (z_centroid_belief). nan without EC and under "cycle".
+        "zbelief_pplus", "zbelief_pminus", "zbelief_base",
         # the per-reach readout probe (READOUT_PROBE_STEPS): mean first-action
         # angle over the 8 directions, and over the targets dealt a P+ / P- /
         # baseline start state (schedule_contexts: the null field or, under
@@ -3569,6 +3652,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
 
             init_dist = float(np.linalg.norm(pos - goal))
             rewards, dist_seq, angle_seq, wall_imps = [], [], [], []
+            z_seq = []          # this reach's z, for the z-centroid belief
             first_angle: Optional[float] = None
             success, steps = False, 0
             latest = {"q_loss": 0.0, "actor_loss": 0.0, "alpha": trainer.current_alpha,
@@ -3588,6 +3672,9 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                     pos, vel_obs, goal, oracle_vec, device, ec_offset,
                     cb_stats=cb_stats, rng=rng, ec_std=ec_std,
                     oracle_noise=oracle_noise)
+                if z_centroids is not None:
+                    # raw z, the space the centroids were measured in
+                    z_seq.append(z_t.squeeze(0).detach().cpu().numpy())
 
                 obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
                 # random actions only while LEARNING has not started; a channel
@@ -3834,6 +3921,26 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             curve["belief_pplus"].append(bp)
             curve["belief_pminus"].append(bm)
             curve["belief_base"].append(bn)
+            # the same three roles read off z instead of a posterior, for the
+            # runs that have no observer (z_centroid_belief). Its own columns,
+            # not the ones above: they are different quantities and a figure
+            # has to be able to say which one it drew. The reach's z averaged
+            # over its steps EXCEPT the first, whose hidden state is reset and
+            # whose prediction error is zero -- as in calibrate_z_centroids.
+            zp = zm = zn = float("nan")
+            if z_centroids is not None and len(z_seq) > 1:
+                ids, cen = z_centroids
+                p = z_centroid_belief(np.mean(z_seq[1:], axis=0), cen)
+                for role, slot in (("pplus", "zp"), ("pminus", "zm"), ("base", "zn")):
+                    cid = roles[role]
+                    if cid in ids:
+                        val = float(p[ids.index(cid)])
+                        if slot == "zp": zp = val
+                        elif slot == "zm": zm = val
+                        else: zn = val
+            curve["zbelief_pplus"].append(zp)
+            curve["zbelief_pminus"].append(zm)
+            curve["zbelief_base"].append(zn)
             # the per-reach readout probe (READOUT_PROBE_STEPS): the mean
             # first-action angle over the 8 directions, and that mean over the
             # targets whose EC start state was dealt from P+ / P- (nan when no
@@ -4218,8 +4325,9 @@ def _parse_args(argv=None):
                               "state's z at the first step is never the end-of-reach one).")
     parser.add_argument("--count-prior", type=float, default=None,
                          help="weight of the visit-count term in an inferred oracle's "
-                              "transition prior (AblationConfig.observer_count_prior). "
-                              "Suffix _cprior.")
+                              f"transition prior (AblationConfig.observer_count_prior, "
+                              f"default {DEFAULT_COUNT_PRIOR:g}). Suffix _nocprior at 0, "
+                              "_cprior at any other non-default weight.")
     return parser.parse_args(argv)
 
 
@@ -4373,12 +4481,20 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
         cfg["relabel_z"] = True
         if "_relabel" not in cfg["name"]:
             cfg["name"] = _with_infix(cfg["name"], "_relabel")
-    if count_prior is not None and float(count_prior) != float(cfg.get("observer_count_prior", 0.0)):
+    if count_prior is not None:
+        # asking at all is the error, whatever the value: since the default
+        # went to 1 a request that HAPPENS to match it must not slip through
+        # the no-op branch and look accepted
         if not cfg.get("use_oracle", False) or cfg.get("oracle_source", "given") == "given":
             raise ValueError(f"--count-prior needs an inferred oracle; {cfg['name']!r} has none")
-        cfg["observer_count_prior"] = float(count_prior)
-        if float(count_prior) > 0 and "_cprior" not in cfg["name"]:
-            cfg["name"] = _with_infix(cfg["name"], "_cprior")
+        if float(count_prior) != float(cfg.get("observer_count_prior", DEFAULT_COUNT_PRIOR)):
+            cfg["observer_count_prior"] = float(count_prior)
+            # the tag marks a departure from the DEFAULT, which is now on:
+            # turning the term off is the variant worth naming, and naming
+            # that _cprior would say the opposite of what the run did
+            tag = NOCPRIOR_SUFFIX if float(count_prior) <= 0 else "_cprior"
+            if tag not in cfg["name"]:
+                cfg["name"] = _with_infix(cfg["name"], tag)
     if episode_buffer and transition_buffer:
         raise ValueError("--episode-buffer and --transition-buffer exclude each other")
     if episode_buffer and cfg.get("replay_units", "transitions") != "episodes":

@@ -44,7 +44,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.lines import Line2D
-from plotting_utils import set_plt_params, make_axis_nice
+from plotting_utils import (use_paper_style, offset_spines, PALETTE, INK, MUTED, figsize,
+                            plot_band, chance_line, label_panels, save)
 
 import model as M
 import oracle as O
@@ -59,11 +60,12 @@ KS       = [0, 1, 2, 3, 4, 6, 8, 10, 12]
 # The three cerebellar-channel conditions, plus a control that never touches
 # the cerebellum: noise into MTL's own recurrent state, scaled by that state's
 # sd.  Without it, "zeroing e hurts" only shows that perturbing something hurts.
-COND = [("intact", "intact", "#1a1a1a", "-"),
-        ("zero", "$e$ zeroed", "#c0392b", "-"),
-        ("shuffle", "$e$ shuffled", "#e67e22", "--"),
-        ("mtl_noise", "MTL noise", "#7f8c8d", ":")]
-FCOL = {"rotation": "#4a6fa5", "reflection": "#c0392b", "curl": "#27ae60", "drift": "#e67e22"}
+COND = [("intact", "intact", INK, "-"),
+        ("zero", "$e$ zeroed", PALETTE["rose"], "-"),
+        ("shuffle", "$e$ shuffled", PALETTE["amber"], "--"),
+        ("mtl_noise", "MTL noise", MUTED, ":")]
+FCOL = {"rotation": PALETTE["navy"], "reflection": PALETTE["rose"],
+        "curl": PALETTE["teal"], "drift": PALETTE["amber"]}
 # ONE grouping: the design is flat again, so a "level" is a family.
 LEVELS = list(FAM_NAMES)
 LEVEL_INDEX = {n: i for i, n in enumerate(FAM_NAMES)}
@@ -72,7 +74,7 @@ READOUTS = LEVELS + ["family", "all"]
 ARM_TITLE = {"main": "main (MTL denied $s_t$)",
              "control": "control (MTL given $s_t$)"}
 
-set_plt_params(style='fast', file_format="png")
+use_paper_style()
 
 def _handles():
     return [Line2D([], [], color=c, ls=ls, marker="o", ms=4, lw=1.8, label=l)
@@ -224,66 +226,70 @@ def fig_mtl_control(arm, seed, r, path):
     fig.suptitle("Is the decoding loss specific to the cerebellar channel?\n"
                  + ttl, fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.90))
-    make_axis_nice(fig)
+    offset_spines(fig)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fig.savefig(path, dpi=300); plt.close(fig)
+    save(fig, path)
     print(f"    saved -> {path}", flush=True)
 
 
 def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
-    """The main figure: MSE bars plus one decoding panel per readout."""
+    """The main figure: MSE per condition, then one decoding panel per readout.
+
+    Built at double-column width with the style's type (no per-call font
+    sizes), one y label per row with inner tick labels dropped, and the
+    which-error-bar note in <path>_caption.txt rather than a suptitle
+    (plotting_utils follow-ups 1, 2, 5). Written as PDF + PNG."""
     ncol = int(np.ceil((1 + len(READOUTS)) / 2))
-    fig, axes = plt.subplots(2, ncol, figsize=(3.3 * ncol, 8.2))
+    fig, axes = plt.subplots(2, ncol, figsize=figsize("double", height=4.4),
+                             layout="constrained")
     ax = axes.ravel()
     for k in range(1 + len(READOUTS), len(ax)):
         ax[k].axis("off")
     ms = [d[m]["mse"] if isinstance(d[m], dict) else d[m] for m, _, _, _ in COND]
     ax[0].bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62)
-    ax[0].set_xticks(range(len(COND)))
-    ax[0].set_xticklabels([l for _, l, _, _ in COND], fontsize=8.5)
+    ax[0].set_xticks(range(len(COND)), [l for _, l, _, _ in COND])
     ax[0].set_ylabel("velocity MSE")
-    ax[0].set_title("prediction", fontsize=10)
+    ax[0].set_title("prediction")
     for k, v in enumerate(ms):
-        ax[0].text(k, v * 1.02, f"{v:.4f}", ha="center", fontsize=7.5)
-    for i, ro in enumerate(READOUTS):
-        a = ax[1 + i]
+        ax[0].annotate(f"{v:.4f}", (k, v), xytext=(0, 1.5), textcoords="offset points",
+                       ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
+    # LEVEL readouts are titled in their level's colour; the whole-factor
+    # readouts (family / all contexts) are not levels and stay in ink
+    ttl = {"family": "which family?", "all": f"which context? (all {N_CONTEXTS})"}
+    dec = list(ax[1:1 + len(READOUTS)])
+    for a, ro in zip(dec, READOUTS):
+        if a is not dec[0]:
+            a.sharey(dec[0])
         for mode, lab, col, ls in COND:
             mu, sd = r[(mode, ro)]
-            a.plot(KS, mu, ls, color=col, marker="o", ms=3.5, lw=1.6)
-            a.fill_between(KS, mu - sd, mu + sd, color=col, alpha=.20, lw=0)
+            plot_band(a, KS, mu, sd, color=col, ls=ls, label=lab)
         ch = _chance(ro)
-        a.axhline(ch, ls=":", color="#888", lw=1)
-        a.text(KS[-1], ch + .015, f"chance {ch:.2f}", fontsize=6.5,
-               color="#888", ha="right")
-        a.set_ylim(0, 1.05)
-        # LEVEL readouts are coloured by their level; the three WHOLE-FACTOR
-        # readouts (aim / field / all contexts) are not levels and have no
-        # entry in FCOL, so they take the neutral colour
-        ttl = {"family": "which family?",
-               "all": f"which context?  (all {N_CONTEXTS})"}
-        a.set_title(ttl.get(ro, ro), fontsize=11,
-                    color="#1a1a1a" if ro in ttl else FCOL.get(ro, "#1a1a1a"))
+        chance_line(a, ch, f"chance {ch:.2f}")
+        a.set_ylim(0, 1)
+        a.set_title(ttl.get(ro, ro), color=INK if ro in ttl else FCOL.get(ro, INK))
         a.set_xlabel("steps since context switch")
-        if i == 0:
-            a.set_ylabel("linear decoding of context")
-        if ro in ttl:
-            a.set_ylabel(f"linear decoding, {ttl[ro]}", fontsize=9)
-    for a in ax:
-        _despine(a)
-    fig.legend(handles=_handles(), ncol=3, frameon=False, fontsize=10,
-               loc="upper center", bbox_to_anchor=(.5, .935))
+    # one y label per row (the first decoding panel of each), inner labels off
+    row_first = {axes[i, 1 if i == 0 else 0] for i in range(axes.shape[0])}
+    for a in dec:
+        if a in row_first:
+            a.set_ylabel("decoding accuracy")
+        else:
+            a.tick_params(labelleft=False)
+    fig.legend(handles=_handles(), ncol=len(COND), loc="outside upper center")
     if band == "split":
-        sub = (f"line is the mean over {N_SPLITS} sequence-level decoder splits, "
-               f"band is $\\pm$1 SD ACROSS SPLITS -- an internal check, not the "
-               f"error bar to quote (see across_seeds/)")
+        err = (f"Line: mean over {N_SPLITS} sequence-level decoder splits; band: +-1 SD "
+               f"across splits, an internal check and not the error bar to quote "
+               f"(see across_seeds/).")
     else:
-        sub = (f"line is the mean over {n_seed} TRAINING SEEDS, band is $\\pm$1 SD "
-               f"across them -- this is the error bar to quote")
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)} -- is the cerebellar error necessary?\n"
-                 f"{sub}", fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, .91))
-    make_axis_nice(fig)
-    fig.savefig(path, dpi=300); plt.close(fig)
+        err = (f"Line: mean over {n_seed} training seeds; band: +-1 SD across them, "
+               f"the error bar to quote.")
+    caption = (f"{ARM_TITLE.get(arm, arm)}: is the cerebellar error necessary? "
+               f"(a) Held-out velocity MSE per condition. (b-f) Linear decoding of "
+               f"context from z against steps since the context switch, per readout; "
+               f"dotted line is chance. {err}")
+    offset_spines(fig)
+    label_panels(fig, [a for a in ax if a.axison])
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -332,9 +338,9 @@ def fig_global(arm, seed, r, path):
                  f"{'  (' + str(seed) + ')' if str(seed).startswith('pooled') else ''}"
                  f" -- context decoding, nothing given away;  band {band}",
                  fontsize=10, y=0.99)
-    make_axis_nice(fig)
+    offset_spines(fig)
     fig.tight_layout(rect=(0, 0, 1, .80))
-    fig.savefig(path, dpi=300); plt.close(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -401,9 +407,9 @@ def fig_tss(arm, seed, d, path):
         f"{ARM_TITLE.get(arm, arm)}  (AR(1), rho={RHO}).  x is time since "
         f"switch, not epoch:\ntss=0 is the step the context changes, where MTL "
         f"is at chance by construction.", fontsize=10)
-    make_axis_nice(fig)
+    offset_spines(fig)
     fig.tight_layout(rect=(0, 0, 1, .88))
-    fig.savefig(path, dpi=300); plt.close(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -417,7 +423,7 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     z = np.load(p)
     fig, ax = plt.subplots(1, 2, figsize=(11.2, 4.3))
     ep = np.arange(1, len(z["hist"]) + 1)
-    ax[0].plot(ep, z["hist"], color="#1a1a1a", lw=1.6, label="overall")
+    ax[0].plot(ep, z["hist"], color="#1c1c1c", lw=1.6, label="overall")
     pf = z["per_fam"]
     for i, f in enumerate(LEVELS[:pf.shape[1]]):
         ax[0].plot(ep, pf[:, i], color=FCOL[f], lw=1.2, label=f)
@@ -441,8 +447,8 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: training history (seed {seed})",
                  fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .92))
-    make_axis_nice(fig)
-    fig.savefig(path, dpi=300); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -477,12 +483,12 @@ def fig_forces(arm, seed, d, path):
         m = keep & _level_mask(d, fm)
         A, B = ang(Fc, Ft)[m], ang(Fb, Ft)[m]
         bins = np.linspace(0, 180, 37)
-        ax[i].hist(B, bins, color="#7f8c8d", alpha=.55,
+        ax[i].hist(B, bins, color="#8a8f94", alpha=.55,
                    label=f"blind ({B.mean():.0f}$\\degree$)")
-        ax[i].hist(A, bins, color="#c0392b", alpha=.55,
+        ax[i].hist(A, bins, color="#c25b6b", alpha=.55,
                    label=f"CB ({A.mean():.0f}$\\degree$)")
-        ax[i].axvline(A.mean(), color="#c0392b", lw=1.5)
-        ax[i].axvline(B.mean(), color="#7f8c8d", lw=1.5, ls="--")
+        ax[i].axvline(A.mean(), color="#c25b6b", lw=1.5)
+        ax[i].axvline(B.mean(), color="#8a8f94", lw=1.5, ls="--")
         ax[i].set_title(fm, fontsize=10)
         ax[i].legend(frameon=False, fontsize=8)
         ax[i].set_xlabel("angle: predicted vs true force (deg)")
@@ -491,8 +497,8 @@ def fig_forces(arm, seed, d, path):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)} -- does CB's predicted force track "
                  f"the context?", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .9))
-    make_axis_nice(fig)
-    fig.savefig(path, dpi=300); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 
@@ -576,8 +582,8 @@ def fig_switch(arm, seed, out, path, band=None, n_seed=None):
     fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: $e$ lesioned only in the window shown "
                  f"-- decoding falls on BOTH sides of the switch{tail}", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, .86))
-    make_axis_nice(fig)
-    fig.savefig(path, dpi=300); plt.close(fig)
+    offset_spines(fig)
+    save(fig, path)
     print(f"  saved -> {path}")
 
 

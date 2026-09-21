@@ -680,6 +680,161 @@ def test_evoked_stats_do_not_average_across_the_evoke():
     assert MAP.evoked_recovery_stats(d[d.occurrence == 0]) is None
 
 
+def _spontaneous_rows(cfg, channel_index, n_channel):
+    """The spontaneous twin of _evoked_rows: the same P0 | P+ | P- prefix and
+    a channel block of the same TOTAL length, with no evoke in it."""
+    import sac
+    blocks = [("P0", 0, 4), ("P+ rot +60", 0, 6), ("P- rot -60", 0, 4),
+              (sac.CHANNEL_LABEL, 0, n_channel)]
+    rows = []
+    for seed in (0, 1):
+        for ph, (lab, occ, n) in enumerate(blocks):
+            for ep in range(1, n + 1):
+                ch = lab == sac.CHANNEL_LABEL
+                index = channel_index if ch else 0.0
+                rows.append(dict(config=cfg, seed=seed, phase=ph, occurrence=occ, ep=ep,
+                                 label=lab, channel=float(ch), index=index,
+                                 first_angle=-60.0 * index, prior_src=-2,
+                                 probe_first_angle=np.nan, probe_fa_pplus=np.nan,
+                                 probe_fa_pminus=np.nan, probe_fa_base=np.nan))
+    return pd.DataFrame(rows)
+
+
+def test_sr_er_pairs_match_the_same_model_across_schedules():
+    """The pair key is the run name with the schedule token dropped, so a
+    model's spontaneous and evoked runs pair up while its buffer twin and a
+    model that ran only one schedule do not get mixed in."""
+    df = pd.DataFrame({"config": ["main_rot_sr_carry", "main_rot_er_carry",
+                                  "baseline_rot_sr", "coin_rot_er",
+                                  "main_rot_savw_carry", "main"]})
+
+    assert MAP._pair_key("main_rot_sr_carry") == MAP._pair_key("main_rot_er_carry")
+    assert MAP._pair_key("main_rot_sr_carry") == "main_rot_carry"
+    # only the model with BOTH schedules pairs; sr-only, er-only, savings and
+    # cycle runs are left out
+    assert MAP.sr_er_pairs(df) == [("main_rot_carry", "main_rot_sr_carry",
+                                    "main_rot_er_carry")]
+
+
+def test_recovery_divergence_is_zero_before_the_evoke():
+    """The figure's own control. Both schedules are the same run up to the
+    evoke, so the paired difference there must be exactly zero; planted, the
+    evoked run then sits 0.8 above the spontaneous one early and 0.2 late."""
+    n_pre, n_post = 5, 12
+    sr = MAP._channel_trace(_spontaneous_rows("main_rot_sr_carry", 0.0, n_pre + n_post),
+                            "main_rot_sr_carry", 3)
+    er = MAP._channel_trace(_evoked_rows("main_rot_er_carry", 0.0,
+                                         [0.8] * 4 + [0.2] * (n_post - 4)),
+                            "main_rot_er_carry", 3)
+    # the two schedules must be comparable reach for reach
+    assert sr.k.max() == er.k.max() == n_pre + n_post
+
+    both, windows = MAP.recovery_divergence(sr, er, n_pre, evoke_window=4, close_reaches=8)
+
+    assert np.allclose(windows["pre"], 0.0)
+    assert np.allclose(windows["early"], 0.8)
+    assert np.allclose(windows["late"], 0.2)
+    assert len(windows["early"]) == 2                      # one value per seed
+
+
+def test_recovery_comparison_figure_renders(tmp_path, monkeypatch):
+    data = pd.concat([
+        _spontaneous_rows("main_rot_sr_carry", -0.5, 17),
+        _evoked_rows("main_rot_er_carry", -0.5, [0.9] * 6 + [0.3] * 6),
+        _spontaneous_rows("baseline_rot_sr", -0.9, 17),
+        _evoked_rows("baseline_rot_er", -0.9, [0.1] * 12),
+    ], ignore_index=True)
+    monkeypatch.setattr(MAP, "CONFIG_ORDERS", dict(MAP.CONFIG_ORDERS))
+    monkeypatch.setattr(MAP, "CONFIG_COLORS", dict(MAP.CONFIG_COLORS))
+    for c in data.config.unique():
+        MAP.register_circuit_variant(c)
+
+    MAP.plot_recovery_comparison(data, str(tmp_path))
+    assert (tmp_path / "recovery_sr_vs_er.png").exists()
+    # a frame with only one of the two schedules renders nothing
+    MAP.plot_recovery_comparison(data[data.config.str.contains("_sr")], str(tmp_path / "one"))
+    assert not (tmp_path / "one").exists()
+
+
+def _belief_rows(cfg, n=24, **columns):
+    """A two-seed run with a channel block and whatever belief columns the
+    test wants to plant."""
+    import sac
+    rows = []
+    for seed in (0, 1):
+        for ep in range(n):
+            ch = ep >= n // 2
+            row = dict(config=cfg, seed=seed, phase=int(ch), occurrence=0, ep=ep + 1,
+                       label=sac.CHANNEL_LABEL if ch else "P+ rot +60",
+                       channel=float(ch), prior_src=-2)
+            row.update({k: (v[ep] if isinstance(v, list) else v)
+                        for k, v in columns.items()})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_belief_frame_prefers_the_observer_then_the_bank_then_z():
+    """Three different measurements answer the same question, so one order is
+    fixed and the figure is told which it got. The bank draw beats the
+    z-centroid softmax ON PURPOSE (2026-09-20, user): the softmax does not
+    resolve the structure the bank draw shows, so a run that logged both must
+    not switch to it just because it is the more direct measurement."""
+    import sac
+    pp, pm = sac.coin_pair()
+
+    both = _belief_rows("coin_rot_er", belief_pplus=0.6, belief_pminus=0.2,
+                        belief_base=0.1, zbelief_pplus=0.9, zbelief_pminus=0.1,
+                        zbelief_base=0.0)
+    d, source = MAP.belief_frame(both, "coin_rot_er")
+    assert source == "observer posterior"
+    # the two traces the figure draws, then the derived pair quantities
+    assert np.allclose(d["p_pplus"], 0.6) and np.allclose(d["p_pminus"], 0.2)
+    assert np.allclose(d["rel_pplus"], 0.75)          # 0.6 / (0.6 + 0.2)
+    assert np.allclose(d["pair_mass"], 0.8)
+
+    # no observer but a circuit: the z softmax, the only source left
+    z_only = _belief_rows("main_rot_er_carry", belief_pplus=np.nan,
+                          belief_pminus=np.nan, zbelief_pplus=0.3,
+                          zbelief_pminus=0.1, zbelief_base=0.2)
+    d, source = MAP.belief_frame(z_only, "main_rot_er_carry")
+    assert source == "z-centroid softmax"
+    assert np.allclose(d["rel_pplus"], 0.75)          # 0.3 / (0.3 + 0.1)
+
+    # a bank draw, planted 3 P+ then 1 P- repeating, so a wide window sits at
+    # 3/4. It wins over the z column when a re-run has logged BOTH.
+    draws = [pp, pp, pp, pm] * 6
+    bank = _belief_rows("main_rot_er_carry", belief_pplus=np.nan, belief_pminus=np.nan,
+                        zbelief_pplus=0.3, zbelief_pminus=0.1, zbelief_base=0.2)
+    bank["prior_src"] = list(draws) * 2
+    d, source = MAP.belief_frame(bank, "main_rot_er_carry", bank_window=12)
+    assert source.startswith("bank draw")
+    mid = d[(d.ep_in_run > 3) & (d.ep_in_run < 8)]    # away from the block edges
+    # a windowed estimate of a Bernoulli rate, so it sits AROUND 3/4 rather
+    # than on it: the window is not a whole number of 4-draw cycles
+    assert mid["rel_pplus"].mean() == pytest.approx(0.774, abs=0.01)
+    assert np.allclose(mid["rel_pplus"], 0.75, atol=0.08)
+
+
+def test_belief_frame_is_none_without_any_source():
+    """baseline has no observer, no circuit and no bank -- nothing to read."""
+    plain = _belief_rows("baseline_rot_er", belief_pplus=np.nan, belief_pminus=np.nan)
+    assert MAP.belief_frame(plain, "baseline_rot_er") is None
+
+
+def test_context_belief_figure_renders(tmp_path, monkeypatch):
+    data = pd.concat([
+        _belief_rows("coin_rot_sr", belief_pplus=0.6, belief_pminus=0.2),
+        _belief_rows("coin_rot_er", belief_pplus=0.8, belief_pminus=0.1),
+    ], ignore_index=True)
+    monkeypatch.setattr(MAP, "CONFIG_ORDERS", dict(MAP.CONFIG_ORDERS))
+    monkeypatch.setattr(MAP, "CONFIG_COLORS", dict(MAP.CONFIG_COLORS))
+    for c in data.config.unique():
+        MAP.register_circuit_variant(c)
+
+    MAP.plot_context_belief(data, str(tmp_path))
+    assert (tmp_path / "context_belief.png").exists()
+
+
 def test_evoked_figure_renders(tmp_path, monkeypatch):
     data = pd.concat([_evoked_rows("baseline_rot_er", -0.9, [0.1] * 12),
                       _evoked_rows("main_rot_er_carry", -0.5, [0.9] * 6 + [0.3] * 6)],

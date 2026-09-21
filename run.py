@@ -36,7 +36,7 @@ import argparse
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from plotting_utils import set_plt_params, make_axis_nice
+from plotting_utils import use_paper_style, offset_spines
 import model as M
 
 

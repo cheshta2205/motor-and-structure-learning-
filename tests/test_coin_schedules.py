@@ -1,10 +1,16 @@
 """COIN's paradigms as block schedules, the channel plant, EC's experience
 prior, hindsight z relabelling and the observers' visit-count prior.
 
-What has to hold, first of all: EVERYTHING IS INERT BY DEFAULT. The cycle
-schedule's block list is the one every earlier run used, the config defaults
-name the old behaviour, and the observer's predict step is unchanged at
-count_prior 0 -- so the existing savings/retention runs stay reproducible.
+What has to hold, first of all: EVERYTHING IS INERT BY DEFAULT -- the cycle
+schedule's block list is the one every earlier run used and the config
+defaults name the old behaviour -- so the existing savings/retention runs
+stay reproducible.
+
+ONE EXCEPTION, deliberate: observer_count_prior went 0 -> 1 on 2026-09-20
+(user). At 0 an inferred oracle's channel belief relaxes toward UNIFORM, not
+toward the visit frequency, so it never tested the account it exists to test;
+see AblationConfig.observer_count_prior. That changes every inferred-oracle
+run (`coin*`), and only those: no other config reads the term.
 """
 import numpy as np
 import pytest
@@ -50,14 +56,20 @@ def test_cycle_schedule_is_the_legacy_block_list():
 
 
 def test_defaults_name_the_old_behaviour():
+    """...with ONE deliberate exception, the visit-count prior: it went from 0
+    to 1 on 2026-09-20 (user) because at 0 an inferred oracle's channel belief
+    relaxes to uniform and so never tested the frequency-driven recovery it
+    exists to test. Every inferred-oracle run made before that used 0 and its
+    name does not say so; see AblationConfig.observer_count_prior."""
     cfg = sac.AblationConfig(name="x")
     assert cfg.schedule == "cycle" and cfg.ec_prior == "zero"
-    assert cfg.relabel_z is False and cfg.observer_count_prior == 0.0
-    # every existing preset resolves to the old behaviour too
+    assert cfg.relabel_z is False
+    assert cfg.observer_count_prior == 1.0 == sac.DEFAULT_COUNT_PRIOR
+    # every existing preset resolves to the old behaviour on the rest
     for name, preset in SW.CONFIG_BY_NAME.items():
         c = sac.AblationConfig(**preset)
-        assert (c.schedule, c.ec_prior, c.relabel_z, c.observer_count_prior) == \
-            ("cycle", "zero", False, 0.0), name
+        assert (c.schedule, c.ec_prior, c.relabel_z) == ("cycle", "zero", False), name
+        assert c.observer_count_prior == 1.0, name
 
 
 def test_observer_predict_is_unchanged_at_count_prior_zero():
@@ -266,10 +278,22 @@ def test_cli_names_the_paradigm_knobs_in_order():
          "--ec-prior", "experience", "--relabel-z", "--clear-buffer"]))
     assert cfg.name == "main_rot_sr_prior_relabel_clearbuf"
     assert cfg.schedule == "spontaneous_recovery" and cfg.ec_prior == "experience" and cfg.relabel_z
+    # the count prior is the DEFAULT now, so asking for it adds no suffix and
+    # the tag marks the departure: turning it off
     coin = sac.config_from_cli(sac._parse_args(
         ["--config", "coin", "--contexts", "rotations", "--schedule", "evoked_recovery",
          "--count-prior", "1.0"]))
-    assert coin.name == "coin_rot_er_cprior" and coin.observer_count_prior == 1.0
+    assert coin.name == "coin_rot_er" and coin.observer_count_prior == 1.0
+    plain = sac.config_from_cli(sac._parse_args(
+        ["--config", "coin", "--contexts", "rotations", "--schedule", "evoked_recovery"]))
+    assert plain.name == "coin_rot_er" and plain.observer_count_prior == 1.0
+    off = sac.config_from_cli(sac._parse_args(
+        ["--config", "coin", "--contexts", "rotations", "--schedule", "evoked_recovery",
+         "--count-prior", "0"]))
+    assert off.name == "coin_rot_er_nocprior" and off.observer_count_prior == 0.0
+    half = sac.config_from_cli(sac._parse_args(
+        ["--config", "coin", "--contexts", "rotations", "--count-prior", "0.5"]))
+    assert half.name == "coin_rot_cprior" and half.observer_count_prior == 0.5
     base = sac.config_from_cli(sac._parse_args(
         ["--config", "baseline", "--contexts", "rotations", "--schedule", "savings_washout"]))
     assert base.name == "baseline_rot_savw"
@@ -281,7 +305,7 @@ def test_cli_names_the_paradigm_knobs_in_order():
         sac.config_from_cli(sac._parse_args(
             ["--config", "baseline", "--contexts", "curls", "--schedule", "spontaneous_recovery"]))
     got = SW.presets_for(["baseline", "coin"], schedule="spontaneous_recovery", count_prior=1.0)
-    assert [c.name for c in got] == ["baseline_rot_sr", "coin_rot_sr_cprior"]
+    assert [c.name for c in got] == ["baseline_rot_sr", "coin_rot_sr"]
     with pytest.raises(ValueError):                      # no EC to draw a prior for
         sac.config_from_cli(sac._parse_args(["--config", "baseline", "--ec-prior", "experience"]))
     with pytest.raises(ValueError):                      # the given oracle has no belief
@@ -373,10 +397,10 @@ def test_paradigms_replay_by_default_and_clearbuf_is_the_twin():
 def test_sweep_takes_several_schedules_at_once():
     got = SW.presets_for(["baseline", "coin"], version="both", count_prior=1.0,
                          schedule=["savings_washout", "spontaneous_recovery"])
-    assert [c.name for c in got] == ["baseline_rot_savw", "coin_rot_savw_cprior",
-                                     "baseline_rot_savw_clearbuf", "coin_rot_savw_cprior_clearbuf",
-                                     "baseline_rot_sr", "coin_rot_sr_cprior",
-                                     "baseline_rot_sr_clearbuf", "coin_rot_sr_cprior_clearbuf"]
+    assert [c.name for c in got] == ["baseline_rot_savw", "coin_rot_savw",
+                                     "baseline_rot_savw_clearbuf", "coin_rot_savw_clearbuf",
+                                     "baseline_rot_sr", "coin_rot_sr",
+                                     "baseline_rot_sr_clearbuf", "coin_rot_sr_clearbuf"]
     assert {c.schedule for c in got} == {"savings_washout", "spontaneous_recovery"}
     one = SW.presets_for(["baseline"], schedule=["spontaneous_recovery"])
     assert [c.name for c in one] == ["baseline_rot_sr"]
@@ -390,7 +414,7 @@ def test_sweep_routes_each_knob_to_the_presets_that_have_the_channel():
                          phase_set="rotations", schedule="spontaneous_recovery",
                          ec_prior="experience", relabel_z=True, count_prior=1.0)
     assert [c.name for c in got] == ["baseline_rot_sr_clearbuf", "main_rot_sr_prior_relabel_clearbuf",
-                                     "coin_rot_sr_cprior_clearbuf", "oracle_rot_sr_clearbuf"]
+                                     "coin_rot_sr_clearbuf", "oracle_rot_sr_clearbuf"]
 
 
 def test_plot_registry_parses_the_paradigm_suffixes():
@@ -615,3 +639,51 @@ def test_channel_reaches_use_the_deterministic_action(tmp_path, monkeypatch):
         a1 = agent.actor.get_action(obs)[2]; a2 = agent.actor.get_action(obs)[2]
     assert torch.equal(a1, a2)                        # the mean is deterministic
     sac.apply_phase_set(sac.DEFAULT_PHASE_SET)
+
+
+# ── the z-centroid belief readout ────────────────────────────────────────
+
+def test_z_centroid_belief_is_a_distribution_that_favours_the_nearest():
+    """softmax of the reciprocal distance: sums to one, peaks on the nearest
+    centroid, and stays finite when z sits exactly on one (1/0)."""
+    cen = np.array([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]])
+
+    p = sac.z_centroid_belief(np.array([1.6, 0.1]), cen)
+    assert p.sum() == pytest.approx(1.0)
+    assert p.argmax() == 1                      # nearest is the second centroid
+
+    on_it = sac.z_centroid_belief(cen[2], cen)
+    assert np.isfinite(on_it).all() and on_it.argmax() == 2
+    # and it is ORDERED by distance, not just peaked
+    d = np.linalg.norm(cen - np.array([1.6, 0.1]), axis=1)
+    assert list(np.argsort(-p)) == list(np.argsort(d))
+
+
+def test_paradigm_run_logs_a_z_belief_and_a_cycle_run_does_not(tmp_path, monkeypatch):
+    """End to end: a paradigm run with a circuit fills zbelief_* for every
+    logged reach, and a cycle run leaves them NaN -- the readout costs a
+    calibration rollout and has no P+/P- pair to report on there, which is
+    also what keeps those runs bit-identical to the ones made before it."""
+    import pandas as pd
+    monkeypatch.setattr(sac, "RUN_DIR", str(tmp_path / "sac_runs"))
+    monkeypatch.setattr(sac, "FIG_DIR", str(tmp_path / "figs"))
+    cols = ["zbelief_pplus", "zbelief_pminus", "zbelief_base"]
+
+    cfg = sac.AblationConfig(**sac.apply_cli_variants(
+        SW.CONFIG_BY_NAME["main"], phase_set="rotations",
+        schedule="evoked_recovery", clear_buffer=True))
+    sac.main(cfg, seeds=1, save_agg=True, workers=1, **_TINY)
+    df = pd.read_csv(tmp_path / "sac_runs" / cfg.name / "aggregated_results.csv")
+
+    pair = df[["zbelief_pplus", "zbelief_pminus"]]
+    assert pair.notna().all().all(), "every logged reach needs a belief"
+    assert ((pair >= 0) & (pair <= 1)).all().all()
+    # a softmax over the four rotations, so the pair cannot hold all of it
+    assert (pair.sum(axis=1) < 1.0).all()
+
+    cyc = sac.AblationConfig(**sac.apply_cli_variants(
+        SW.CONFIG_BY_NAME["main"], phase_set="rotations"))
+    sac.main(cyc, seeds=1, save_agg=True, workers=1,
+             **{k: v for k, v in _TINY.items() if k != "coin_block_ep"})
+    cyc_df = pd.read_csv(tmp_path / "sac_runs" / cyc.name / "aggregated_results.csv")
+    assert cyc_df[cols].isna().all().all()

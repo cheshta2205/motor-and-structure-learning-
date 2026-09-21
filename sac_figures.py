@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from figures import _despine
-from plotting_utils import set_plt_params
+from plotting_utils import use_paper_style, save
 
-set_plt_params(style='fast', file_format='png')
+use_paper_style()
 
 
 def smooth(x, w=25):
@@ -129,7 +129,7 @@ def plot_cross_context(seed, probes, out_dir, config_name=None):
     if config_name:
         title = f"{config_name} — {title}"
     fig.suptitle(title, fontsize=10)
-    plt.savefig(os.path.join(out_dir, "cross_context"))
+    save(plt.gcf(), os.path.join(out_dir, "cross_context"), close=False, formats=("png",))
     plt.close(fig)
 
 
@@ -203,7 +203,7 @@ def plot_center_out(seed, probes, out_dir, config_name=None):
     if config_name:
         title = f"{config_name} — {title}"
     fig.suptitle(title, fontsize=11)
-    plt.savefig(os.path.join(out_dir, "center_out"))
+    save(plt.gcf(), os.path.join(out_dir, "center_out"), close=False, formats=("png",))
     plt.close(fig)
 
 
@@ -225,7 +225,7 @@ def plot_seed(seed, curve, out_dir, key_params=None):
         _despine(ax)
     axes[2].set_xlabel("Episode (global)")
     fig.suptitle(f"SAC diagnostic curves (seed {seed})", fontsize=11)
-    plt.savefig(os.path.join(out_dir, "diagnostic_losses"))
+    save(plt.gcf(), os.path.join(out_dir, "diagnostic_losses"), close=False, formats=("png",))
     plt.close(fig)
 
     for metric, color, ylim in [("success", "steelblue", (0, 1)), ("return", "seagreen", None)]:
@@ -242,7 +242,7 @@ def plot_seed(seed, curve, out_dir, key_params=None):
             param_str = ", ".join(f"{k}={v}" for k, v in key_params.items())
             ax.set_title(param_str, fontsize=7)
         _despine(ax)
-        plt.savefig(os.path.join(out_dir, f"{metric}_curve"))
+        save(plt.gcf(), os.path.join(out_dir, f"{metric}_curve"), close=False, formats=("png",))
         plt.close(fig)
 
 
@@ -324,7 +324,7 @@ def plot_aim_by_step(seed, probes, out_dir, config_name=None, max_blocks=16):
     fig.suptitle(title + "\nStep 0 is context-blind by construction for circuit "
                         "configs; only later steps can show context dependence",
                  fontsize=9)
-    plt.savefig(os.path.join(out_dir, "aim_by_step"))
+    save(plt.gcf(), os.path.join(out_dir, "aim_by_step"), close=False, formats=("png",))
     plt.close(fig)
 
 
@@ -389,5 +389,5 @@ def plot_transfer_trajectories(seed, probes, out_dir, config_name=None,
     if config_name:
         title = f"{config_name} — {title}"
     fig.suptitle(title, fontsize=10)
-    plt.savefig(os.path.join(out_dir, "transfer_trajectories"))
+    save(plt.gcf(), os.path.join(out_dir, "transfer_trajectories"), close=False, formats=("png",))
     plt.close(fig)
