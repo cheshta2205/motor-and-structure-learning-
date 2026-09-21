@@ -2195,7 +2195,9 @@ def _paired_bars(ax, runs, values, keys, ylabel, title, reference=None,
     (the evoked jump and decay) passes refs=(0,) and ylim=None to autoscale,
     since ±1 means nothing there."""
     # Swarm + mean/CI instead of bars: keys[0] a filled mean marker, keys[1]
-    # hollow; a no-replay run gets a dashed interval line.
+    # hollow; a no-replay run gets a dashed interval line. When every run has
+    # the same replay variant the label is the model name alone.
+    one_variant = len({_replay_off(c) for c in runs if values.get(c) is not None}) == 1
     x = 0; ticks, tlabels = [], []
     for cfg in runs:
         pr = values.get(cfg)
@@ -2210,7 +2212,8 @@ def _paired_bars(ax, runs, values, keys, ylabel, title, reference=None,
             swarm_ci(ax, [v], colors=[col], x=[x + 0.4 * j], jitter=0.1,
                      mean_kw=dict(mfc="white", mec=col) if j else None,
                      ci_kw=dict(ls="--") if _replay_off(cfg) else None)
-        ticks.append(x + 0.2); tlabels.append(_model_label(cfg).replace(" · ", "\n")); x += 1.4
+        ticks.append(x + 0.2); x += 1.4
+        tlabels.append(base_config(cfg) if one_variant else _model_label(cfg).replace(" · ", "\n"))
     for y in refs:
         ax.axhline(y, **_REF_KW)
     ax.set_xticks(ticks); ax.set_xlim(-0.5, x - 1.4 + 0.9)
