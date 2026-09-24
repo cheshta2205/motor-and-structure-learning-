@@ -284,11 +284,22 @@ def readout_tag(readout=DEFAULT_READOUT, beta=RATE_BETA, sigma=NOISE_SIGMA) -> s
 # (+train-rotations); data.generate_sequences reads the ids off the spec, so
 # every analysis of such a circuit rolls it out on its own contexts.
 _FAMILY_SET = {f"{name}s": name for name in FAM_NAMES}        # "rotations" -> "rotation"
-TRAIN_CONTEXT_SETS = ("all",) + tuple(_FAMILY_SET)
+# "rotations_wide" (2026-09-21): the table with its four rotations REPLACED
+# by task.WIDE_ROT_ANGLES (+-30, +-90) -- curl and drift as before, so the
+# circuit differs from the default one in the rotation anchors alone. The
+# zero-shot experiment's circuit; see task.wide_rotation_ids for why.
+WIDE_TRAIN_SET = "rotations_wide"
+# "linear_random" (2026-09-21): the structure-learning CONTROL -- the table
+# with its rotations replaced by four random linear action transforms at the
+# wide rotations' effect sizes (task.random_linear_ids). Same count, same
+# effect sizes, no one-parameter axis; see the task.py comment.
+LINEAR_TRAIN_SET = "linear_random"
+TRAIN_CONTEXT_SETS = ("all",) + tuple(_FAMILY_SET) + (WIDE_TRAIN_SET, LINEAR_TRAIN_SET)
 DEFAULT_TRAIN_CONTEXTS = "all"
 _SHORT_FAMILY = {"rotation": "rot", "reflection": "refl", "curl": "curl", "drift": "drift"}
 _TRAIN_TAG = {"all": "", **{s: f"_train{_SHORT_FAMILY.get(name, name)}"
-                            for s, name in _FAMILY_SET.items()}}
+                            for s, name in _FAMILY_SET.items()},
+              WIDE_TRAIN_SET: "_trainrotw", LINEAR_TRAIN_SET: "_trainlin"}
 
 
 def train_context_ids(train_contexts=DEFAULT_TRAIN_CONTEXTS):
@@ -298,6 +309,12 @@ def train_context_ids(train_contexts=DEFAULT_TRAIN_CONTEXTS):
                        f"expected one of {TRAIN_CONTEXT_SETS}")
     if train_contexts == "all":
         return None
+    if train_contexts == WIDE_TRAIN_SET:
+        import task as _T
+        return _T.wide_rotation_ids() + [c for c in range(N_CONTEXTS) if FAMILY[c] != 0]
+    if train_contexts == LINEAR_TRAIN_SET:
+        import task as _T
+        return _T.random_linear_ids() + [c for c in range(N_CONTEXTS) if FAMILY[c] != 0]
     fam = FAM_NAMES.index(_FAMILY_SET[train_contexts])
     return [c for c in range(N_CONTEXTS) if FAMILY[c] == fam]
 
@@ -309,7 +326,20 @@ def train_contexts_tag(train_contexts=DEFAULT_TRAIN_CONTEXTS) -> str:
 
 def train_contexts_stamp(train_contexts=DEFAULT_TRAIN_CONTEXTS) -> str:
     train_context_ids(train_contexts)
-    return "" if train_contexts == "all" else f"+train-{train_contexts}"
+    if train_contexts == "all":
+        return ""
+    if train_contexts == WIDE_TRAIN_SET:
+        # THE ANGLES ARE IN THE STAMP: a checkpoint fitted on one wide set
+        # must not load as if fitted on another once the constant moves
+        import task as _T
+        angles = ",".join(f"{a:g}" for a in _T.WIDE_ROT_ANGLES)
+        return f"+train-{train_contexts}[{angles}]"
+    if train_contexts == LINEAR_TRAIN_SET:
+        # the draw is in the stamp: its seed and the effect sizes it matched
+        import task as _T
+        effs = ",".join(f"{_T.effect_size(_T.LINEAR_MATS[c]):.2f}" for c in _T.random_linear_ids())
+        return f"+train-{train_contexts}[seed{_T.RANDOM_LINEAR_SEED};{effs}]"
+    return f"+train-{train_contexts}"
 
 
 @dataclass(frozen=True)
@@ -357,7 +387,9 @@ def add_circuit_args(ap):
     ap.add_argument("--train-contexts", default=DEFAULT_TRAIN_CONTEXTS,
                     choices=list(TRAIN_CONTEXT_SETS),
                     help="which contexts the circuit was (or is to be) fitted on: "
-                         "the whole table, or one family. Tag _trainrot/_trainrefl.")
+                         "the whole table, one family, rotations_wide (the table with "
+                         "+-30/+-90 as its rotations) or linear_random (random linear "
+                         "transforms in their place). Tag _trainrot/_trainrotw/_trainlin.")
     return ap
 
 

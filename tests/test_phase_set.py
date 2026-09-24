@@ -25,7 +25,9 @@ def restore_phase_set():
 
 
 def test_sets_follow_the_family_table():
-    assert sac.PHASE_SETS == ("mixed", "rotations", "curls", "drifts")
+    # the family sets follow the table; rotations_wide is the named off-table
+    # set of the zero-shot experiment (sac.WIDE_PHASE_SET)
+    assert sac.PHASE_SETS == ("mixed", "rotations", "curls", "drifts", "rotations_wide")
     mixed = sac.phase_ids_for("mixed")
     assert mixed == sac._phase_ids() and len(mixed) == 2 * len(T.FAM_NAMES)
     fams = {}

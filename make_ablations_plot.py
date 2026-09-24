@@ -43,8 +43,8 @@ import seaborn as sns
 from scipy.optimize import curve_fit
 from statannotations.Annotator import Annotator
 
-from plotting_utils import (offset_spines, use_paper_style, swarm_ci, chance_line, save,
-                            figsize, label_panels, INK, MUTED, SHADE)
+from plotting_utils import (offset_spines, bracket_xticks, use_paper_style, swarm_ci,
+                            chance_line, plot_band, save, figsize, label_panels, INK, MUTED, SHADE)
 import sac
 import task as T
 
@@ -138,8 +138,11 @@ _NUM = r"[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?"
 _TASK_INFIX = "|".join(re.escape(s) for s in sac.PHASE_SET_SUFFIX.values() if s)
 # ... then the COIN-paradigm knobs (schedule, EC prior, relabelling, count prior)
 _TASK_INFIX = (_TASK_INFIX + "|" if _TASK_INFIX else "") + "|".join(
-    [re.escape(s) for s in sac.SCHEDULE_SUFFIX.values() if s]
-    + ["_prior", "_carry", "_relabel", sac.NOCPRIOR_SUFFIX, "_cprior",
+    # the zero-shot suffix carries the few-shot angle and, optionally, the
+    # test horizon: _zs60, _zs60_h12
+    [re.escape(s) + (rf"(?:-?{_NUM})?(?:_h[0-9]+)?(?:_p[0-9]+)?" if k == "zero_shot" else "")
+     for k, s in sac.SCHEDULE_SUFFIX.items() if s]
+    + ["_prior", "_carrymean", "_carry", "_relabel", sac.NOCPRIOR_SUFFIX, "_cprior",
        sac.TRANSBUF_SUFFIX])
 _TASK_INFIX = rf"(?:{_TASK_INFIX})*"
 _TRAIN_INFIX = "|".join(re.escape(t) for t in sac.M._TRAIN_TAG.values() if t)
@@ -203,6 +206,31 @@ def base_config(name: str) -> str:
     return split_run_name(name)[0]
 
 
+# WHAT THE FIGURES CALL EACH PRESET (user, 2026-09-24): the anatomy the agent
+# has, not the code name. Keyed by base preset, so every derived run (main_carry,
+# main_clearbuf, ...) inherits its parent's name; a run whose base is not
+# listed keeps its run name. The savings twin is marked, since a legend that
+# holds both must tell them apart; other infixes (the EC prior, the circuit
+# variant) are not shown -- the run name in the file records them.
+DISPLAY_NAME = {
+    "main": "Full Circuit",
+    "baseline": "Motor Cortex",
+    "cb_only_end_to_end": "Motor Cortex + Cerebellum",
+    "coin": "COIN",
+}
+
+
+def display_name(run: str, wrap: bool = False) -> str:
+    """`wrap` breaks a compound name at its "+" onto two lines -- for tick
+    labels, where the longest name sets the axis width; legends stay on one
+    line."""
+    base, _, tail = split_run_name(run)
+    name = DISPLAY_NAME.get(base, run)
+    if wrap:
+        name = name.replace(" + ", "\n+ ")
+    return name + (" (buffer cleared)" if tail and "_clearbuf" in tail else "")
+
+
 def _schedule_of(cfg: str) -> str:
     """The sac.SCHEDULES entry a run name carries (_sr / _er / _savw as a
     whole '_'-token), "cycle" when none."""
@@ -210,6 +238,10 @@ def _schedule_of(cfg: str) -> str:
     for schedule, suffix in sac.SCHEDULE_SUFFIX.items():
         if suffix and suffix.lstrip("_") in tokens:
             return schedule
+    # the zero-shot token carries its angle (zs45); the paradigm figures do
+    # not draw those runs, but the registry must still place them
+    if any(re.fullmatch(rf"zs-?{_NUM}", t) for t in tokens):
+        return "zero_shot"
     return "cycle"
 
 
@@ -253,8 +285,12 @@ def register_circuit_variant(name: str) -> bool:
             n_prior += b == base and bool(i) and not s
         CONFIG_ORDERS[circuit_level] = (CONFIG_ORDERS[base]
                                         + CIRCUIT_VARIANT_ORDER_STEP * (n_prior + 1))
+        # capped: with five or more variants of one base (main has the three
+        # paradigms plus the zero-shot runs) the linear step passed 1.0 and
+        # _shade produced a negative channel ('#-1-3-5'), which seaborn
+        # rejected and the whole sweep's plot step died on (2026-09-21)
         CONFIG_COLORS[circuit_level] = _shade(
-            CONFIG_COLORS[base], CIRCUIT_VARIANT_SHADE * (1 + 0.5 * n_prior))
+            CONFIG_COLORS[base], min(CIRCUIT_VARIANT_SHADE * (1 + 0.5 * n_prior), 0.85))
     _register_buffer_variants(circuit_level)
     return name in CONFIG_ORDERS
 
@@ -686,11 +722,18 @@ def build_criterion_crossing_phase_table(data: pd.DataFrame, metrics: list, crit
                 "config": config, "seed": seed, "phase_occurrence": phase_occurrence,
                 "metric": metric, "criterion_target": target, "criterion_episode": criterion_episode,
                 "label": label, "occurrence": occurrence,
+                # never reached: the estimator reports the block's LAST episode
+                # (episodes.max(), 0-based), which the swarms draw hollow. A
+                # genuine crossing on that very episode is flagged too; the
+                # two cannot be told apart from the trace.
+                "censored": bool(np.isfinite(criterion_episode)
+                                 and criterion_episode >= episodes.max() - 1e-9),
             })
 
     if not rows:
         return pd.DataFrame(columns=[
-            "config", "seed", "phase_occurrence", "metric", "criterion_target", "criterion_episode"])
+            "config", "seed", "phase_occurrence", "metric", "criterion_target", "criterion_episode",
+            "label", "occurrence", "censored"])
     return pd.DataFrame(rows)
 
 
@@ -821,10 +864,74 @@ def get_shared_seeds(data: pd.DataFrame, configs: list) -> set:
     return set.intersection(*seed_sets)
 
 
+def _config_legend_handles(config_order):
+    """One filled patch per config, in the registry's colour, keyed by the
+    config's DISPLAY name (so `ax.legend(h.values(), h.keys())` reads right)
+    -- built by hand so the legend can sit outside the axes (and in a
+    FacetGrid, which keeps no legend data for violins)."""
+    from matplotlib.patches import Patch
+    return {display_name(c): Patch(facecolor=CONFIG_COLORS[c], edgecolor=INK, linewidth=.5,
+                                   label=display_name(c))
+            for c in config_order}
+
+
+def _criterion_swarm(ax, df: pd.DataFrame, occurrence_order, config_order, ymax: float,
+                     width: float = 0.8):
+    """Episodes to criterion as a swarm: one point per seed, the median and
+    interquartile range over them in the config's colour, and seeds that
+    NEVER reached criterion -- reported at the block's last episode, `ymax`
+    -- as open circles, so a pile at the ceiling reads as censoring rather
+    than as late crossings (they still count in the median and IQR, which
+    is what the Wilcoxon test sees). Groups are dodged the way seaborn dodges
+    hue levels in a `width`-wide slot, which is also how statannotations
+    locates them (its default `plot="boxplot"` convention), so the brackets
+    land over the right swarms."""
+    nh = len(config_order)
+    each = width / nh
+    offsets = np.linspace(0, width - each, nh) - (width - each) / 2
+    for oi, occ in enumerate(occurrence_order):
+        for hi, cfg in enumerate(config_order):
+            sel = df[(df["occurrence"] == occ) & (df["config"] == cfg)]
+            v = sel["criterion_episode"].to_numpy(float)
+            if not len(v):
+                continue
+            swarm_ci(ax, [v], colors=[CONFIG_COLORS[cfg]], x=[oi + offsets[hi]],
+                     stat="median", hollow=[sel["censored"].to_numpy(bool)], jitter=each * 0.35,
+                     point_kw=dict(s=3), mean_ms=3, seed=oi * nh + hi)
+    ax.set_xlim(-0.5, len(occurrence_order) - 0.5)
+    ax.set_xticks(range(len(occurrence_order)), [str(o) for o in occurrence_order])
+
+
+def _raise_title_above_annotations(ax, pad: float = 0.02):
+    """With statannotations' `loc="outside"` the significance brackets are
+    drawn above the axes, where the title is; lift the title clear of them.
+    Needs a draw to know how high the brackets reach."""
+    fig = ax.figure
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    frame = ax.get_window_extent(r)
+    top = max((a.get_window_extent(r).y1 for a in ax.lines + ax.texts
+               if a.get_visible() and a is not ax.title), default=frame.y1)
+    if top > frame.y1:
+        # through set_title: a bare title.set_y is overridden by the axes'
+        # automatic title placement at the next draw
+        ax.set_title(ax.get_title(), y=(top - frame.y0) / frame.height + pad)
+
+
 def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, criterion_fraction: float = 0.8):
     """Plot episode-to-criterion estimates with a consistent global threshold.
 
-    Cycle-schedule runs only (cycle_only)."""
+    Cycle-schedule runs only (cycle_only). The y axis is the block length:
+    a run that never reaches criterion is reported at the last episode, so
+    nothing lies above it, and the significance brackets are drawn ABOVE
+    the axes rather than stacked inside them (user, 2026-09-23: the legend
+    and the brackets were stretching the axis to twice the data). The
+    legend sits to the right.
+
+    The swarm shows every seed x context block; the TESTS are at the seed
+    level (user, 2026-09-24): each seed's crossings are averaged over its
+    contexts and the Wilcoxon signed-rank pairs seeds, since one seed's
+    blocks are not independent. Holm over the figure's comparisons."""
     data = cycle_only(data)
     if data.empty:
         print("No cycle-schedule runs; skipping criterion_crossing_*")
@@ -846,21 +953,30 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
         if plot_data.empty:
             continue
 
-        fig, ax = plt.subplots(figsize=(3, 3))
-        sns.violinplot(
-            data=plot_data, x="occurrence", y="criterion_episode", hue="config",
-            palette=CONFIG_COLORS, hue_order=get_config_order(plot_data), ax=ax,
-            inner="box", inner_kws={"box_width": 1, "whis_width": 0.5, "color": "black"}, width=1,
-        )
-
-        pairs = []
-        present = set(zip(facet_data["occurrence"], facet_data["config"]))
+        ymax = float(restricted_data["ep"].max())
         # Both orders must come from facet_data, the frame handed to Annotator --
         # taking them from the full `data` lets an occurrence that got dropped
         # here (NaN criterion, filtered seed) stay in `order`, and
         # statannotations rejects an order value it can't find in the data.
         occurrence_order = sorted(facet_data["occurrence"].dropna().unique())
         config_order = get_config_order(facet_data)
+
+        # one-and-a-half columns: twelve swarms plus the legend to the right
+        fig, ax = plt.subplots(figsize=figsize("onehalf", height=3.2))
+        # a swarm, not violins (user, 2026-09-23): the measure has a floor
+        # (the smoothing window) and a ceiling (never reached), and a density
+        # smears both into tails -- see _criterion_swarm
+        _criterion_swarm(ax, facet_data, occurrence_order, config_order, ymax)
+        ax.set_ylim(0, ymax)
+        handles = _config_legend_handles(config_order)
+        ax.legend(handles.values(), handles.keys(), title="config", loc="upper left",
+                  bbox_to_anchor=(1.02, 1.0), frameon=False)
+
+        # the tests see one value per seed: the mean over its context blocks
+        seed_data = (facet_data.groupby(["config", "seed", "occurrence"], as_index=False)
+                     ["criterion_episode"].mean())
+        pairs = []
+        present = set(zip(seed_data["occurrence"], seed_data["config"]))
 
         for occ in occurrence_order:
             baseline_pair = (occ, "baseline")
@@ -872,15 +988,15 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
                 if (occ, cfg) in present:
                     pairs.append((baseline_pair, (occ, cfg)))
 
-        pairs = testable_pairs(facet_data, pairs)
+        pairs = testable_pairs(seed_data, pairs)
         if pairs:
             annot = Annotator(
-                ax, pairs, data=facet_data, x="occurrence", y="criterion_episode",
+                ax, pairs, data=seed_data, x="occurrence", y="criterion_episode",
                 hue="config", order=occurrence_order, hue_order=config_order,
             )
             annot.configure(
                 test="Wilcoxon", text_format="star", comparisons_correction="holm",
-                correction_format='replace', verbose=False,
+                correction_format='replace', verbose=False, loc="outside",
             )
             annot.apply_and_annotate()
         else:
@@ -890,14 +1006,15 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
         ax.set_xlabel("Previous Experiences")
         ax.set_ylabel("Episodes to Criterion")
         ax.set_title(f"Criterion Crossing Episode: {metric.replace('_', ' ').title()}")
-        ax.set_ylim(bottom=0)
-        ax.tick_params(axis="x", rotation=15)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=15, ha="right")
         ax.grid(True, alpha=0.3, axis="y")
+        _raise_title_above_annotations(ax)
 
         output_path = os.path.join(output_dir, f"criterion_crossing_{metric}")
         plt.tight_layout()
         offset_spines(fig)
+        # each occurrence's four swarms under one bracket, stopping short of
+        # the 0.8-wide slot's edge so neighbours stay apart (user, 2026-09-23)
+        bracket_xticks(ax, half_width=0.42)
         save(plt.gcf(), output_path, close=False)
         plt.close()
         print(f"Saved {output_path}")
@@ -906,7 +1023,9 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
 def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: list, output_dir: str, criterion_fraction: float = 0.8):
     """Plot episode-to-criterion estimates separated by phase occurrence.
 
-    Cycle-schedule runs only (cycle_only)."""
+    Cycle-schedule runs only (cycle_only). Within one context and one visit a
+    seed has exactly one block, so here the block-level Wilcoxon IS the
+    seed-level one and nothing needs aggregating."""
     data = cycle_only(data)
     if data.empty:
         print("No cycle-schedule runs; skipping criterion_crossing_by_phase_occurrence_*")
@@ -922,7 +1041,9 @@ def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: lis
         if plot_data.empty:
             continue
 
-        g = sns.FacetGrid(plot_data, col="label", col_wrap=4, height=3, aspect=1.0)
+        # four panels across a double column (the legend adds a little)
+        g = sns.FacetGrid(plot_data, col="label", col_wrap=4,
+                          height=figsize("double")[0] / 4, aspect=1.0)
 
         def plot_func(data, **kwargs):
             ax = plt.gca()
@@ -936,11 +1057,8 @@ def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: lis
             occurrence_order = sorted(facet_data["occurrence"].dropna().unique())
             config_order = get_config_order(facet_data)
 
-            sns.violinplot(
-                data=facet_data, x="occurrence", y="criterion_episode", hue="config",
-                palette=CONFIG_COLORS, hue_order=config_order, order=occurrence_order,
-                inner="box", inner_kws={"box_width": 1, "whis_width": 0.5, "color": "black"}, **kwargs,
-            )
+            _criterion_swarm(ax, facet_data, occurrence_order, config_order, ymax)
+            ax.set_ylim(0, ymax)                  # before the brackets: see plot_criterion_crossing
 
             pairs = []
             present = set(zip(facet_data["occurrence"], facet_data["config"]))
@@ -962,18 +1080,30 @@ def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: lis
                 )
                 annot.configure(
                     test="Wilcoxon", text_format="star", comparisons_correction="holm",
-                    correction_format='replace', verbose=False,
+                    correction_format='replace', verbose=False, loc="outside",
                 )
                 annot.apply_and_annotate()
 
+        ymax = float(restricted_data["ep"].max())
         g.map_dataframe(plot_func)
         g.figure.set_layout_engine("constrained")
         g.set_axis_labels("Previous Experiences", "Episodes to Criterion")
-        g.set(ylim=(0, restricted_data['ep'].max()))
-        g.figure.suptitle(f"Criterion Crossing by Phase Occurrence: {metric.replace('_', ' ').title()}", fontsize=14)
+        g.set(ylim=(0, ymax))
+        # one legend for the grid, outside on the right: a figure legend with
+        # an "outside" loc, which is what constrained layout reserves room
+        # for (FacetGrid.add_legend adjusts subplots by hand and is ignored
+        # under a layout engine). Handles built by hand: seaborn keeps no
+        # legend data for violins.
+        handles = _config_legend_handles(get_config_order(plot_data))
+        g.figure.legend(handles.values(), handles.keys(), title="config",
+                        loc="outside right upper", frameon=False)
+        for a in g.axes.flat:
+            _raise_title_above_annotations(a)
+        g.figure.suptitle(f"Criterion Crossing by Phase Occurrence: {metric.replace('_', ' ').title()}")
 
         output_path = os.path.join(output_dir, f"criterion_crossing_by_phase_occurrence_{metric}")
         offset_spines(g.figure)
+        bracket_xticks(g.figure, half_width=0.42)   # the 0.8-wide slot, less a hair
         save(plt.gcf(), output_path, close=False)
         plt.close()
         print(f"Saved {output_path}")
@@ -1273,6 +1403,273 @@ def plot_metric_traces_by_phase_visit(data: pd.DataFrame, metrics: list, output_
         output_path = os.path.join(output_dir, f"traces_by_phase_visit_{metric}")
         save(plt.gcf(), output_path, close=False)
         plt.close(fig)
+        print(f"Saved {output_path}")
+
+
+def _pooled_visit_band(block: pd.DataFrame, metric: str,
+                       smooth_window: int = TRACE_SMOOTH_WINDOW, n_boot: int = 1000,
+                       ci: float = 0.95, seed: int = 0) -> pd.DataFrame:
+    """median_seed_band's pooled cousin, with the SEED as the unit.
+
+    Each (seed, block visit) curve is smoothed and aligned on position within
+    the block; a seed's curves over its six contexts are then averaged into
+    ONE curve, and the line is the median of those across seeds with a
+    percentile-bootstrap confidence interval (`ci`, `n_boot` resamples of
+    seeds) as the band. Not the s.d. over all seed x context blocks: that
+    band was mostly context heterogeneity (some contexts are never learned on
+    a first visit) and the six blocks of one seed are not independent, so
+    neither the s.d. nor a naive s.e.m. over blocks answered "do the configs'
+    curves differ". The per-block spread lives in the swarm beneath.
+    Columns: median, lo, hi, n (seeds)."""
+    per_seed = {}
+    for sd_, run_seed in block.groupby("seed"):
+        curves = {}
+        for visit, run in run_seed.groupby("phase_occurrence"):
+            run = run.sort_values("ep")
+            offset, y = smooth_trace(run[metric].to_numpy(dtype=float), smooth_window)
+            curves[visit] = pd.Series(y, index=np.arange(len(run))[offset:])
+        if curves:
+            per_seed[sd_] = pd.DataFrame(curves).mean(axis=1)
+    if not per_seed:
+        return pd.DataFrame(columns=["median", "lo", "hi", "n"], dtype=float)
+    M = pd.DataFrame(per_seed).sort_index()              # episodes x seeds
+    vals = M.to_numpy(dtype=float).T                     # seeds x episodes
+    n = vals.shape[0]
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    with np.errstate(all="ignore"):
+        boots = np.nanmedian(vals[idx], axis=1)          # n_boot x episodes
+        lo, hi = np.nanpercentile(boots, [50 * (1 - ci), 50 * (1 + ci)], axis=0)
+    return pd.DataFrame({"median": np.nanmedian(vals, axis=0), "lo": lo, "hi": hi, "n": n},
+                        index=M.index)
+
+
+def _curve_crossing(band: pd.DataFrame, target: float) -> float:
+    """Episode at which a plotted median curve first reaches `target`,
+    linearly interpolated between the bracketing samples; NaN if it never
+    does (then no marker is drawn: a curve that stays below the line has no
+    crossing to mark)."""
+    if band.empty or not np.isfinite(target):
+        return np.nan
+    x = band.index.to_numpy(float)
+    y = band["median"].to_numpy(float)
+    hit = np.flatnonzero(y >= target)
+    if not len(hit):
+        return np.nan
+    i = int(hit[0])
+    if i == 0 or not np.isfinite(y[i - 1]) or np.isclose(y[i], y[i - 1]):
+        return float(x[i])
+    frac = (target - y[i - 1]) / (y[i] - y[i - 1])
+    return float(x[i - 1] + frac * (x[i] - x[i - 1]))
+
+
+# stars as statannotations prints them, so the two criterion figures agree
+_STAR_LEVELS = [(1e-4, "****"), (1e-3, "***"), (1e-2, "**"), (0.05, "*"), (1.0, "ns")]
+
+
+def _stars(p: float) -> str:
+    if not np.isfinite(p):
+        return "n/a"
+    return next(s for thr, s in _STAR_LEVELS if p <= thr)
+
+
+def _holm(pvals) -> np.ndarray:
+    """Holm step-down adjusted p-values (NaNs pass through)."""
+    p = np.asarray(pvals, float)
+    out = np.full_like(p, np.nan)
+    ok = np.isfinite(p)
+    m = int(ok.sum())
+    if m == 0:
+        return out
+    order = np.argsort(p[ok])
+    adj = np.minimum(1.0, (m - np.arange(m)) * p[ok][order])
+    adj = np.maximum.accumulate(adj)
+    out[np.flatnonzero(ok)[order]] = adj
+    return out
+
+
+def _gap_brackets(ax, crossings: pd.DataFrame, configs: list, x_max: float,
+                  base: str = "baseline"):
+    """Pairwise tests against `base` drawn as VERTICAL brackets in the strip
+    left of the first possible crossing (0 .. the smoothing window), which
+    the swarm cannot occupy. Wilcoxon signed-rank AT THE SEED LEVEL: each
+    seed's crossing episodes over its context blocks are averaged first and
+    the seeds are the pairs (user, 2026-09-24 -- the six blocks of one seed
+    are not independent, so pairing blocks overstated the evidence; this is
+    the unit the traces' CI uses too). Holm-corrected over the panel's
+    comparisons; stars as in the standalone criterion figures. Brackets nest
+    right-to-left by span so they never cross. `crossings` is this panel's
+    slice of the crossing table; rows of `configs` are the swarm's y
+    positions."""
+    from scipy.stats import wilcoxon
+    if base not in configs:
+        return
+    seed_level = crossings.groupby(["config", "seed"])["criterion_episode"].mean()
+    keyed = {c: (seed_level.xs(c, level="config") if c in seed_level.index.get_level_values(0)
+                 else pd.Series(dtype=float))
+             for c in configs}
+    others = [c for c in configs if c != base]
+    pvals = []
+    for c in others:
+        both = pd.concat([keyed[base].rename("a"), keyed[c].rename("b")], axis=1).dropna()
+        try:
+            pvals.append(float(wilcoxon(both["a"], both["b"]).pvalue) if len(both) >= 2 else np.nan)
+        except ValueError:                       # every pair identical
+            pvals.append(np.nan)
+    adj = _holm(pvals)
+    fs = plt.rcParams["xtick.labelsize"]
+    # the strip, inset from both edges; the shortest span sits nearest the swarm
+    xs = np.linspace(0.82, 0.28, len(others)) * x_max
+    y0 = configs.index(base)
+    for x, c, p in zip(xs, others, adj):
+        y1 = configs.index(c)
+        ax.plot([x, x], [y0, y1], color=INK, lw=0.6, solid_capstyle="butt", clip_on=False)
+        ax.plot([x, x], [y0, y1], ls="none", marker=3, ms=2, mew=0.6, color=INK,  # TICKRIGHT
+                clip_on=False)
+        ax.text(x - 0.03 * x_max, (y0 + y1) / 2, _stars(p), rotation=90, ha="right",
+                va="center", fontsize=fs, color=INK)
+
+
+def plot_criterion_summary(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                           criterion_fraction: float = 0.8,
+                           smooth_window: int = TRACE_SMOOTH_WINDOW, width: str = "double"):
+    """THE CRITERION FIGURE FOR THE PAPER: traces and crossings on one x axis.
+
+    One trace/swarm PAIR per previous-experience count (first visit, second,
+    third). `width="double"` (the user's pick, 2026-09-24, over the stacked
+    version) lays the pairs out as three columns, traces above swarms;
+    `width="single"` stacks the pairs down one column instead. Within a pair --
+    Top: the within-block trace of the metric, re-zeroed at the block onset
+    and pooled over the six contexts (median +- s.d. across seed x context
+    blocks, each smoothed first), every config overlaid, the criterion as a
+    dotted line and each config's median crossing marked on it. Bottom,
+    sharing the x axis: the per-block episodes to criterion as a horizontal
+    swarm, one row per config, median and IQR over the points, seeds that
+    never reached criterion hollow at the block's end. So the swarm's points
+    sit directly under the place where the trace above clears the line, and
+    the two readings of "how fast" can be checked against each other.
+
+    The pairwise tests against baseline sit in the strip left of the first
+    possible crossing (the smoothing window), as vertical brackets
+    (_gap_brackets). Cycle-schedule runs only."""
+    metrics = METRICS if metrics is None else metrics
+    data = cycle_only(data)
+    if data.empty:
+        print("No cycle-schedule runs; skipping criterion_summary_*")
+        return
+    configs = get_config_order(data)
+    shared_seeds = get_shared_seeds(data, configs)
+    data = data[data["seed"].isin(shared_seeds) & data["config"].isin(configs)].copy()
+    targets = global_criterion_targets(data, metrics, criterion_fraction)
+    crossings = build_criterion_crossing_phase_table(data, metrics, criterion_fraction=criterion_fraction)
+    n_ep = int(data.groupby(["config", "seed", "phase_occurrence"]).size().max())
+    occ_order = sorted(pd.to_numeric(data["occurrence"], errors="coerce").dropna().unique().astype(int))
+    handles = _config_legend_handles(configs)
+
+    for metric in metrics:
+        target = targets.get(metric, np.nan)
+        if metric not in data.columns or not np.isfinite(target):
+            continue
+        stacked = width == "single"
+        n_occ = len(occ_order)
+        if stacked:
+            fig = plt.figure(figsize=figsize("single", height=2.3 * n_occ + 0.4),
+                             layout="constrained")
+            # a pair is one outer cell split in two with almost no inner gap,
+            # so the trace and its swarm read as a unit and pairs stay well
+            # apart (the outer gap also holds the next pair's title)
+            outer = fig.add_gridspec(n_occ, 1, hspace=0.45)
+            cells = [outer[k].subgridspec(2, 1, height_ratios=[1.0, 0.7], hspace=0.02)
+                     for k in range(n_occ)]
+            cell_at = lambda k: cells[k][0, 0]
+            cell_ab = lambda k: cells[k][1, 0]
+        else:
+            fig = plt.figure(figsize=figsize("double", height=4.2), layout="constrained")
+            gs = fig.add_gridspec(2, n_occ, height_ratios=[1.0, 0.75])
+            cell_at = lambda k: gs[0, k]
+            cell_ab = lambda k: gs[1, k]
+        top, bottom = [], []
+        for k, occ in enumerate(occ_order):
+            at = fig.add_subplot(cell_at(k), sharex=top[0] if top else None,
+                                 sharey=top[0] if top else None)
+            ab = fig.add_subplot(cell_ab(k), sharex=at, sharey=bottom[0] if bottom else None)
+            blk = data[data["occurrence"] == occ]
+            groups, hollow = [], []
+            n_seeds = 0
+            for cfg in configs:
+                band = _pooled_visit_band(blk[blk["config"] == cfg], metric, smooth_window)
+                if not band.empty:
+                    n_seeds = max(n_seeds, int(band["n"].iloc[0]))
+                    plot_band(at, band.index, band["median"], lo=band["lo"], hi=band["hi"],
+                              color=CONFIG_COLORS[cfg], lw=1.0)
+                cr = crossings[(crossings["config"] == cfg) & (crossings["metric"] == metric)
+                               & (crossings["occurrence"] == occ)]
+                groups.append(cr["criterion_episode"].to_numpy(float))
+                hollow.append(cr["censored"].to_numpy(bool))
+                # the marker sits where the PLOTTED curve crosses the line, so
+                # it lines up with the trace by construction; the median of
+                # the individual blocks' crossings is the swarm's dot below,
+                # and the two differ (censored blocks pull that median to the
+                # block's end while the median curve may never cross at all)
+                x_cross = _curve_crossing(band, target)
+                if np.isfinite(x_cross):
+                    at.plot(x_cross, target, **CROSSING_MARKER, color=CONFIG_COLORS[cfg],
+                            transform=crossing_transform(at, fig))
+            chance_line(at, target, f"criterion {target:.2f}" if k == len(occ_order) - 1 else None,
+                        color=INK, lw=0.7)
+            at.set_title(f"previous experiences: {occ}")
+            at.tick_params(labelbottom=False)
+            names = [display_name(c, wrap=True) for c in configs]
+            swarm_ci(ab, groups, colors=[CONFIG_COLORS[c] for c in configs],
+                     labels=names, x=np.arange(len(configs)), stat="median", hollow=hollow,
+                     orient="h", jitter=0.28, point_kw=dict(s=3), mean_ms=3, seed=k)
+            ab.set_yticks(np.arange(len(configs)), names)
+            ab.set_ylim(len(configs) - 0.4, -0.6)          # first config on top
+            ab.set_xlim(0, n_ep)
+            # the tests, in the strip no crossing can occupy (user, 2026-09-24)
+            _gap_brackets(ab, crossings[(crossings["metric"] == metric)
+                                        & (crossings["occurrence"] == occ)],
+                          configs, x_max=smooth_window - 1)
+            if stacked:
+                # one x axis for the column, on the last swarm; every trace
+                # keeps its own y label (short) since the pairs are far apart
+                at.set_ylabel(metric)
+                if k < n_occ - 1:
+                    ab.tick_params(labelbottom=False)
+                else:
+                    ab.set_xlabel("episodes since switch")
+            else:
+                ab.set_xlabel("episodes since switch")
+                if k:
+                    at.tick_params(labelleft=False)
+                    ab.tick_params(labelleft=False)
+            top.append(at); bottom.append(ab)
+        if metric == "success":
+            top[0].set_ylim(0, 1.02)
+        if not stacked:
+            top[0].set_ylabel(f"{metric} ({smooth_window}-episode mean)")
+        fig.legend(handles.values(), handles.keys(), ncol=2 if stacked else len(configs),
+                   loc="outside upper center")
+        caption = (
+            f"{metric.title()} against episodes since the context switch, by how many times "
+            f"the agent has met the context before (columns). Top: the smoothed trace, each "
+            f"seed's curve the mean over its six contexts; line is the median across "
+            f"{n_seeds} seeds, band the 95% bootstrap CI of that median. Dotted line is the "
+            f"criterion, {criterion_fraction:g} x the best value seen, and each marker "
+            f"where that config's median curve first reaches it (none if it never "
+            f"does). Bottom, same x axis: episodes to criterion per "
+            f"seed x context block, median and IQR over the points; open circles are blocks "
+            f"that never reached criterion, placed at the block's last episode. No crossing "
+            f"is reported before episode {smooth_window}, the smoothing window; the brackets "
+            f"in that strip are Wilcoxon signed-rank tests against {display_name('baseline')}, "
+            f"one value per seed (its mean over the six contexts), {n_seeds} pairs, "
+            f"Holm-corrected within the panel.")
+        offset_spines(fig)
+        # letters follow reading order: down the column when stacked
+        label_panels(fig, [a for pair in zip(top, bottom) for a in pair] if stacked
+                     else top + bottom)
+        output_path = os.path.join(output_dir, f"criterion_summary_{metric}")
+        save(fig, output_path, caption=caption)
         print(f"Saved {output_path}")
 
 
@@ -2069,15 +2466,19 @@ def _shade_blocks(ax, one, fontsize=None, label_short_blocks=True):
                 color=MUTED, transform=ax.get_xaxis_transform())
 
 
-def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_recovery"):
+def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_recovery",
+                      reference_labels=True, legend=True):
     """Panel A of every paradigm figure: adaptation index across the whole
     schedule, one trace per run (smoothed per seed, mean ± sem over seeds),
-    blocks shaded and labelled, references at +1 / 0 / -1, legend below with
-    one column per model. Returns ({cfg: frame with ep_in_run / index}, the
-    set of readout columns used)."""
+    blocks shaded and labelled, references at +1 / 0 / -1 (named at the right
+    edge unless `reference_labels` is False, which frees that width for a
+    neighbouring panel), legend inside with one column per model. Returns
+    ({cfg: frame with ep_in_run / index}, the set of readout columns used)."""
     for y in sorted(set(_reference_labels(schedule)) | {0.0}):
         axA.axhline(y, **_REF_KW)
     frames, readouts = {}, set()
+    refs = sorted(set(_reference_labels(schedule)) | {0.0})
+    ylo, yhi = min(refs), max(refs)          # the y range grows to hold the bands
     for cfg in runs:
         d = data[data.config == cfg].copy()
         d["ep_in_run"] = d.groupby("seed").cumcount()
@@ -2104,6 +2505,7 @@ def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_reco
         m, se = g.mean(), g.std() / np.sqrt(g.count().clip(lower=1))
         axA.plot(m.index, m.values, ls, color=col, lw=1.6, label=_model_label(cfg))
         axA.fill_between(m.index, (m - se).values, (m + se).values, color=col, alpha=0.12, lw=0)
+        ylo, yhi = min(ylo, float((m - se).min())), max(yhi, float((m + se).max()))
         frames[cfg] = d
     # blocks, from one run's label sequence
     one = data[data.config == runs[0]]; one = one[one.seed == one.seed.iloc[0]].reset_index(drop=True)
@@ -2118,10 +2520,18 @@ def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_reco
             continue
         if i % 2:
             axA.axvspan(lo - 0.5, hi - 0.5, color=SHADE, lw=0, zorder=0)
-        axA.text((lo + hi) / 2, 0.98, one.label.iloc[lo], ha="center", va="top",
+        # rows alternate block by block, and a narrow block (the pre-evoke
+        # channel) drops to a third row, so neighbouring labels never collide
+        narrow = (hi - lo) < max(len(one) * 0.08, 1)
+        y = 0.82 if narrow else (0.98 if i % 2 == 0 else 0.90)
+        axA.text((lo + hi) / 2, y, one.label.iloc[lo], ha="center", va="top",
                  color=MUTED, transform=axA.get_xaxis_transform())
-    axA.set_ylim(-1.5, 1.5); axA.set_xlim(-1, len(one))
-    for y, lab in _reference_labels(schedule).items():
+    # just enough y to hold the references and the bands (was a fixed +-1.5,
+    # which shaded and ticked half a unit of nothing above and below), plus
+    # headroom at the top where the block labels sit
+    span = yhi - ylo
+    axA.set_ylim(ylo - 0.06 * span, yhi + 0.28 * span); axA.set_xlim(-1, len(one))
+    for y, lab in (_reference_labels(schedule).items() if reference_labels else ()):
         axA.annotate(lab, (1.0, y), xycoords=axA.get_yaxis_transform(), xytext=(2, 0),
                      textcoords="offset points", va="center", color=MUTED,
                      fontsize=plt.rcParams["xtick.labelsize"])
@@ -2134,7 +2544,8 @@ def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_reco
     # legend: ONE COLUMN PER MODEL, replay above no-replay. matplotlib fills a
     # legend column-major, so order the entries model by model and pad a model
     # that has only one variant with an invisible entry. It sits inside the
-    # panel, lower right: the index never goes below 0 there.
+    # panel, lower LEFT: the index never goes below 0 under the first blocks,
+    # whereas the lower right holds the evoked schedule's rotated evoke label.
     handles, labels = axA.get_legend_handles_labels()
     by_model = {}
     for h, lab in zip(handles, labels):
@@ -2146,8 +2557,12 @@ def _timecourse_panel(axA, data, runs, smooth_window, schedule="spontaneous_reco
         for variant in ("replay", "no replay"):
             h, lab = variants.get(variant, (blank, " "))
             ordered_h.append(h); ordered_l.append(lab)
-    axA.legend(ordered_h, ordered_l, loc="lower right", ncol=max(len(by_model), 1),
-               columnspacing=1.5)
+    if legend:
+        axA.legend(ordered_h, ordered_l, loc="lower left", ncol=max(len(by_model), 1),
+                   columnspacing=1.0)
+    else:
+        # the caller draws one legend for several panels: hand it the entries
+        axA._paradigm_legend = (ordered_h, ordered_l, max(len(by_model), 1))
     offset_spines(axA)
     return frames, readouts
 
@@ -3291,6 +3706,7 @@ def plot_rb_variants(data: pd.DataFrame, output_dir: str, run_dir: str = None):
         plot_schedule_timecourse(rb, rb_dir, schedule=schedule)
     plot_recovery_comparison(rb, rb_dir)
     plot_savings_washout(rb, rb_dir)
+    plot_paradigm_overview(rb, rb_dir)
 
 
 def plot_channel_schedule_comparison(data: pd.DataFrame, output_dir: str,
@@ -3915,7 +4331,111 @@ def plot_retention_vs_savings(data: pd.DataFrame, metrics: list, output_dir: str
 # The figures --only can select, by the file each one writes. Every entry
 # takes (data, output_dir) so the flag can drive them uniformly; anything
 # needing more than that is not offered here and runs in the full pass.
+def _paradigm_summary(schedule, frames, open_reaches, close_reaches, evoke_window,
+                      jump_reaches):
+    """cfg -> per-seed array of the ONE number each paradigm is about:
+      savings_washout       the second-exposure jump minus the first
+                            (plot_savings_washout panel D)
+      spontaneous_recovery  recovery index: mean index over the last
+                            `close_reaches` channel reaches minus the first
+                            `open_reaches` (plot_schedule_timecourse panel C)
+      evoked_recovery       {"jump", "decay"} per seed (evoked_recovery_stats),
+                            drawn as a paired swarm
+    """
+    values = {}
+    for cfg, d in frames.items():
+        if schedule == "savings_washout":
+            jump2, jump1 = _reexposure_jump(d, jump_reaches)
+            if jump2 is not None:
+                delta = (jump2 - jump1).dropna()
+                if len(delta):
+                    values[cfg] = delta.to_numpy()
+        elif schedule == "spontaneous_recovery":
+            ch = d[d.channel == 1].copy()
+            if not len(ch):
+                continue
+            ch["k"] = ch.groupby("seed").cumcount() + 1
+            opening = ch[ch.k <= open_reaches].groupby("seed")["index"].mean()
+            closing = ch[ch.k > ch.k.max() - close_reaches].groupby("seed")["index"].mean()
+            v = (closing - opening).dropna()
+            if len(v):
+                values[cfg] = v.to_numpy()
+        else:
+            # both numbers, for a paired swarm: the jump AND the decay after it
+            st = evoked_recovery_stats(d, evoke_window, close_reaches)
+            if st is not None and (len(st["jump"]) or len(st["decay"])):
+                values[cfg] = st
+    return values
+
+
+def plot_paradigm_overview(data: pd.DataFrame, output_dir: str, smooth_window: int = 15,
+                           open_reaches: int = 25, close_reaches: int = 50,
+                           evoke_window: int = 10, jump_reaches: int = 5):
+    """The three COIN paradigms in one figure -- file paradigm_overview.
+
+    One row per schedule (savings, spontaneous recovery, evoked recovery; a
+    schedule with no runs is skipped). Left: the adaptation index across the
+    whole schedule, exactly panel A of that paradigm's own figure. Right: the
+    paradigm's summary number per seed as a swarm with mean and 95% CI
+    (_paradigm_summary). The legend is drawn once, on the top row.
+    """
+    if "channel" not in data.columns or "label" not in data.columns:
+        return
+    rows = [("savings_washout", "savings", "savings: second jump − first", r"$\Delta$ exposure"),
+            ("spontaneous_recovery", "spontaneous recovery", "recovery index", "recovery index"),
+            ("evoked_recovery", "evoked recovery", "evoked: jump (filled), decay (hollow)",
+             r"$\Delta$ adaptation index")]
+    rows = [r for r in rows if _paradigm_runs(data, r[0])]
+    if not rows:
+        return
+    fig = plt.figure(figsize=figsize("double", height=2.2 * len(rows)), layout="constrained")
+    gs = fig.add_gridspec(len(rows), 2, width_ratios=[2.4, 1.3])
+    axes = []
+    for i, (schedule, name, title, ylabel) in enumerate(rows):
+        runs = _paradigm_runs(data, schedule)
+        axL, axR = fig.add_subplot(gs[i, 0]), fig.add_subplot(gs[i, 1])
+        # no "full P+ / straight aim" labels at the right edge: the +1 / 0 / -1
+        # references are the same in every row and the caption names them, and
+        # the width goes to the swarm panel instead
+        frames, _ = _timecourse_panel(axL, data, runs, smooth_window, schedule,
+                                      reference_labels=False, legend=False)
+        axL.set_title(name)
+        if i == 0:                      # one legend for the figure, below it
+            h, l, ncol = axL._paradigm_legend
+            fig.legend(h, l, loc="outside lower center", ncol=ncol)
+        values = _paradigm_summary(schedule, frames, open_reaches, close_reaches,
+                                   evoke_window, jump_reaches)
+        if schedule == "evoked_recovery":
+            _paired_bars(axR, runs, values, ("jump", "decay"), ylabel, title,
+                         refs=(0.0,), ylim=None)
+        else:
+            _grouped_bars(axR, runs, values, ylabel, title)
+        axes += [axL, axR]
+    label_panels(fig, axes)
+    caption = (
+        f"The three COIN paradigms. Left column: adaptation index across each "
+        f"schedule (dotted references: +1 = full P+ compensation, 0 = full base or "
+        f"P0, -1 = full P-; in the savings schedule the middle line is aiming "
+        f"straight), one trace per run, smoothed per "
+        f"seed over {smooth_window} reaches within a block, mean ± SEM over seeds; "
+        f"solid = replay, dashed = no replay; shaded blocks alternate. Right "
+        f"column: one dot per seed with the mean and 95% CI. Savings: jump at the "
+        f"second P+ exposure minus the jump at the first ({jump_reaches}-reach "
+        f"windows). Spontaneous recovery: mean channel index over the last "
+        f"{close_reaches} reaches minus the first {open_reaches}. Evoked recovery, "
+        f"paired per run: the jump (filled), mean index over the first "
+        f"{evoke_window} post-evoke reaches minus the pre-evoke channel level, and "
+        f"the decay (hollow), mean over the last {close_reaches} post-evoke reaches "
+        f"minus that early window. In the savings and spontaneous panels filled "
+        f"markers are replay runs and hollow ones no-replay; in the evoked panel a "
+        f"no-replay run has a dashed interval.")
+    path = os.path.join(output_dir, "paradigm_overview")
+    save(fig, path, caption=caption)
+    print(f"Saved {path}")
+
+
 SELECTABLE = {
+    "paradigm_overview": plot_paradigm_overview,
     "channel_comparison": plot_channel_schedule_comparison,
     "rb_variants": plot_rb_variants,
     "channel_decomposition": plot_channel_decompositions,
@@ -3924,6 +4444,11 @@ SELECTABLE = {
     "context_belief": plot_context_belief,
     "recovery_comparison": plot_recovery_comparison,
     "savings_washout": plot_savings_washout,
+    # the cycle's criterion figures, so they can be redrawn without the fits
+    "criterion_crossing": lambda d, o: plot_criterion_crossing(d, METRICS, o),
+    "criterion_crossing_by_phase_occurrence":
+        lambda d, o: plot_criterion_crossing_by_phase_occurrence(d, METRICS, o),
+    "criterion_summary": plot_criterion_summary,
 }
 
 
@@ -3974,6 +4499,7 @@ def main(only=None, cfg=None):
     plot_metric_traces_by_phase_visit(data, METRICS, PLOT_OUTPUT_DIR)
     plot_criterion_crossing(data, METRICS, PLOT_OUTPUT_DIR)
     plot_criterion_crossing_by_phase_occurrence(data, METRICS, PLOT_OUTPUT_DIR)
+    plot_criterion_summary(data, PLOT_OUTPUT_DIR)
     report_criterion_trace_consistency(data, METRICS, PLOT_OUTPUT_DIR)
     plot_retention_vs_savings(data, METRICS, PLOT_OUTPUT_DIR)
     # the COIN-paradigm figures, one per schedule; each is a no-op without runs
@@ -3982,6 +4508,7 @@ def main(only=None, cfg=None):
     plot_recovery_comparison(data, PLOT_OUTPUT_DIR)
     plot_context_belief(data, PLOT_OUTPUT_DIR)
     plot_savings_washout(data, PLOT_OUTPUT_DIR)
+    plot_paradigm_overview(data, PLOT_OUTPUT_DIR)
     # the bank-deal pair: why the channel mean is a mixture average, and the
     # estimator that integrates the deal out. No-ops without a `carry` run.
     plot_channel_decompositions(data, PLOT_OUTPUT_DIR)

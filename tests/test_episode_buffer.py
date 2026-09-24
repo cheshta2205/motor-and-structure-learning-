@@ -7,7 +7,9 @@ old-context data. In episode units the span, the recency constant and each
 episode's total sampling mass are independent of episode length. What has to
 hold:
 
-  transition units are BIT-IDENTICAL to before (every existing run)
+  transition units are BIT-IDENTICAL to before (the runs made under them)
+  episode units are the DEFAULT for every schedule (since 2026-09-23; the
+    paradigms' since 2026-09-18), --transition-buffer opts out with _transbuf
   in episode units an episode's mass depends on its age and nothing else
   capacity evicts whole episodes, never a partial one
   the CLI variants rename the run so no two versions share a directory
@@ -64,9 +66,13 @@ def test_transition_units_ignore_ep_now_and_evict_by_transition():
                        buf._sampling_probs(t_now=8))
 
 
-def test_default_units_are_transitions():
+def test_default_units():
+    """The class keeps the ported recency rule's default; the CONFIG -- what
+    the run loop reads -- defaults to episodes for every schedule since
+    2026-09-23 (the paradigms' default since 2026-09-18)."""
     assert ReplayBuffer().units == "transitions"
-    assert sac.AblationConfig(name="x").replay_units == "transitions"
+    assert sac.DEFAULT_REPLAY_UNITS == "episodes"
+    assert sac.AblationConfig(name="x").replay_units == "episodes"
 
 
 # ── episode units ────────────────────────────────────────────────────────
@@ -203,8 +209,8 @@ def test_rehearsal_budget_beats_recency_dilution_on_the_real_block_lengths():
         p = buf._sampling_probs(t_now=10_000, ep_now=300 + n_new)
         return p[np.asarray(buf.episodes) >= 300].sum()
     assert share(10, 0.0) < 0.3                      # recency alone: diluted
-    assert share(10, sac.PARADIGM_REHEARSAL) == pytest.approx(1 - sac.PARADIGM_REHEARSAL)
-    assert share(50, sac.PARADIGM_REHEARSAL) == pytest.approx(1 - sac.PARADIGM_REHEARSAL)
+    assert share(10, sac.REHEARSAL_FRACTION) == pytest.approx(1 - sac.REHEARSAL_FRACTION)
+    assert share(50, sac.REHEARSAL_FRACTION) == pytest.approx(1 - sac.REHEARSAL_FRACTION)
 
 
 def test_clear_forgets_the_block_boundary():
@@ -214,36 +220,54 @@ def test_clear_forgets_the_block_boundary():
     assert buf.block_start_ep is None
 
 
-def test_paradigms_set_the_budget_and_cycle_does_not():
+def test_every_schedule_gets_the_budget_the_effort_cost_and_the_episode_buffer():
+    """Since 2026-09-23 the cycle inherits the paradigms' four replay/effort
+    settings (user's call), so they are config DEFAULTS rather than something
+    the schedule switches on: a hand-built config and every schedule agree,
+    and no run name carries a suffix for them."""
     base = dict(SW.CONFIG_BY_NAME["main"])
-    assert sac.AblationConfig(**sac.apply_cli_variants(base)).rehearsal_fraction == 0.0
-    for sch in ("spontaneous_recovery", "evoked_recovery", "savings_washout"):
+    for sch in (None, "spontaneous_recovery", "evoked_recovery", "savings_washout", "zero_shot"):
         c = sac.AblationConfig(**sac.apply_cli_variants(base, schedule=sch))
-        assert c.rehearsal_fraction == sac.PARADIGM_REHEARSAL, sch
-    assert sac.AblationConfig(name="x").rehearsal_fraction == 0.0
+        assert c.rehearsal_fraction == sac.REHEARSAL_FRACTION == 0.15, sch
+        assert c.effort_weight == sac.EFFORT_WEIGHT == 0.1, sch
+        assert c.replay_units == "episodes", sch
+    plain = sac.AblationConfig(name="x")
+    assert (plain.rehearsal_fraction, plain.effort_weight, plain.replay_units) \
+        == (sac.REHEARSAL_FRACTION, sac.EFFORT_WEIGHT, "episodes")
+    assert sac.AblationConfig(**sac.apply_cli_variants(base)).name == "main"
 
 
 # ── CLI variants and the two versions ────────────────────────────────────
 
-def test_episode_buffer_flag_sets_units_and_suffixes_the_name():
+def test_episode_buffer_flag_is_a_no_op_on_the_default():
+    """Episodes are the default, so --episode-buffer changes nothing and adds
+    no suffix; it still fires, with _epbuf, on a config that set transitions
+    by hand (a legacy run being reproduced)."""
     cfg = sac.config_from_cli(sac._parse_args(["--config", "main", "--episode-buffer"]))
     assert cfg.replay_units == "episodes"
-    assert cfg.name == "main_carry_epbuf"          # main runs default to the carry prior
+    assert cfg.name == "main_carry"                # main runs default to the carry prior
+    legacy = sac.apply_cli_variants(dict(SW.CONFIG_BY_NAME["main"], replay_units="transitions"),
+                                    episode_buffer=True)
+    assert legacy["replay_units"] == "episodes" and legacy["name"] == "main_epbuf"
 
 
-def test_both_flags_name_the_savings_twin_of_the_epbuf_run():
+def test_transition_buffer_flag_opts_the_cycle_out_and_suffixes_the_name():
     cfg = sac.config_from_cli(sac._parse_args(
-        ["--config", "main", "--episode-buffer", "--clear-buffer"]))
-    assert cfg.name == "main_carry_epbuf_clearbuf"
-    assert cfg.replay_units == "episodes" and cfg.clear_buffer_on_switch is True
+        ["--config", "main", "--transition-buffer", "--clear-buffer"]))
+    # after the circuit and prior tags, before the clearbuf one -- the same
+    # slot the paradigm runs put it in (main_rot_sr_prior_transbuf_clearbuf)
+    assert cfg.name == "main_carry_transbuf_clearbuf"
+    assert cfg.replay_units == "transitions" and cfg.clear_buffer_on_switch is True
+    # the other three defaults are untouched by the opt-out
+    assert cfg.rehearsal_fraction == sac.REHEARSAL_FRACTION and cfg.effort_weight == sac.EFFORT_WEIGHT
 
 
 def test_variant_flags_are_idempotent():
     once = sac.apply_cli_variants(SW.CONFIG_BY_NAME["main"],
-                                  clear_buffer=True, episode_buffer=True)
-    twice = sac.apply_cli_variants(once, clear_buffer=True, episode_buffer=True)
+                                  clear_buffer=True, transition_buffer=True)
+    twice = sac.apply_cli_variants(once, clear_buffer=True, transition_buffer=True)
     assert once == twice
-    assert once["name"] == "main_epbuf_clearbuf"        # apply_cli_variants itself adds no default prior
+    assert once["name"] == "main_transbuf_clearbuf"     # apply_cli_variants itself adds no default prior
 
 
 def test_sweep_savings_version_derives_the_hand_written_twins():
@@ -269,11 +293,15 @@ def test_sweep_both_lists_parents_then_twins_without_duplicates():
     assert got == ["main_carry", "main_carry_clearbuf"]
 
 
-def test_sweep_episode_buffer_applies_to_every_selected_preset():
+def test_sweep_episode_buffer_is_the_default_and_transition_buffer_opts_out():
     got = SW.presets_for(["baseline", "main"], version="both", episode_buffer=True)
-    assert [c.name for c in got] == ["baseline_epbuf", "main_carry_epbuf",
-                                     "baseline_epbuf_clearbuf", "main_carry_epbuf_clearbuf"]
+    assert [c.name for c in got] == ["baseline", "main_carry",
+                                     "baseline_clearbuf", "main_carry_clearbuf"]
     assert all(c.replay_units == "episodes" for c in got)
+    got = SW.presets_for(["baseline", "main"], version="both", transition_buffer=True)
+    assert [c.name for c in got] == ["baseline_transbuf", "main_carry_transbuf",
+                                     "baseline_transbuf_clearbuf", "main_carry_transbuf_clearbuf"]
+    assert all(c.replay_units == "transitions" for c in got)
 
 
 def test_sweep_cli_parses_version_and_episode_buffer():
@@ -348,9 +376,10 @@ def test_sweep_applies_circuit_knobs_only_to_frozen_presets():
         "action_mode", sac.M.DEFAULT_ACTION_MODE)
 
 
-def test_epbuf_twin_still_differs_from_its_parent_in_one_knob():
+def test_buffer_twins_still_differ_from_their_parent_in_one_knob():
     """replay_units is set on BOTH sides by the CLI, so the twin contrast stays
-    a single knob in the episode-buffer version too."""
-    parent, twin = SW.presets_for(["main"], version="both", episode_buffer=True)
-    a, b = asdict(parent), asdict(twin)
-    assert {k for k in a if a[k] != b[k]} == {"name", "clear_buffer_on_switch"}
+    a single knob in either unit."""
+    for units in ({}, {"episode_buffer": True}, {"transition_buffer": True}):
+        parent, twin = SW.presets_for(["main"], version="both", **units)
+        a, b = asdict(parent), asdict(twin)
+        assert {k for k in a if a[k] != b[k]} == {"name", "clear_buffer_on_switch"}, units

@@ -200,35 +200,36 @@ def fig_mtl_control(arm, seed, r, path):
     easier route to the measure, and a large drop there is not by itself
     evidence against cerebellar specificity.
     """
-    import matplotlib.pyplot as plt
     ros = [ro for ro in ("family", "all") if (COND[0][0], ro) in r]
-    fig, axes = plt.subplots(1, len(ros), figsize=(4.6 * len(ros), 4.2),
-                             squeeze=False)
+    fig, axes = plt.subplots(1, len(ros), figsize=figsize("double" if len(ros) > 1 else "single",
+                                                          height=2.6),
+                             squeeze=False, sharey=True, layout="constrained")
     for ax, ro in zip(axes[0], ros):
         for mode, lab, col, ls in COND:
             mu, sd = r[(mode, ro)]
-            ax.plot(KS, mu, ls, color=col, marker="o", ms=4, lw=1.8, label=lab)
-            ax.fill_between(KS, mu - sd, mu + sd, color=col, alpha=.18, lw=0)
+            plot_band(ax, KS, mu, sd, color=col, ls=ls, label=lab)
         ch = _chance(ro)
-        ax.axhline(ch, ls=":", color="#888", lw=1)
-        ax.text(KS[-1], ch + .015, f"chance {ch:.2f}", fontsize=7,
-                color="#888", ha="right")
+        chance_line(ax, ch, f"chance {ch:.2f}")
         ax.set_ylim(0, 1.02)
         ax.set_xlabel("steps since context switch")
         ax.set_title("which family?" if ro == "family"
-                     else f"which context?  (all {N_CONTEXTS})", fontsize=11)
-        _despine(ax)
+                     else f"which context? (all {N_CONTEXTS})")
     axes[0][0].set_ylabel("linear decoding of context")
-    axes[0][0].legend(frameon=False, fontsize=8.5)
-    ttl = f"{ARM_TITLE.get(arm, arm)}"
-    if seed is not None:
-        ttl += f"   seed {seed}"
-    fig.suptitle("Is the decoding loss specific to the cerebellar channel?\n"
-                 + ttl, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    for ax in axes[0][1:]:
+        ax.tick_params(labelleft=False)
+    fig.legend(handles=_handles(), ncol=len(COND), loc="outside upper center")
+    who = ARM_TITLE.get(arm, arm) + ("" if seed is None else f", seed {seed}")
+    caption = (f"{who}: is the decoding loss specific to the cerebellar channel? "
+               f"Linear decoding of context from z against steps since the switch, "
+               f"under the intact channel, e zeroed, e shuffled and an equal-magnitude "
+               f"noise injected into MTL's own state (which never touches the "
+               f"cerebellum). Dotted line is chance; band +-1 SD across {N_SPLITS} "
+               f"decoder splits.")
     offset_spines(fig)
+    if len(ros) > 1:
+        label_panels(fig)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    save(fig, path)
+    save(fig, path, caption=caption)
     print(f"    saved -> {path}", flush=True)
 
 
@@ -245,13 +246,26 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
     ax = axes.ravel()
     for k in range(1 + len(READOUTS), len(ax)):
         ax[k].axis("off")
-    ms = [d[m]["mse"] if isinstance(d[m], dict) else d[m] for m, _, _, _ in COND]
-    ax[0].bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62)
+    # d[m] is a rollout dict (per seed: one MSE), a float, or an ARRAY of
+    # per-seed MSEs (across_seeds): then the bar is the mean with a +-1 SD
+    # whisker and one dot per seed, and the label quotes both.
+    per_seed = [np.atleast_1d(d[m]["mse"] if isinstance(d[m], dict) else d[m]).astype(float)
+                for m, _, _, _ in COND]
+    ms = [v.mean() for v in per_seed]
+    ax[0].bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62, zorder=1)
+    for k, v in enumerate(per_seed):
+        if len(v) > 1:
+            ax[0].errorbar(k, v.mean(), v.std(ddof=1), color=INK, lw=0.8, capsize=0, zorder=3)
+            ax[0].scatter(k + np.linspace(-0.18, 0.18, len(v)), v, s=4, color=INK,
+                          alpha=0.5, lw=0, zorder=2)
     ax[0].set_xticks(range(len(COND)), [l for _, l, _, _ in COND])
     ax[0].set_ylabel("velocity MSE")
     ax[0].set_title("prediction")
-    for k, v in enumerate(ms):
-        ax[0].annotate(f"{v:.4f}", (k, v), xytext=(0, 1.5), textcoords="offset points",
+    for k, v in enumerate(per_seed):
+        top = v.mean() + (v.std(ddof=1) if len(v) > 1 else 0.0)
+        top = max(top, v.max())
+        text = f"{v.mean():.4f}" if len(v) == 1 else f"{v.mean():.4f}\n±{v.std(ddof=1):.4f}"
+        ax[0].annotate(text, (k, top), xytext=(0, 1.5), textcoords="offset points",
                        ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
     # LEVEL readouts are titled in their level's colour; the whole-factor
     # readouts (family / all contexts) are not levels and stay in ink
@@ -282,7 +296,8 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
                f"(see across_seeds/).")
     else:
         err = (f"Line: mean over {n_seed} training seeds; band: +-1 SD across them, "
-               f"the error bar to quote.")
+               f"the error bar to quote. In (a) the bar is the mean MSE over seeds, "
+               f"the whisker +-1 SD and each dot one seed.")
     caption = (f"{ARM_TITLE.get(arm, arm)}: is the cerebellar error necessary? "
                f"(a) Held-out velocity MSE per condition. (b-f) Linear decoding of "
                f"context from z against steps since the context switch, per readout; "
@@ -302,45 +317,41 @@ def fig_global(arm, seed, r, path):
     collapsing them into one curve would hide the main finding.
     """
     keys = ["family", "all"]
-    fig, ax = plt.subplots(1, 2, figsize=(10.6, 4.6))
-    ttl = {"family": "which FAMILY?   " + " / ".join(FAM_NAMES),
-           "all": f"which CONTEXT?   all {N_CONTEXTS}"}
+    fig, ax = plt.subplots(1, 2, figsize=figsize("double", height=2.6), sharey=True,
+                           layout="constrained")
+    ttl = {"family": "which family? " + " / ".join(FAM_NAMES),
+           "all": f"which context? (all {N_CONTEXTS})"}
     for i, k in enumerate(keys):
         for mode, lab, col, ls in COND:
             mu, sd = r[(mode, k)]
-            ax[i].plot(KS, mu, ls, color=col, marker="o", ms=4, lw=1.8)
-            ax[i].fill_between(KS, mu - sd, mu + sd, color=col, alpha=.20, lw=0)
+            plot_band(ax[i], KS, mu, sd, color=col, ls=ls)
             if k == "family" and (mode, f"{k}_derived") in r:
                 mu2, _ = r[(mode, f"{k}_derived")]
-                ax[i].plot(KS, mu2, ":", color=col, marker="^", ms=4, lw=1.5,
-                           alpha=.85)
+                ax[i].plot(KS, mu2, ":", color=col, marker="^", ms=3, lw=1, alpha=.85)
         ch = _chance(k)
-        ax[i].axhline(ch, ls=":", color="#888", lw=1)
-        ax[i].text(KS[-1], ch + .02, f"chance {ch:.2f}", fontsize=8,
-                   color="#888", ha="right")
-        ax[i].set_title(ttl[k], fontsize=11)
+        chance_line(ax[i], ch, f"chance {ch:.2f}")
+        ax[i].set_title(ttl[k])
         ax[i].set_xlabel("steps since context switch")
-        ax[i].set_ylabel("linear decoding", fontsize=10)
         ax[i].set_ylim(0, 1.02)
-        _despine(ax[i])
+    ax[0].set_ylabel("linear decoding")
+    ax[1].tick_params(labelleft=False)
     h = _handles() + [
-        Line2D([], [], color="#555", ls="-", marker="o", ms=4, lw=1.8,
+        Line2D([], [], color=MUTED, ls="-", marker="o", ms=4, lw=1.8,
                label="factor: direct 4-way fit"),
-        Line2D([], [], color="#555", ls=":", marker="^", ms=4, lw=1.5,
+        Line2D([], [], color=MUTED, ls=":", marker="^", ms=4, lw=1.5,
                label="factor: derived from the 16-way fit")]
-    fig.legend(handles=h, ncol=3, frameon=False, fontsize=9,
-               loc="upper center", bbox_to_anchor=(.5, .90))
-    band = ("$\\pm$1 SD across TRAINING SEEDS" if str(seed).startswith("pooled")
-            else f"$\\pm$1 SD across {N_SPLITS} decoder splits")
-    # ONE line, not three.  Three suptitle lines plus a legend overlapped into
-    # unreadable text at this figure size; the detail belongs in the docstring.
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)}"
-                 f"{'  (' + str(seed) + ')' if str(seed).startswith('pooled') else ''}"
-                 f" -- context decoding, nothing given away;  band {band}",
-                 fontsize=10, y=0.99)
+    fig.legend(handles=h, ncol=3, loc="outside upper center")
+    pooled = str(seed).startswith("pooled")
+    band = ("+-1 SD across training seeds" if pooled
+            else f"+-1 SD across {N_SPLITS} decoder splits")
+    caption = (f"{ARM_TITLE.get(arm, arm)}{' (' + str(seed) + ')' if pooled else ''}: "
+               f"context decoding with nothing given away. (a) Which family, decoded "
+               f"directly (solid) or derived from the 16-way fit (dotted, triangles). "
+               f"(b) Which of the {N_CONTEXTS} contexts. Dotted grey line is chance; "
+               f"band {band}.")
     offset_spines(fig)
-    fig.tight_layout(rect=(0, 0, 1, .80))
-    save(fig, path)
+    label_panels(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -359,7 +370,7 @@ def fig_tss(arm, seed, d, path):
     than the oracle when in fact it goes BELOW the one-hot rung once settled.
     """
     lad = O.load()
-    fig, ax = plt.subplots(1, 2, figsize=(11.2, 4.3))
+    fig, ax = plt.subplots(1, 2, figsize=figsize("double", height=2.6), layout="constrained")
     se = d["intact"]["se"]
     tc = d["tss"][:, :-1]
     for i, f in enumerate(LEVELS):
@@ -368,48 +379,48 @@ def fig_tss(arm, seed, d, path):
         m = _level_mask(d, f)[:, :-1]
         y = [se[m & (tc == k)].mean() if (m & (tc == k)).sum() else np.nan
              for k in KS]
-        ax[0].plot(KS, y, "o-", ms=4, color=FCOL[f], label=f)
+        ax[0].plot(KS, y, "o-", ms=3, color=FCOL[f], label=f)
         if lad:
             # both rungs per family, in that family's colour: dotted = knows
             # nothing, dashed = told the context.  The model should sit between
             # them, and drop toward the dashed line as tss grows.
-            ax[0].axhline(lad["blind"][f], ls=":", color=FCOL[f], lw=1.1, alpha=.8)
+            ax[0].axhline(lad["blind"][f], ls=":", color=FCOL[f], lw=.8, alpha=.8)
             ax[0].axhline(lad["one-hot"][f], ls=(0, (5, 2)), color=FCOL[f],
-                          lw=1.2, alpha=.9)
+                          lw=.8, alpha=.9)
     if lad:
-        ax[0].plot([], [], ls=":", color="#555", lw=1.1, label="context-blind CB")
-        ax[0].plot([], [], ls=(0, (5, 2)), color="#555", lw=1.2,
+        ax[0].plot([], [], ls=":", color=MUTED, lw=.8, label="context-blind CB")
+        ax[0].plot([], [], ls=(0, (5, 2)), color=MUTED, lw=.8,
                    label="oracle: told the context (one-hot)")
     else:
         print("  (no oracle ladder -- run `python oracle.py`; rungs omitted)")
     ax[0].set_yscale("log")
     ax[0].set_xlabel("steps since context switch")
     ax[0].set_ylabel("held-out velocity MSE")
-    ax[0].set_title("prediction error, per family", fontsize=10)
-    ax[0].legend(frameon=False, fontsize=7.5)
+    ax[0].set_title("prediction error, per family")
+    ax[0].legend()
 
     zf = d["intact"]["z"].reshape(-1, d["intact"]["z"].shape[-1])
     for i, f in enumerate(LEVELS):
         ax[1].plot(KS, by_tss(zf, d["cid"].ravel(), d["sid"].ravel(),
                               d["tss"].ravel(), KS,
                               mask=_level_mask(d, f).ravel()),
-                   "o-", ms=4, color=FCOL[f], label=f)
-    ax[1].axhline(.25, ls=":", color="#555", lw=1)
-    ax[1].text(KS[-1], .265, "chance 0.25", fontsize=7.5, color="#888", ha="right")
+                   "o-", ms=3, color=FCOL[f], label=f)
+    ch = _chance(LEVELS[0])                     # within-family: over that family's members
+    chance_line(ax[1], ch, f"chance {ch:.2f}")
     ax[1].set_ylim(0, 1.02)
     ax[1].set_xlabel("steps since context switch")
     ax[1].set_ylabel("within-family context decoding")
-    ax[1].set_title("linear decoder, per family", fontsize=10)
-    ax[1].legend(frameon=False, fontsize=7.5)
-    for a_ in ax:
-        _despine(a_)
-    fig.suptitle(
-        f"{ARM_TITLE.get(arm, arm)}  (AR(1), rho={RHO}).  x is time since "
-        f"switch, not epoch:\ntss=0 is the step the context changes, where MTL "
-        f"is at chance by construction.", fontsize=10)
+    ax[1].set_title("linear decoder, per family")
+    ax[1].legend()
+    caption = (f"{ARM_TITLE.get(arm, arm)} (AR(1), rho={RHO}), the intact network, per "
+               f"family, against time since the context switch rather than epoch: "
+               f"tss=0 is the step the context changes, where MTL is at chance by "
+               f"construction. (a) Held-out velocity MSE; dotted rung: a context-blind "
+               f"CB, dashed rung: an oracle told the context (one-hot). (b) Within-family "
+               f"linear decoding of context from z; dotted grey line is chance.")
     offset_spines(fig)
-    fig.tight_layout(rect=(0, 0, 1, .88))
-    save(fig, path)
+    label_panels(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -421,15 +432,15 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
               f"training; skipping epoch_curves)")
         return
     z = np.load(p)
-    fig, ax = plt.subplots(1, 2, figsize=(11.2, 4.3))
+    fig, ax = plt.subplots(1, 2, figsize=figsize("double", height=2.6), layout="constrained")
     ep = np.arange(1, len(z["hist"]) + 1)
-    ax[0].plot(ep, z["hist"], color="#1c1c1c", lw=1.6, label="overall")
+    ax[0].plot(ep, z["hist"], color=INK, lw=1.2, label="overall")
     pf = z["per_fam"]
     for i, f in enumerate(LEVELS[:pf.shape[1]]):
-        ax[0].plot(ep, pf[:, i], color=FCOL[f], lw=1.2, label=f)
+        ax[0].plot(ep, pf[:, i], color=FCOL[f], lw=.9, label=f)
     ax[0].set_yscale("log"); ax[0].set_xlabel("epoch")
     ax[0].set_ylabel("held-out velocity MSE")
-    ax[0].legend(frameon=False, fontsize=8)
+    ax[0].legend()
     for f in LEVELS:
         # track() writes the level name ALONE.  It was "<level>_linear" while an
         # MLP decoder existed alongside; dropping the MLP dropped the suffix.
@@ -438,17 +449,17 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     # within a family the decode is over that family's members, so chance is
     # 1/members -- not a hardcoded 0.25, which was right only when the families
     # happened to have four members each
-    ax[1].axhline(len(FAM_NAMES) / N_CONTEXTS, ls=":", color="#888", lw=1)
+    ch = _chance(LEVELS[0])
+    chance_line(ax[1], ch, f"chance {ch:.2f}")
     ax[1].set_ylim(0, 1.03); ax[1].set_xlabel("epoch")
     ax[1].set_ylabel("within-family linear decoding")
-    ax[1].legend(frameon=False, fontsize=8)
-    for a in ax:
-        _despine(a)
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: training history (seed {seed})",
-                 fontsize=10.5)
-    fig.tight_layout(rect=(0, 0, 1, .92))
+    ax[1].legend()
+    caption = (f"{ARM_TITLE.get(arm, arm)}, seed {seed}: training history. (a) Held-out "
+               f"velocity MSE by epoch, overall and per family. (b) Within-family linear "
+               f"decoding of context from z at the tracked epochs; dotted line is chance.")
     offset_spines(fig)
-    save(fig, path)
+    label_panels(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -478,27 +489,32 @@ def fig_forces(arm, seed, d, path):
     # drop wall steps: there the plant zeroed v' and F is not recoverable
     interior = np.all(np.abs(nxt_p) < POS_LIM - 1e-6, axis=-1)
     keep = (d["tss"] >= TSS_MIN) & interior
-    fig, ax = plt.subplots(1, len(LEVELS), figsize=(3.6 * len(LEVELS), 4.0))
+    fig, ax = plt.subplots(1, len(LEVELS), figsize=figsize("double", height=2.2),
+                           sharey=True, layout="constrained")
+    cb_col, blind_col = PALETTE["rose"], MUTED
     for i, fm in enumerate(LEVELS):
         m = keep & _level_mask(d, fm)
         A, B = ang(Fc, Ft)[m], ang(Fb, Ft)[m]
         bins = np.linspace(0, 180, 37)
-        ax[i].hist(B, bins, color="#8a8f94", alpha=.55,
-                   label=f"blind ({B.mean():.0f}$\\degree$)")
-        ax[i].hist(A, bins, color="#c25b6b", alpha=.55,
-                   label=f"CB ({A.mean():.0f}$\\degree$)")
-        ax[i].axvline(A.mean(), color="#c25b6b", lw=1.5)
-        ax[i].axvline(B.mean(), color="#8a8f94", lw=1.5, ls="--")
-        ax[i].set_title(fm, fontsize=10)
-        ax[i].legend(frameon=False, fontsize=8)
-        ax[i].set_xlabel("angle: predicted vs true force (deg)")
-        _despine(ax[i])
+        ax[i].hist(B, bins, color=blind_col, alpha=.55, label=f"blind ({B.mean():.0f}°)")
+        ax[i].hist(A, bins, color=cb_col, alpha=.55, label=f"CB ({A.mean():.0f}°)")
+        ax[i].axvline(A.mean(), color=cb_col, lw=1)
+        ax[i].axvline(B.mean(), color=blind_col, lw=1, ls="--")
+        ax[i].set_title(fm, color=FCOL[fm])
+        ax[i].legend()
+        ax[i].set_xlabel("predicted vs true force (deg)")
+        ax[i].set_xlim(0, 180); ax[i].set_xticks([0, 90, 180])   # an angle: not "200"
+        if i:
+            ax[i].tick_params(labelleft=False)
     ax[0].set_ylabel("count")
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)} -- does CB's predicted force track "
-                 f"the context?", fontsize=10.5)
-    fig.tight_layout(rect=(0, 0, 1, .9))
+    caption = (f"{ARM_TITLE.get(arm, arm)}: does CB's predicted force track the context? "
+               f"Per family, the angle between CB's predicted force and the true one on "
+               f"settled interior steps (tss >= {TSS_MIN}, no wall contact), against a "
+               f"context-blind reference: the force averaged over every context. Vertical "
+               f"lines mark the means, quoted in the legends.")
     offset_spines(fig)
-    save(fig, path)
+    label_panels(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -556,34 +572,37 @@ def switch_aligned(arm, seed, n=N_SEQ, action_mode=M.DEFAULT_ACTION_MODE):
 
 
 def fig_switch(arm, seed, out, path, band=None, n_seed=None):
-    fig, ax = plt.subplots(1, len(LEVELS), figsize=(3.4 * len(LEVELS), 4.0))
+    fig, ax = plt.subplots(1, len(LEVELS), figsize=figsize("double", height=2.2),
+                           sharey=True, layout="constrained")
     for i, f in enumerate(LEVELS):
         for mode, lab, col, ls in COND:
             if band is None:
                 y = [out.get((mode, f, o), np.nan) for o in OFFSETS]
-                ax[i].plot(OFFSETS, y, ls, color=col, marker="o", ms=4, lw=1.6)
+                ax[i].plot(OFFSETS, y, ls, color=col, marker="o", ms=3, lw=1)
             else:
                 mu, sd = band[(mode, f)]
-                ax[i].plot(OFFSETS, mu, ls, color=col, marker="o", ms=4, lw=1.6)
-                ax[i].fill_between(OFFSETS, mu - sd, mu + sd, color=col,
-                                   alpha=.20, lw=0)
-        ax[i].axvline(-.5, color="#888", lw=1)
-        ax[i].axhline(.25, ls=":", color="#888", lw=1)
+                plot_band(ax[i], OFFSETS, mu, sd, color=col, ls=ls)
+        ax[i].axvline(-.5, color=MUTED, lw=.8)       # the switch
+        ch = _chance(f)
+        chance_line(ax[i], ch, f"chance {ch:.2f}" if i == len(LEVELS) - 1 else None)
         ax[i].set_xticks(OFFSETS); ax[i].set_ylim(0, 1.05)
-        ax[i].set_title(f, fontsize=11, color=FCOL[f])
+        ax[i].set_title(f, color=FCOL[f])
         ax[i].set_xlabel("steps relative to switch")
         if i == 0:
             ax[i].set_ylabel("linear decoding of context")
-        _despine(ax[i])
-    fig.legend(handles=_handles(), ncol=3, frameon=False, fontsize=10,
-               loc="upper center", bbox_to_anchor=(.5, .965))
-    tail = ("" if band is None else
-            f"\nmean $\\pm$1 SD across {n_seed} training seeds")
-    fig.suptitle(f"{ARM_TITLE.get(arm, arm)}: $e$ lesioned only in the window shown "
-                 f"-- decoding falls on BOTH sides of the switch{tail}", fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, .86))
+        else:
+            ax[i].tick_params(labelleft=False)
+    fig.legend(handles=_handles(), ncol=len(COND), loc="outside upper center")
+    err = ("" if band is None else
+           f" Line: mean over {n_seed} training seeds; band +-1 SD across them.")
+    caption = (f"{ARM_TITLE.get(arm, arm)}: e lesioned only in the window shown, "
+               f"{PRE} steps before to {POST - 1} after a context switch (grey line), "
+               f"and decoded in that window. Decoding falls on both sides of the switch, "
+               f"so the error feeds a continuous state estimate rather than a change "
+               f"detector alone. Dotted line is chance.{err}")
     offset_spines(fig)
-    save(fig, path)
+    label_panels(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -645,7 +664,8 @@ def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
     out = os.path.join(M.FIG_DIR, M.arm_tag(arm, action_mode), "across_seeds")
     os.makedirs(out, exist_ok=True)
     n = len(d)
-    mse = {m: float(np.mean([float(z[f"{m}|mse"]) for z in d.values()]))
+    # per-seed values, not their mean: fig_ablation draws mean, SD and the dots
+    mse = {m: np.array([float(z[f"{m}|mse"]) for z in d.values()])
            for m, _, _, _ in COND}
     r = {}
     for m, _, _, _ in COND:

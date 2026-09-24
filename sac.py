@@ -608,6 +608,23 @@ class _ContextPosterior:
         return (self.posterior.astype(np.float32) @ self.embed).astype(np.float32)
 
 
+def observer_angle(observer) -> float:
+    """The posterior-mean rotation angle of an inferred oracle: sum_k p_k
+    theta_k over its rotation hypotheses (the null hypothesis counts as 0
+    degrees), renormalised to their mass. nan when no hypothesis is a
+    rotation. What COIN's mixture code "means" as an angle -- at a novel +45
+    it should sit between +30 and +60; at +90 it cannot pass +60."""
+    post = observer.posterior
+    mass, tot = 0.0, 0.0
+    for p, cid in zip(post, observer.ids):
+        if cid is None:
+            mass += p
+        elif T.FAMILY[int(cid)] == 0:
+            mass += p
+            tot += p * float(T.C_PARAM[int(cid)])
+    return float(tot / mass) if mass > 1e-12 else float("nan")
+
+
 class BayesObserver(_ContextPosterior):
     """The ideal observer through the TRUE plant. The velocity change is
     dv = (A_c a_noisy + B_c v - DAMPING v) DT / MASS + w_c, so the quantity
@@ -752,8 +769,10 @@ def observer_has_null(config) -> bool:
         return bool(explicit)
     schedule = getattr(config, "schedule", DEFAULT_SCHEDULE)
     # only where the schedule's baseline IS the null field (P0 blocks);
-    # savings-washout runs on a trained baseline and needs no such hypothesis
-    return schedule != "cycle" and schedule_contexts(schedule)["base"] is None
+    # savings-washout runs on a trained baseline and needs no such hypothesis,
+    # and a zero-shot run is a cycle run plus a test: its observer is the
+    # cycle's, over the trained contexts alone
+    return schedule in PARADIGM_SCHEDULES and schedule_contexts(schedule)["base"] is None
 
 
 def make_observer(config: AblationConfig, oracle_embed, device="cpu"):
@@ -842,9 +861,17 @@ PRIORITY_GAMMA_EP = 40.0
 # CURRENT block gets a fixed majority whatever its length, and everything
 # before it shares a fixed budget, so protection no longer decays and
 # dilution no longer depends on block length. Recency still orders each pool.
-# Inert at 0.0 (every run before this); the paradigm schedules set it.
-PARADIGM_REHEARSAL = 0.15
+# The paradigms' default since 2026-09-18 and EVERY schedule's since
+# 2026-09-23 (user: the cycle inherits the paradigms' replay and effort
+# settings, all four -- this budget, the episode buffer, the effort cost and
+# the null-field clear); cycle runs made before that sit in
+# sac_runs/_retired_cycle_v0/.
+REHEARSAL_FRACTION = 0.15
 REPLAY_UNITS = ("transitions", "episodes")
+# the default units, for every schedule (AblationConfig.replay_units); the
+# ReplayBuffer class itself still defaults to transitions, as the unit tests
+# of the ported recency rule expect
+DEFAULT_REPLAY_UNITS = "episodes"
 
 # DEFAULT for AblationConfig.clear_buffer_on_switch, which is what the run loop
 # actually reads. False matches the previous iteration: nothing STRICTLY
@@ -915,8 +942,9 @@ assert GOAL_RADIUS < GRID_SIZE, (
 # making the penalty symmetric instead changed nothing (0.08). Every v1-plant
 # run predates this and is not return-comparable.
 DIST_WEIGHT = 0.3
-# Per-step effort cost -EFFORT_WEIGHT |a|^2, applied only where a config asks
-# for it (AblationConfig.effort_weight); the paradigm schedules do. See
+# Per-step effort cost -EFFORT_WEIGHT |a|^2 (AblationConfig.effort_weight).
+# Every schedule's default since 2026-09-23 (the paradigms' since 2026-09-19,
+# zero-shot's since 2026-09-21); a config sets 0.0 to opt out. See
 # step_reward for the measurements behind the value.
 EFFORT_WEIGHT = 0.1
 PROGRESS_WEIGHT = 1.0
@@ -996,10 +1024,15 @@ N_PHASE_FAMILIES = len(PHASE_CONTEXT_IDS)
 # all four of one family. Names follow task.FAM_NAMES, so a family change in
 # task.py changes the knob with it.
 _PHASE_FAMILY = {f"{name}s": name for name in T.FAM_NAMES}
-PHASE_SETS = ("mixed",) + tuple(_PHASE_FAMILY)
+# "rotations_wide" (2026-09-21): the four wide rotations, task.WIDE_ROT_ANGLES
+# (+-30, +-90), for the zero-shot experiment's wider-gap variant; paired with
+# the circuit fitted on model.WIDE_TRAIN_SET. Suffix _rotw.
+WIDE_PHASE_SET = "rotations_wide"
+PHASE_SETS = ("mixed",) + tuple(_PHASE_FAMILY) + (WIDE_PHASE_SET,)
 # run-name suffix per set: "" for the default, the family's short name else
 _SHORT = {"rotation": "rot", "reflection": "refl", "curl": "curl", "drift": "drift"}
-PHASE_SET_SUFFIX = {"mixed": "", **{s: f"_{_SHORT.get(name, name)}" for s, name in _PHASE_FAMILY.items()}}
+PHASE_SET_SUFFIX = {"mixed": "", **{s: f"_{_SHORT.get(name, name)}" for s, name in _PHASE_FAMILY.items()},
+                    WIDE_PHASE_SET: "_rotw"}
 DEFAULT_PHASE_SET = "mixed"
 
 
@@ -1008,6 +1041,8 @@ def phase_ids_for(phase_set: str) -> list:
         raise KeyError(f"unknown phase_set {phase_set!r}; expected one of {PHASE_SETS}")
     if phase_set == DEFAULT_PHASE_SET:
         return _phase_ids()
+    if phase_set == WIDE_PHASE_SET:
+        return T.wide_rotation_ids()
     fam = T.FAM_NAMES.index(_PHASE_FAMILY[phase_set])
     return [c for c in range(T.N_CONTEXTS) if T.FAMILY[c] == fam]
 
@@ -1067,10 +1102,116 @@ def apply_phase_set(phase_set: str) -> list:
 # --contexts rotations. P0 is the null field. Savings-washout is the
 # exception: its baseline is the TRAINED rot +30 and its P+ rot +60
 # (savings_pair; schedule_contexts holds every schedule's roles).
-SCHEDULES = ("cycle", "spontaneous_recovery", "evoked_recovery", "savings_washout")
+SCHEDULES = ("cycle", "spontaneous_recovery", "evoked_recovery", "savings_washout",
+             "zero_shot")
 DEFAULT_SCHEDULE = "cycle"
+# the three COIN paradigms: what the paradigm-only machinery (the per-reach
+# readout probe, the z-centroid belief, the null hypothesis) keys on.
+# "zero_shot" is a cycle run with a test appended and inherits none of it.
+# The replay and effort settings (REHEARSAL_FRACTION, DEFAULT_REPLAY_UNITS,
+# EFFORT_WEIGHT, the null-field clear) were paradigm-only until 2026-09-23
+# and are now every schedule's defaults, on AblationConfig itself.
+PARADIGM_SCHEDULES = ("spontaneous_recovery", "evoked_recovery", "savings_washout")
 SCHEDULE_SUFFIX = {"cycle": "", "spontaneous_recovery": "_sr", "evoked_recovery": "_er",
-                   "savings_washout": "_savw"}
+                   "savings_washout": "_savw", "zero_shot": "_zs"}
+
+# ── ZERO-SHOT GENERALIZATION (2026-09-21) ─────────────────────────────────
+#
+# The question: after training on several rotations, what does the agent do
+# in a rotation it has never met -- and does a circuit that represents the
+# family as an axis do better there than COIN, whose only route to a novel
+# context is a posterior-weighted MIXTURE of the ones it knows? The mixture
+# interpolates passably between two neighbours (a 50/50 code between +30 and
+# +60 mixes the two policies, which for angles lands near +45) but cannot
+# reach past the anchors (at +90 the posterior saturates at +60) or resolve
+# a magnitude it has no hypothesis for. A smooth code can.
+#
+# THE CONTEXT SET IS THE WIDE ONE (2026-09-21, user): anchors at +-30 and
+# +-90 (task.WIDE_ROT_ANGLES, PHASE_SETS "rotations_wide"), the circuit
+# fitted on the same four (model.WIDE_TRAIN_SET). The table's +-30/+-60 set
+# was the first version and was dropped: with anchors 30 degrees apart a
+# 50/50 mixture of two neighbouring policies is nearly the policy for the
+# angle between them, so interpolation could not tell a mixture code from
+# an axis code. Runs of that set sit in sac_runs/_retired_narrow/. The
+# schedule IMPLIES the wide set and, for a frozen preset, the wide circuit
+# (apply_cli_variants), so `--schedule zero_shot` alone names the runs on
+# disk: baseline_rotw_zs60, coin_rotw_zs60, main_trainrotw_rotw_zs60_carry.
+#
+# THE SCHEDULE is the cycle -- the same four rotation blocks, three times
+# round -- and then two things appended:
+#
+#   the FROZEN SWEEP: ZS_PROBE_EP reaches at each of ZS_TEST_ANGLES with MC
+#     frozen (no replay writes, no updates; the actor's deterministic mean, as
+#     in a channel block, so exploration noise is not measurement noise). The
+#     trained anchors are in the sweep as ordinary points, so every angle is
+#     measured the same way and the curve through them is one curve. The
+#     observers and EC run as they do in training -- the belief carries from
+#     reach to reach WITHIN a block and has to notice each switch from
+#     evidence -- but nothing is written to long-term memory (the experience
+#     bank, the observer's visit counts): these blocks are a measurement, not
+#     experience. Block order is a per-seed permutation so whatever carries
+#     over a switch (a stale belief, one reach's worth) averages out rather
+#     than biasing a fixed neighbour.
+#   the FEW-SHOT block: n_phase_ep reaches of ordinary training at ONE novel
+#     angle, config.zs_learn_angle, logged like any phase -- the learning
+#     curve of a context met for the first time, to set beside the anchors'
+#     own first-occurrence curves. One angle per run (a second block would
+#     start from what the first taught), named in the run: _zs60.
+#
+# THE CIRCUIT IS HELD OUT TOO. The wide circuit is fitted on the four wide
+# rotations (and the curl and drift contexts), so at +-15, +-45, +-60 and
+# +-75 z is an extrapolation of the circuit as much as the policy is: the
+# test is of the representation, not only of MC's readout of it. (0 is the
+# identity plant, unseen by the circuit as well -- the null field is never
+# in the supervised set -- and trivially solved by a blind controller, which
+# makes it a useful floor.)
+#
+# WHAT TO READ. Success saturates -- a blind feedback law solves any
+# rotation under 90 degrees -- so the measures are path ratio, steps and
+# return, per reach. The first action carries no context by construction
+# (eval_center_out's note), so the frozen blocks' per-reach efficiency, with
+# the belief carried between reaches, is where zero-shot competence shows.
+# The test grid: every ZS_ANGLE_STEP degrees from -90 to +90. It was 15
+# degrees (13 angles) until 2026-09-22 (user): at 5 (37 angles) the steps of
+# a discrete code's staircase are unmistakable where 15 left them implied.
+# The anchors (+-30, +-90) and the midpoints (+-60) fall on the grid at any
+# step that divides 30. Runs made on the 15-degree grid sit in
+# sac_runs/_retired_step15/.
+ZS_ANGLE_STEP = 5.0
+ZS_TEST_ANGLES = tuple(float(a) for a in np.round(np.arange(-90.0, 90.0 + ZS_ANGLE_STEP / 2,
+                                                             ZS_ANGLE_STEP), 6))
+assert 30.0 in ZS_TEST_ANGLES and 60.0 in ZS_TEST_ANGLES and 90.0 in ZS_TEST_ANGLES
+# frozen reaches per test angle. 16 is what every run on disk used; the
+# estimators of panels d and e of the zero-shot figure (the mode of the aim
+# and the share near full compensation, per angle) are PER ANGLE and pooled
+# over seeds, so more reaches here buys their precision far more cheaply than
+# more seeds would (the sweep is ~1.5 min of a ~7 min run). Override per run
+# with --zs-probe-ep, which names the run (_p32) so a rerun cannot be served
+# the 16-reach runs from the cache.
+ZS_PROBE_EP = 16
+# the few-shot block's angle, by default: the midpoint of the WIDE set's
+# outer gap (+30..+90). Was 45, the table set's midpoint, until the table
+# set was dropped from the experiment (2026-09-21, user).
+ZS_LEARN_ANGLE = 60.0
+ZS_ORDER_SEED_BASE = 7_000        # the sweep order's rng, seeded per run seed
+ZS_KIND, FS_KIND, TRAIN_KIND = "zs", "fs", "train"   # curve["kind"]
+# THE TEST BLOCKS ARE CENTRE-OUT AND SHORT (2026-09-21, user). The cycle
+# trains on free (start, goal) pairs whose distance varies twofold; the
+# frozen sweep and the few-shot block instead draw their reaches from the
+# centre-out battery (eval_battery: the origin to eight targets at
+# EVAL_RADIUS, a per-block permutation of the order), so every test reach is
+# the same question and nothing about the distance enters the measure. And
+# they may run under a SHORTER horizon, config.zs_max_steps, because under
+# MAX_STEPS = 30 feedback absorbs a misaim for free: the hand accelerates at
+# 1/MASS per step and rides the speed cap for the rest of the reach, so a
+# wrong first push is undone during the slow first steps at no cost in
+# return -- the first wide sweep had every trained config at the return
+# ceiling while COIN's first action snapped to the nearest anchor. A
+# centre-out reach needs 8 steps at full push (0.65 to the goal circle at
+# V_MAX 0.1 after ~3 steps of acceleration); the trained policies take 10,
+# 13 at the 95th percentile. At 12 a straight reach arrives and a curved
+# one does not. None keeps MAX_STEPS.
+ZS_CENTRE_OUT = True
 # Block lengths in reaches. The human design is 50 / 125 / 15 / 150, calibrated
 # to human adaptation rates, where 15 P- trials drive expressed adaptation
 # through zero. This learner is slower -- P+ took 25-40 reaches to reach high
@@ -1141,6 +1282,10 @@ def schedule_contexts(schedule):
     if schedule == "savings_washout":
         base, pplus = savings_pair()
         return {"base": base, "pplus": pplus, "pminus": None}
+    if schedule == "zero_shot":
+        # no P+/P- roles: the sweep is its own design, and no belief column
+        # has a context to report on
+        return {"base": None, "pplus": None, "pminus": None}
     pplus, pminus = coin_pair()
     return {"base": None, "pplus": pplus, "pminus": pminus}
 
@@ -1150,13 +1295,57 @@ def schedule_required_ids(schedule):
     return [c for c in schedule_contexts(schedule).values() if c is not None]
 
 
-def schedule_blocks(schedule, n_phase_ep, phase_reps, warmup_episodes, block_ep=None):
+def zero_shot_blocks(n_phase_ep, phase_reps, warmup_episodes, block_ep=None, *,
+                     seed=0, learn_angle=ZS_LEARN_ANGLE):
+    """The zero_shot schedule: the cycle, then the frozen sweep over
+    ZS_TEST_ANGLES in a per-seed order, then one few-shot block at
+    `learn_angle`. See the ZERO-SHOT comment above SCHEDULE_SUFFIX.
+
+    The appended blocks carry three flags the cycle's do not: `readout`
+    (deterministic action), `write` (may this block enter long-term memory:
+    the experience bank, the observer's visit counts) and `probe` (run the
+    end-of-block centre-out battery). They also carry `kind` (ZS_KIND /
+    FS_KIND) and `param` (the angle), which the logged curve copies.
+    block_ep["zs_probe"] overrides ZS_PROBE_EP (tests cut it down)."""
+    blocks = schedule_blocks("cycle", n_phase_ep, phase_reps, warmup_episodes)
+    n_probe = int({**(block_ep or {})}.get("zs_probe", ZS_PROBE_EP))
+    phase_idx = 1 + max(b["phase_idx"] for b in blocks)
+
+    def rot_block(theta, prefix, kind):
+        cid = T.rotation_id(theta)
+        return dict(context_id=cid, label=f"{prefix} {T.C_LABEL[cid]}", log=True,
+                    occurrence=0,
+                    family_idx=(PHASE_CONTEXT_IDS.index(cid) if cid in PHASE_CONTEXT_IDS
+                                else None),
+                    channel=False, kind=kind, param=float(theta),
+                    # the test blocks' reaches: centre-out, under the test
+                    # horizon (run_sac reads config.zs_max_steps)
+                    centre_out=ZS_CENTRE_OUT, test_horizon=True)
+
+    order = np.random.default_rng(ZS_ORDER_SEED_BASE + int(seed)).permutation(len(ZS_TEST_ANGLES))
+    for k in order:
+        blocks.append({**rot_block(ZS_TEST_ANGLES[k], "zs", ZS_KIND), "n_ep": n_probe,
+                       "phase_idx": phase_idx, "learn": False, "readout": True,
+                       "write": False, "probe": False})
+        phase_idx += 1
+    blocks.append({**rot_block(learn_angle, "fs", FS_KIND), "n_ep": int(n_phase_ep),
+                   "phase_idx": phase_idx, "learn": True, "readout": False,
+                   "write": True, "probe": True})
+    return blocks
+
+
+def schedule_blocks(schedule, n_phase_ep, phase_reps, warmup_episodes, block_ep=None,
+                    *, seed=0, zs_learn_angle=ZS_LEARN_ANGLE):
     """The blocks run_sac runs, in order. Each carries context_id (None = null
     field), label, n_ep, log, phase_idx, occurrence, family_idx (row of the
     oracle embed; None for the null field), learn and channel. "cycle"
-    reproduces the pre-schedule block list exactly (tests pin it)."""
+    reproduces the pre-schedule block list exactly (tests pin it). `seed`
+    and `zs_learn_angle` are read by "zero_shot" alone (zero_shot_blocks)."""
     if schedule not in SCHEDULES:
         raise KeyError(f"unknown schedule {schedule!r}; expected one of {SCHEDULES}")
+    if schedule == "zero_shot":
+        return zero_shot_blocks(n_phase_ep, phase_reps, warmup_episodes, block_ep,
+                                seed=seed, learn_angle=zs_learn_angle)
     blocks = []
     if warmup_episodes > 0:
         blocks.append({"context_id": None, "label": "null field", "n_ep": warmup_episodes,
@@ -1264,7 +1453,31 @@ def channel_step(pos, goal):
 # why that mixture flipped over a few tau. Every reach with evidence enters,
 # the null field included. The bank is EC's memory, distinct from the replay
 # buffer (MC's): clear_buffer_on_switch never clears it.
-EC_PRIORS = ("zero", "experience", "carry")
+EC_PRIORS = ("zero", "experience", "carry", "carry_mean")
+# "carry_mean" (2026-09-22, user): "carry" RAO-BLACKWELLISED. What "carry"
+# hands the next reach is ONE SAMPLE of EC's belief -- the hidden state at
+# the last step of the previous reach, shaped by braking at the goal, the
+# last command-noise draws and that reach's geometry -- where COIN hands its
+# observer's exact posterior, a sufficient statistic of the reach. Measured
+# on the zero-shot sweep, main's first-action aim at a TRAINED angle had an
+# s.d. of 27 degrees across reaches against COIN's 10, with no bias: the
+# spread was the carried sample's. carry_mean carries the MEAN of the hidden
+# state over the reach's settled steps (from CARRY_MEAN_MIN_STEP on, when
+# the context has been read) instead of its last value: a lower-variance
+# estimate of the same belief, and the same kind of object COIN carries.
+# Everything else about "carry" -- the leak, the channel rule, the bank --
+# is unchanged; the bank stores the same averaged state. Suffix _carrymean.
+#
+# TRIED AND REJECTED (2026-09-22, two seeds, zero-shot sweep at the 12-step
+# horizon). The mean of a GRU's hidden states is not a hidden state the
+# readout was fitted for: the angle decoded from the carried code at a
+# reach's first step (curve["z0"]) had a within-target spread of 19 degrees
+# against 11 under "carry", the first-action aim followed it (19 against 8),
+# and zero-shot success fell from 0.92 to 0.85. The spread under "carry" is
+# mostly the POLICY's sensitivity to an 11-degree code, and it varies by
+# seed (6 to 31 degrees) -- a property of the readout, not of the carried
+# sample. Kept as an option so the negative result sits beside the knob.
+CARRY_MEAN_MIN_STEP = 3
 # "carry" (2026-09-19, the default for an EC config): PROPAGATE the belief
 # instead of redrawing it. Each reach starts from the PREVIOUS reach's end
 # state, except with probability EC_PRIOR_HAZARD, when it starts from a state
@@ -1410,7 +1623,24 @@ class AblationConfig:
     times; the default and every run before 2026-09-18, unchanged) or one of
     COIN's paradigms -- "spontaneous_recovery", "evoked_recovery",
     "savings_washout" -- built from P+/P- (the +-30 rotations), the null
-    field and channel blocks. See SCHEDULES. Run name: _sr / _er / _savw."""
+    field and channel blocks. See SCHEDULES. Run name: _sr / _er / _savw.
+    "zero_shot" is the cycle plus a frozen sweep over novel rotations and one
+    few-shot block (zero_shot_blocks). Run name: _zs<angle>."""
+    zs_learn_angle: float = ZS_LEARN_ANGLE
+    """The zero_shot schedule's few-shot block: the novel rotation (degrees)
+    the agent is then TRAINED in, for n_phase_ep reaches. One per run, so
+    the interpolation case (45, between the +30 and +60 anchors) and the
+    extrapolation case (90) are separate runs, main_rot_zs45 / main_rot_zs90,
+    whose frozen sweeps are identical and can be pooled. Read by the
+    zero_shot schedule alone."""
+    zs_probe_ep: Optional[int] = None
+    """Frozen reaches per test angle in the zero_shot schedule's sweep; None
+    is ZS_PROBE_EP (16). Run name: _p<N>. See ZS_PROBE_EP for why 32."""
+    zs_max_steps: Optional[int] = None
+    """The horizon of the zero_shot schedule's TEST blocks (the frozen sweep
+    and the few-shot block), in steps; None is the run's MAX_STEPS. The cycle
+    blocks always run the full horizon. See ZS_CENTRE_OUT for why 12. Run
+    name: _h<N>."""
     ec_prior: str = "zero"
     ec_prior_tau: float = EC_PRIOR_TAU
     ec_prior_alpha: float = EC_PRIOR_ALPHA
@@ -1743,22 +1973,28 @@ class AblationConfig:
     condition. The field travels in the pickled config. Default is the module
     constant, so every existing run and preset is unchanged.
     """
-    effort_weight: float = 0.0
-    """Per-step action cost -w |a|^2 in step_reward. 0.0 is every run before
-    2026-09-19; the paradigm schedules set EFFORT_WEIGHT. It exists to make
-    knowing the context worth reward -- see coin_pair and step_reward."""
-    rehearsal_fraction: float = 0.0
+    effort_weight: float = EFFORT_WEIGHT
+    """Per-step action cost -w |a|^2 in step_reward. It exists to make knowing
+    the context worth reward -- see coin_pair and step_reward. 0.0 was every
+    run before 2026-09-19; the paradigms set EFFORT_WEIGHT from then, zero-
+    shot from 2026-09-21, and since 2026-09-23 it is the default for every
+    schedule, the cycle included (user's call: the cycle inherits all four of
+    the paradigms' replay and effort settings)."""
+    rehearsal_fraction: float = REHEARSAL_FRACTION
     """Fraction of each batch drawn from blocks BEFORE the one being learned
-    (ReplayBuffer.rehearsal). 0.0 -- every run before 2026-09-18 -- leaves the
-    recency rule alone, so how much of the batch is the current block depends
-    on how long that block has run. The paradigm schedules set
-    PARADIGM_REHEARSAL, which fixes both shares. Inert under clear_buffer_on_
-    switch, where there is nothing older to draw. No run-name suffix: it is
-    the paradigms' default and the saved config records it."""
-    replay_units: str = "transitions"
-    """What the replay buffer counts: "transitions" (capacity BUFFER_CAPACITY,
-    recency in steps -- every existing run) or "episodes" (capacity
-    BUFFER_CAPACITY_EPISODES, recency in episodes, equal mass per episode).
+    (ReplayBuffer.rehearsal): the current block holds the rest, whatever its
+    length. 0.0 leaves the recency rule alone, so how much of the batch is
+    the current block depends on how long that block has run -- every run
+    before 2026-09-18, and every cycle run before 2026-09-23. Inert under
+    clear_buffer_on_switch, where there is nothing older to draw. No run-name
+    suffix: it is the default and the saved config records it."""
+    replay_units: str = DEFAULT_REPLAY_UNITS
+    """What the replay buffer counts: "episodes" (capacity
+    BUFFER_CAPACITY_EPISODES, recency in episodes, equal mass per episode --
+    the default for every schedule since 2026-09-23, the paradigms' since
+    2026-09-18) or "transitions" (capacity BUFFER_CAPACITY, recency in steps
+    -- every run before those dates; the CLI's --transition-buffer, suffix
+    _transbuf).
 
     See the comment at BUFFER_CAPACITY_EPISODES for why: in transition units
     a competent agent's short episodes buy it a longer memory, so how much
@@ -1769,9 +2005,8 @@ class AblationConfig:
     A CONFIG FIELD because it changes within-block learning for every config
     (short successful episodes are no longer under-weighted), so it must be
     set IDENTICALLY on a parent and its *_clearbuf twin or their contrast is
-    no longer one knob -- tests pin that. Default keeps every existing run
-    bit-identical; the CLI's --episode-buffer selects the other and suffixes
-    the run name so the two never share a directory.
+    no longer one knob -- tests pin that. The two units never share a run
+    directory: the non-default one carries a suffix.
     """
 
 
@@ -2590,8 +2825,9 @@ class ReplayBuffer:
         if units not in REPLAY_UNITS:
             raise ValueError(f"units must be one of {REPLAY_UNITS}, got {units!r}")
         self.units = units
-        # the fixed rehearsal budget (PARADIGM_REHEARSAL): fraction of each
-        # batch drawn from BEFORE the current block. 0 = pure recency.
+        # the fixed rehearsal budget (REHEARSAL_FRACTION): fraction of each
+        # batch drawn from BEFORE the current block. 0 = pure recency; the
+        # run loop sets it from config.rehearsal_fraction.
         self.rehearsal = 0.0
         self.block_start_ep = None
         self.capacity = capacity
@@ -3137,7 +3373,7 @@ ROLLOUT_N_EPISODES = 140      # per context; 6 x 140 x 50 steps = 42k rows
 
 
 def rollout_z(arm, ckpt_seed, contexts=None, *, n_episodes=ROLLOUT_N_EPISODES,
-              max_steps=None, seed=0, device="cpu"):
+              max_steps=None, seed=0, device="cpu", spec=None):
     """Drive a frozen checkpoint through sac's OWN rollout and collect z.
 
     Through sac's own step functions -- circuit_state, augmented_obs_step,
@@ -3163,7 +3399,9 @@ def rollout_z(arm, ckpt_seed, contexts=None, *, n_episodes=ROLLOUT_N_EPISODES,
     config = AblationConfig(name="probe", use_ec=True, use_cb=True,
                             freeze=True, arm=arm)
     cb_proj = make_cb_proj(seed, device)
-    ec, cb = M.load(arm, ckpt_seed)
+    # `spec` (a model.CircuitSpec) selects a non-default checkpoint -- the
+    # wide-rotation circuit, say; None is the default circuit as before
+    ec, cb = M.load(arm, ckpt_seed) if spec is None else M.load(arm, ckpt_seed, spec)
     freeze_module(ec)
     freeze_module(cb)
 
@@ -3476,7 +3714,11 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     # P+/P- pair to report a belief over -- which also keeps those runs
     # bit-identical to every run made before this existed.
     z_centroids = (calibrate_z_centroids(config, device=device)
-                   if config.schedule != DEFAULT_SCHEDULE else None)
+                   if config.schedule in PARADIGM_SCHEDULES else None)
+    # the reach-mean z is logged (curve["z_mean"]) where a belief is read off
+    # it: the paradigms' centroid belief, and the zero-shot sweep, whose
+    # analysis decodes the angle from z with a decoder fitted on the anchors
+    collect_z = z_centroids is not None or (config.schedule == "zero_shot" and config.use_ec)
 
     ec, cb = build_ec_cb(config, device)
     spec = obs_spec(config, cb_proj_dim=cb_proj_dim)
@@ -3543,6 +3785,22 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # savings, the base context); nan under "cycle" and where no target
         # drew the source
         "probe_first_angle", "probe_fa_pplus", "probe_fa_pminus", "probe_fa_base",
+        # the zero-shot schedule (ZS_TEST_ANGLES): what kind of block the
+        # reach belongs to (TRAIN_KIND / ZS_KIND / FS_KIND), whether MC was
+        # learning, the block context's parameter (the rotation angle; nan
+        # for the null field), the path ratio of a reach that arrived, the
+        # inferred oracle's posterior-mean angle over its rotation
+        # hypotheses, and the reach's mean z (an array; nan without EC or
+        # outside the zero-shot schedule)
+        "kind", "learn", "param", "path_ratio", "belief_angle", "z_mean",
+        # z at the reach's FIRST step: the code MC acts on before any evidence
+        # of this reach, i.e. the carried context state as EC reads it (an
+        # array; nan when z is not collected). For the zero-shot diagnostic
+        # of how noisy the carried state is, reach to reach.
+        "z0",
+        # the reach's horizon (steps allowed) and, for a centre-out reach,
+        # the target's index on the ring (-1 for a free reach)
+        "budget", "target",
     )}
 
     probes = []
@@ -3554,13 +3812,18 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     # implementation as training rather than a parallel copy that could drift.
     # the schedule: our cycle (the default, same block list as before) or one
     # of COIN's paradigms -- see SCHEDULES
+    # the zero-shot sweep's reaches per angle: the config's, unless the
+    # caller's block_ep already names one (the cut-down tests do)
+    block_ep = dict(coin_block_ep or {})
+    if getattr(config, "zs_probe_ep", None):
+        block_ep.setdefault("zs_probe", int(config.zs_probe_ep))
     blocks = schedule_blocks(config.schedule, n_phase_ep, phase_reps, warmup_episodes,
-                             coin_block_ep)
+                             block_ep, seed=seed, zs_learn_angle=config.zs_learn_angle)
     # EC's start-of-reach prior (see ExperienceBank); None means the zero state
     if config.ec_prior not in EC_PRIORS:
         raise KeyError(f"unknown ec_prior {config.ec_prior!r}; expected one of {EC_PRIORS}")
     bank = (ExperienceBank(config.ec_prior_tau, config.ec_prior_alpha, device)
-            if config.ec_prior in ("experience", "carry") and ec is not None else None)
+            if config.ec_prior in ("experience", "carry", "carry_mean") and ec is not None else None)
     # "carry": the belief propagated from the previous reach, and whose context
     # it came from. None until the first reach ends. See EC_PRIORS.
     carry_h, carry_src = None, PRIOR_SRC_NONE
@@ -3579,6 +3842,12 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         log_block = block["log"]
         learn = block.get("learn", True)
         channel = block.get("channel", False)
+        # the zero-shot flags (zero_shot_blocks); at their defaults every
+        # other schedule is unchanged: a channel block already reads out
+        readout = block.get("readout", channel)
+        write = block.get("write", True)
+        do_probe = block.get("probe", True)
+        kind = block.get("kind", TRAIN_KIND)
         # the warmup and the null field have no context to encode, so the
         # given oracle sees zeros there (family_idx None -> the zero code)
         oracle_vec = (oracle_code(family_idx if log_block else None, oracle_embed)
@@ -3599,26 +3868,51 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # than they are to each other -- so replaying them taught "aim
         # straight" across the whole code space and slowed P+ learning for
         # every model, main most (first-50-reach index 0.12 vs 0.49 with an
-        # empty buffer). The buffer is cleared ONCE, on leaving a LOGGED
-        # null-field block (P0). The cycle schedule's warmup is a null-field
-        # block too but unlogged, so those runs are untouched; the trained
-        # baseline of savings-washout is a real context and IS replayed.
+        # empty buffer). The buffer is cleared ONCE, on leaving null-field
+        # data for the first REAL context: the paradigms' P0, and since
+        # 2026-09-23 the cycle's (and zero-shot's) unlogged warmup too, which
+        # until then rode into the first rotation block. Warmup -> P0 does not
+        # clear (both are the null field; P0 keeps the warmup's data), and the
+        # trained baseline of savings-washout is a real context and IS
+        # replayed, so there the clear falls on leaving the warmup for it.
+        # Keyed on the blocks' contexts rather than labels, which differ
+        # between the warmup ("null field") and P0 (NULL_LABEL); the channel
+        # is also context None but writes nothing and must NOT clear -- under
+        # evoked recovery the P+ memory it is followed by lives in that buffer.
         prev = blocks[block_idx - 1] if block_idx else None
-        if (log_block and prev is not None and prev["log"]
-                and prev["label"] == NULL_LABEL and not config.clear_buffer_on_switch):
+        if (log_block and block["context_id"] is not None and prev is not None
+                and prev["context_id"] is None and not prev.get("channel", False)
+                and not config.clear_buffer_on_switch):
             replay_buffer.clear()
 
         # the batch split follows the block boundary (ReplayBuffer.rehearsal)
         replay_buffer.mark_block_start(global_ep + 1)
 
+        # the zero-shot test blocks: centre-out reaches under the test horizon
+        # (ZS_CENTRE_OUT, AblationConfig.zs_max_steps); every other block
+        # samples free (start, goal) pairs under the run's horizon, as before
+        centre_out = block.get("centre_out", False)
+        block_max_steps = (int(config.zs_max_steps)
+                           if block.get("test_horizon", False) and config.zs_max_steps
+                           else max_steps)
+        if centre_out:
+            co_starts, co_goals = eval_battery()
+            co_order = rng.permutation(len(co_goals))
+
         kind_note = ("" if log_block else " [warmup, not logged]") + \
-                    (" [channel: clamped, MC frozen]" if channel else "")
+                    (" [channel: clamped, MC frozen]" if channel else "") + \
+                    (f" [centre-out, {block_max_steps} steps]" if centre_out else "")
         print(f"\nPhase {label} ({block['n_ep']} episodes){kind_note}...", flush=True)
 
         for local_ep in range(1, block["n_ep"] + 1):
             global_ep += 1
 
-            pos, goal = sample_pos_goal(rng)
+            if centre_out:
+                target = int(co_order[(local_ep - 1) % len(co_order)])
+                pos, goal = co_starts[target].copy(), co_goals[target].copy()
+            else:
+                target = -1
+                pos, goal = sample_pos_goal(rng)
             vel_sim = np.zeros(2, dtype=np.float32)
             vel_obs = np.zeros(2, dtype=np.float32)
 
@@ -3628,7 +3922,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                 h = None
             elif bank is None:
                 h = torch.zeros(1, EC_HIDDEN, device=device)
-            elif config.ec_prior == "carry":
+            elif config.ec_prior in ("carry", "carry_mean"):
                 # keep the previous reach's belief; leak to the bank's visit
                 # distribution with probability ec_prior_hazard (see EC_PRIORS)
                 if carry_h is None or float(rng.random()) < config.ec_prior_hazard:
@@ -3639,6 +3933,8 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             else:
                 h, prior_src, _src_ep = bank.sample(rng, global_ep)
             pending, z_last = [], None      # relabel_z: this reach's transitions, end z
+            h_acc, h_n = None, 0            # carry_mean: the settled steps' hidden-state sum
+            z0 = float("nan")               # z at the first step (curve["z0"])
             if oracle_noise is not None:
                 oracle_noise.reset()        # per episode, as EC's hidden is
             s_tm1 = torch.zeros(1, SDIM, device=device)
@@ -3652,14 +3948,15 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
 
             init_dist = float(np.linalg.norm(pos - goal))
             rewards, dist_seq, angle_seq, wall_imps = [], [], [], []
-            z_seq = []          # this reach's z, for the z-centroid belief
+            z_seq = []          # this reach's z, for the z-centroid belief / z_mean
+            path_len = 0.0      # walked distance, for the path ratio
             first_angle: Optional[float] = None
             success, steps = False, 0
             latest = {"q_loss": 0.0, "actor_loss": 0.0, "alpha": trainer.current_alpha,
                       "q_target_mean": 0.0, "log_pi_mean": 0.0}
             latest_ec_cb = float("nan")
 
-            for _ in range(max_steps):
+            for _ in range(block_max_steps):
                 d = float(np.linalg.norm(pos - goal))
                 dist_seq.append(d)
                 if d < GOAL_RADIUS:
@@ -3672,7 +3969,12 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                     pos, vel_obs, goal, oracle_vec, device, ec_offset,
                     cb_stats=cb_stats, rng=rng, ec_std=ec_std,
                     oracle_noise=oracle_noise)
-                if z_centroids is not None:
+                if collect_z and steps == 0:
+                    z0 = z_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                if config.ec_prior == "carry_mean" and h is not None and steps >= CARRY_MEAN_MIN_STEP:
+                    h_acc = h.detach().clone() if h_acc is None else h_acc + h.detach()
+                    h_n += 1
+                if collect_z:
                     # raw z, the space the centroids were measured in
                     z_seq.append(z_t.squeeze(0).detach().cpu().numpy())
 
@@ -3690,7 +3992,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                     # baseline's channel wandered by 0.4 of the full effect over
                     # 150 reaches (first-action index sd ~0.9 per reach). A force
                     # channel measures the expressed memory; this is that.
-                    action_np = ((action_mean if channel else action_t)
+                    action_np = ((action_mean if readout else action_t)
                                  .squeeze(0).cpu().numpy().astype(np.float32))
                 action_t_full = torch.tensor(action_np, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -3732,6 +4034,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                                               effort_weight=config.effort_weight,
                                               wall_impulse=wall_imp)
                 rewards.append(reward)
+                path_len += float(np.linalg.norm(pos_new - pos))
                 # logged per episode so the penalty's effect is visible without
                 # re-instrumenting: mean normalised impulse, and contact rate
                 wall_imps.append(float(wall_imp) / T.MAX_WALL_IMPULSE)
@@ -3847,16 +4150,25 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             # counts the visit; relabelled transitions are stored with the
             # end-of-reach z in their ec block
             if steps > 0 and not channel:
-                if bank is not None:
-                    bank.add(h, global_ep, context_id)
+                # a frozen zero-shot block (write=False) carries its belief
+                # from reach to reach like any block but enters nothing into
+                # long-term memory: no bank entry, no visit count
+                # the state this reach settled on: its last hidden state, or
+                # (carry_mean) the mean over its settled steps -- the same
+                # object goes to the bank and to the carry
+                h_settled = h
+                if config.ec_prior == "carry_mean" and h_acc is not None and h_n > 0:
+                    h_settled = h_acc / float(h_n)
+                if bank is not None and write:
+                    bank.add(h_settled, global_ep, context_id)
                 # the belief this reach settled on becomes the next reach's
                 # start. NOT after a channel reach: its end state is about the
                 # clamp, not the context, so the carry stays where it was and
                 # only a leak moves it -- see EC_PRIORS.
-                if config.ec_prior == "carry":
-                    carry_h, carry_src = h.clone(), (PRIOR_SRC_NULL if context_id is None
-                                                     else int(context_id))
-                if observer is not None and log_block and observer.count_prior > 0.0:
+                if config.ec_prior in ("carry", "carry_mean"):
+                    carry_h, carry_src = h_settled.clone(), (PRIOR_SRC_NULL if context_id is None
+                                                             else int(context_id))
+                if observer is not None and log_block and observer.count_prior > 0.0 and write:
                     observer.note_visit()
             if pending and z_last is not None:
                 z_end = ec_channel(z_last, config, ec_offset, ec_std)
@@ -3945,8 +4257,23 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             # first-action angle over the 8 directions, and that mean over the
             # targets whose EC start state was dealt from P+ / P- (nan when no
             # target drew that source -- and always without a bank)
+            # the zero-shot columns
+            curve["kind"].append(kind)
+            curve["learn"].append(float(learn))
+            curve["param"].append(float(block.get("param", T.C_PARAM.get(context_id, float("nan"))
+                                                  if context_id is not None else float("nan"))))
+            straight = init_dist - GOAL_RADIUS
+            curve["path_ratio"].append(path_len / max(straight, 1e-6)
+                                       if (success and straight > 0) else float("nan"))
+            curve["belief_angle"].append(observer_angle(observer) if observer is not None
+                                         else float("nan"))
+            curve["z_mean"].append(np.mean(z_seq[1:], axis=0).astype(np.float32)
+                                   if (collect_z and len(z_seq) > 1) else float("nan"))
+            curve["z0"].append(z0)
+            curve["budget"].append(int(block_max_steps))
+            curve["target"].append(int(target))
             pfa = pfa_pp = pfa_pm = pfa_null = float("nan")
-            if config.schedule != "cycle":
+            if config.schedule in PARADIGM_SCHEDULES:
                 ro = eval_center_out(trainer, ec, cb, config, context_id, family_idx,
                                      max_steps=READOUT_PROBE_STEPS, device=device,
                                      cb_proj=cb_proj, oracle_embed=oracle_embed,
@@ -4006,16 +4333,27 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         for eval_fi, eval_cid in enumerate(PHASE_CONTEXT_IDS):
             eval_specs.append((PHASE_LABELS[eval_fi], eval_cid, eval_cid,
                                bool(log_block and eval_cid == block["context_id"])))
+        # a block in a context outside the trained set (the zero-shot
+        # few-shot block) is probed in its own context too, as the current one
+        if (log_block and block["context_id"] is not None
+                and block["context_id"] not in PHASE_CONTEXT_IDS):
+            eval_specs.append((T.C_LABEL[block["context_id"]], block["context_id"],
+                               block["context_id"], True))
+        if not do_probe:
+            eval_specs = []
 
         summary = []
         for eval_label, eval_ctx, eval_cid, is_current in eval_specs:
-            eval_fi = PHASE_CONTEXT_IDS.index(eval_cid) if eval_cid is not None else 0
+            # a context outside the trained set has no oracle row: it takes
+            # the null field's conventions (family_idx 0 for the probe's
+            # observer bookkeeping, the zero code for the given oracle)
+            in_set = eval_cid in PHASE_CONTEXT_IDS
+            eval_fi = PHASE_CONTEXT_IDS.index(eval_cid) if in_set else 0
             # The oracle must be told the context it is ACTUALLY being evaluated
             # in, not the phase's -- being told the truth is the entire premise
             # of that config, and a stale one-hot would measure something else.
             if config.use_oracle:
-                ev_oracle = oracle_code(eval_fi if eval_cid is not None else None,
-                                        oracle_embed)
+                ev_oracle = oracle_code(eval_fi if in_set else None, oracle_embed)
             else:
                 ev_oracle = None
 
@@ -4066,7 +4404,8 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             summary.append(f"{mark}{eval_label}: {int(probe['success'].sum())}/"
                            f"{len(probe['success'])} @{np.mean(probe['first_angle']):+.0f}deg")
 
-        print("  probes | " + " | ".join(summary), flush=True)
+        if summary:
+            print("  probes | " + " | ".join(summary), flush=True)
 
     if agent_path is not None:
         save_agent(agent_path, trainer, config, spec, cb_proj, oracle_embed, seed,
@@ -4278,11 +4617,14 @@ def _parse_args(argv=None):
                          help="replay buffer counts EPISODES, not transitions "
                               "(AblationConfig.replay_units='episodes'): same memory "
                               "span and recency for every config regardless of how "
-                              "fast it succeeds. Suffixes the run name with _epbuf. The "
-                              "DEFAULT under a COIN paradigm schedule (no suffix there).")
+                              "fast it succeeds. The DEFAULT for every schedule since "
+                              "2026-09-23, so this is a no-op (kept so old command lines "
+                              "parse); it suffixes _epbuf only on a config that set "
+                              "transitions by hand.")
     parser.add_argument("--transition-buffer", action="store_true",
-                         help="opt a paradigm-schedule run OUT of the episode buffer "
-                              "(replay_units='transitions'); suffixes _transbuf")
+                         help="opt OUT of the episode buffer (replay_units='transitions', "
+                              "capacity in steps -- every run before 2026-09-18, and every "
+                              "cycle run before 2026-09-23); suffixes _transbuf")
     # which frozen circuit drives MC -- only meaningful for freeze=True presets
     parser.add_argument("--action-mode", default=None,
                          choices=list(M.ACTION_MODES) + list(M.LEGACY_ACTION_MODES),
@@ -4328,6 +4670,17 @@ def _parse_args(argv=None):
                               f"transition prior (AblationConfig.observer_count_prior, "
                               f"default {DEFAULT_COUNT_PRIOR:g}). Suffix _nocprior at 0, "
                               "_cprior at any other non-default weight.")
+    parser.add_argument("--zs-learn-angle", type=float, default=None,
+                         help="zero_shot schedule only: the novel rotation (degrees) of the "
+                              f"few-shot block (default {ZS_LEARN_ANGLE:g}); the run name "
+                              "carries it, _zs<angle>")
+    parser.add_argument("--zs-max-steps", type=int, default=None,
+                         help="zero_shot schedule only: the horizon of the test blocks (the "
+                              "frozen sweep and the few-shot block), in steps; default the "
+                              "run's MAX_STEPS. Suffix _h<N>. See sac.ZS_CENTRE_OUT.")
+    parser.add_argument("--zs-probe-ep", type=int, default=None,
+                         help="zero_shot schedule only: frozen reaches per test angle "
+                              f"(default {ZS_PROBE_EP}). Suffix _p<N>.")
     return parser.parse_args(argv)
 
 
@@ -4356,7 +4709,8 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
                        ec_readout=None, rate_beta=None, noise_sigma=None,
                        phase_set=None, train_contexts=None, schedule=None,
                        ec_prior=None, relabel_z: bool = False,
-                       count_prior=None) -> dict:
+                       count_prior=None, zs_learn_angle=None, zs_max_steps=None,
+                       zs_probe_ep=None) -> dict:
     """Turn a preset dict into the variant the CLI asked for, renaming it.
 
     Every knob renames the run because the run directory is config.name:
@@ -4377,6 +4731,17 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
     in how they name the same run.
     """
     cfg = dict(cfg)
+    # THE ZERO-SHOT SCHEDULE IMPLIES ITS CONTEXT SET AND ITS CIRCUIT (see the
+    # ZERO-SHOT comment): the wide rotations for the task and, on a preset
+    # that freezes a circuit, the circuit fitted on them -- unless either was
+    # named, so `--train-contexts linear_random` still selects the
+    # unstructured control. Resolved first so the naming below sees them.
+    if schedule == "zero_shot":
+        if phase_set is None and cfg.get("phase_set", DEFAULT_PHASE_SET) == DEFAULT_PHASE_SET:
+            phase_set = WIDE_PHASE_SET
+        if (train_contexts is None and cfg.get("freeze", False)
+                and cfg.get("train_contexts", M.DEFAULT_TRAIN_CONTEXTS) == M.DEFAULT_TRAIN_CONTEXTS):
+            train_contexts = M.WIDE_TRAIN_SET
     circuit_knob = (action_mode is not None or ec_readout is not None
                     or rate_beta is not None or noise_sigma is not None
                     or train_contexts is not None)
@@ -4430,23 +4795,52 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
             need = [T.C_LABEL[c] for c in schedule_required_ids(schedule)]
             raise ValueError(f"schedule {schedule!r} needs the rotations {need}; the context "
                              f"set {chosen!r} lacks them -- use --contexts rotations")
-        # ... and the fixed rehearsal budget, for the same reason: the
-        # paradigms ask short blocks (P- 50, washout 75) to be learned beside
-        # a 300-reach P+ block. See PARADIGM_REHEARSAL.
-        if cfg.get("rehearsal_fraction", 0.0) == 0.0:
-            cfg["rehearsal_fraction"] = PARADIGM_REHEARSAL
-        # ... and the effort cost, which is what makes the +-60 pair pay
-        if cfg.get("effort_weight", 0.0) == 0.0:
-            cfg["effort_weight"] = EFFORT_WEIGHT
-        # A PARADIGM ALSO IMPLIES THE EPISODE BUFFER (2026-09-18, user's
-        # call): in transition units the 7900 P+ transitions were 88% of the
-        # sampled batch after 10 P- reaches and still 55% after 50, and main's
-        # P- memory, learned in the first 15 reaches, eroded back toward P+
-        # under that replay; with equal mass per episode (gamma 40 episodes)
-        # it held and kept building. No suffix -- it is the paradigms'
-        # default; --transition-buffer opts out and suffixes _transbuf.
-        if not transition_buffer and cfg.get("replay_units", "transitions") != "episodes":
-            cfg["replay_units"] = "episodes"
+    # THE REPLAY AND EFFORT SETTINGS ARE NOT SCHEDULE-KEYED ANY MORE. Until
+    # 2026-09-23 this is where the paradigms (and, for effort, zero-shot) got
+    # the fixed rehearsal budget, the effort cost and the episode buffer while
+    # the cycle kept every pre-September default so its runs stayed bit-
+    # identical. The cycle now inherits all of it (user's call), so the three
+    # live as AblationConfig's own defaults -- effort_weight, rehearsal_
+    # fraction, replay_units -- and reach every schedule, a config built by
+    # hand included. The reasons they exist, kept here because this is where
+    # a reader looks for them:
+    #   rehearsal (REHEARSAL_FRACTION): the paradigms ask short blocks (P- 50,
+    #     washout 75) to be learned beside a 300-reach P+ block; under recency
+    #     alone the current block's share depends on how long it has run.
+    #   effort (EFFORT_WEIGHT): it is what makes knowing the field pay.
+    #     Without it closed-loop feedback absorbs a 15-degree aiming error at
+    #     no cost in return -- the first wide-set zero-shot sweep showed every
+    #     trained config at the return ceiling while COIN's first action
+    #     snapped to the nearest anchor. Those runs sit in
+    #     sac_runs/_retired_noeffort/.
+    #   episode buffer (DEFAULT_REPLAY_UNITS): in transition units the 7900 P+
+    #     transitions were 88% of the sampled batch after 10 P- reaches and
+    #     still 55% after 50, and main's P- memory, learned in the first 15
+    #     reaches, eroded back toward P+ under that replay; with equal mass
+    #     per episode (gamma 40 episodes) it held and kept building.
+    # --transition-buffer opts any schedule out of the episode buffer and
+    # suffixes _transbuf (below). The cycle runs made under the old defaults
+    # sit in sac_runs/_retired_cycle_v0/.
+    # the zero-shot few-shot angle: only meaningful under that schedule
+    effective_schedule = schedule if schedule is not None else cfg.get("schedule", DEFAULT_SCHEDULE)
+    if zs_learn_angle is not None and effective_schedule != "zero_shot":
+        raise ValueError("--zs-learn-angle is the zero_shot schedule's knob; pass "
+                         "--schedule zero_shot")
+    if zs_learn_angle is not None:
+        cfg["zs_learn_angle"] = float(zs_learn_angle)
+    if zs_max_steps is not None and effective_schedule != "zero_shot":
+        raise ValueError("--zs-max-steps is the zero_shot schedule's knob; pass "
+                         "--schedule zero_shot")
+    if zs_max_steps is not None:
+        if int(zs_max_steps) < 1:
+            raise ValueError(f"--zs-max-steps must be positive, got {zs_max_steps}")
+        cfg["zs_max_steps"] = int(zs_max_steps)
+    if zs_probe_ep is not None and effective_schedule != "zero_shot":
+        raise ValueError("--zs-probe-ep is the zero_shot schedule's knob; pass --schedule zero_shot")
+    if zs_probe_ep is not None:
+        if int(zs_probe_ep) < 2:
+            raise ValueError(f"--zs-probe-ep must be at least 2, got {zs_probe_ep}")
+        cfg["zs_probe_ep"] = int(zs_probe_ep)
     # the TASK knob: which contexts. Allowed on every preset (baseline
     # included -- it changes the task, not the circuit); after the circuit
     # suffixes, before the buffer ones: main_iid_rot_clearbuf
@@ -4464,6 +4858,14 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
             raise KeyError(f"unknown schedule {schedule!r}; expected one of {SCHEDULES}")
         cfg["schedule"] = schedule
         tag = SCHEDULE_SUFFIX[schedule]
+        if schedule == "zero_shot":
+            # the few-shot angle is in the name (_zs60), and the test horizon
+            # when it is not the run's (_h12): main_trainrotw_rotw_zs60_h12
+            tag += f"{float(cfg.get('zs_learn_angle', ZS_LEARN_ANGLE)):g}"
+            if cfg.get("zs_max_steps"):
+                tag += f"_h{int(cfg['zs_max_steps'])}"
+            if cfg.get("zs_probe_ep"):
+                tag += f"_p{int(cfg['zs_probe_ep'])}"
         if tag and tag not in cfg["name"]:
             cfg["name"] = _with_infix(cfg["name"], tag)
     if ec_prior is not None and ec_prior != cfg.get("ec_prior", "zero"):
@@ -4472,7 +4874,7 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
         if not cfg.get("use_ec", False):
             raise ValueError(f"--ec-prior needs an EC channel; {cfg['name']!r} has none")
         cfg["ec_prior"] = ec_prior
-        tag = {"experience": "_prior", "carry": "_carry"}.get(ec_prior)
+        tag = {"experience": "_prior", "carry": "_carry", "carry_mean": "_carrymean"}.get(ec_prior)
         if tag and tag not in cfg["name"]:
             cfg["name"] = _with_infix(cfg["name"], tag)
     if relabel_z and not cfg.get("relabel_z", False):
@@ -4497,28 +4899,29 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
                 cfg["name"] = _with_infix(cfg["name"], tag)
     if episode_buffer and transition_buffer:
         raise ValueError("--episode-buffer and --transition-buffer exclude each other")
-    if episode_buffer and cfg.get("replay_units", "transitions") != "episodes":
+    # --episode-buffer: a no-op now that episodes are every schedule's default
+    # (the flag stays so old command lines still parse); it only fires, and
+    # suffixes _epbuf, on a config that set transitions by hand
+    if episode_buffer and cfg.get("replay_units", DEFAULT_REPLAY_UNITS) != "episodes":
         cfg["replay_units"] = "episodes"
         if EPBUF_SUFFIX not in cfg["name"]:
             cfg["name"] = cfg["name"] + EPBUF_SUFFIX
-    if transition_buffer:
-        # only meaningful under a paradigm schedule, where episodes are the
-        # default; under "cycle" transitions already are and nothing changes
-        if cfg.get("schedule", DEFAULT_SCHEDULE) == DEFAULT_SCHEDULE:
-            raise ValueError("--transition-buffer only opts a paradigm schedule out of the "
-                             "episode buffer; the cycle schedule already counts transitions")
+    if transition_buffer and cfg.get("replay_units", DEFAULT_REPLAY_UNITS) != "transitions":
+        # opts any schedule out of the episode buffer (the cycle included
+        # since 2026-09-23, when episodes became its default too)
         cfg["replay_units"] = "transitions"
         if TRANSBUF_SUFFIX not in cfg["name"]:
             cfg["name"] = _with_infix(cfg["name"], TRANSBUF_SUFFIX)
-    # REPLAY IS THE PARADIGMS' DEFAULT (settled 2026-09-18 after going both
-    # ways): MC is a shared-weight controller with no gate, so without
-    # rehearsal 50 P- reaches overwrite P+ (probe +0.05..+0.33) and the
-    # channel rebounds toward a memory that is mostly gone. Rehearsal is how
-    # this architecture implements the memory protection COIN builds into
-    # responsibility-gated learning. The *_clearbuf twin (block-local buffer)
-    # is the ablation that shows protection is needed; baseline with replay
-    # (flat channel) shows a context signal is needed too. Held fixed:
-    # episode-indexed replay, the null-field block never replayed.
+    # REPLAY IS THE DEFAULT (settled 2026-09-18 for the paradigms after going
+    # both ways; the cycle always had it): MC is a shared-weight controller
+    # with no gate, so without rehearsal 50 P- reaches overwrite P+ (probe
+    # +0.05..+0.33) and the channel rebounds toward a memory that is mostly
+    # gone. Rehearsal is how this architecture implements the memory
+    # protection COIN builds into responsibility-gated learning. The
+    # *_clearbuf twin (block-local buffer) is the ablation that shows
+    # protection is needed; baseline with replay (flat channel) shows a
+    # context signal is needed too. Held fixed: episode-indexed replay, the
+    # null-field block never replayed.
     if clear_buffer and not cfg.get("clear_buffer_on_switch", False):
         cfg["clear_buffer_on_switch"] = True
         if not cfg["name"].endswith(CLEARBUF_SUFFIX):
@@ -4563,7 +4966,10 @@ def config_from_cli(args) -> AblationConfig:
                              schedule=getattr(args, "schedule", None),
                              ec_prior=default_ec_prior(cfg, getattr(args, "ec_prior", None)),
                              relabel_z=getattr(args, "relabel_z", False),
-                             count_prior=getattr(args, "count_prior", None))
+                             count_prior=getattr(args, "count_prior", None),
+                             zs_learn_angle=getattr(args, "zs_learn_angle", None),
+                             zs_max_steps=getattr(args, "zs_max_steps", None),
+                             zs_probe_ep=getattr(args, "zs_probe_ep", None))
     return AblationConfig(**cfg)
 
 

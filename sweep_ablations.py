@@ -192,7 +192,8 @@ VERSIONS = ("retention", "savings", "both")
 def presets_for(names, version="retention", episode_buffer=False,
                 action_mode=None, ec_readout=None, rate_beta=None, noise_sigma=None,
                 phase_set=None, train_contexts=None, schedule=None, ec_prior=None,
-                relabel_z=False, count_prior=None, transition_buffer=False):
+                relabel_z=False, count_prior=None, transition_buffer=False,
+                zs_learn_angle=None, zs_max_steps=None, zs_probe_ep=None):
     """The configs a sweep over `names` runs, for one version of the
     experiment or both.
 
@@ -217,9 +218,20 @@ def presets_for(names, version="retention", episode_buffer=False,
             for s in schedule:
                 out.extend(presets_for(names, version, episode_buffer, action_mode, ec_readout,
                                        rate_beta, noise_sigma, phase_set, train_contexts, s,
-                                       ec_prior, relabel_z, count_prior, transition_buffer))
+                                       ec_prior, relabel_z, count_prior, transition_buffer,
+                                       zs_learn_angle, zs_max_steps, zs_probe_ep))
             return out
         schedule = schedule[0]
+    # the zero-shot knobs only reach a zero_shot sweep (apply_cli_variants
+    # refuses them elsewhere); several schedules at once route them to that one
+    zs_knob = {}
+    if schedule == "zero_shot":
+        if zs_learn_angle is not None:
+            zs_knob["zs_learn_angle"] = zs_learn_angle
+        if zs_max_steps is not None:
+            zs_knob["zs_max_steps"] = zs_max_steps
+        if zs_probe_ep is not None:
+            zs_knob["zs_probe_ep"] = zs_probe_ep
     circuit = dict(action_mode=action_mode, ec_readout=ec_readout, rate_beta=rate_beta,
                    noise_sigma=noise_sigma, train_contexts=train_contexts)
     base = []
@@ -239,7 +251,8 @@ def presets_for(names, version="retention", episode_buffer=False,
             knobs = dict(knobs, count_prior=count_prior)
         base.append(sac.apply_cli_variants(cfg, episode_buffer=episode_buffer,
                                            transition_buffer=transition_buffer,
-                                           phase_set=phase_set, schedule=schedule, **knobs))
+                                           phase_set=phase_set, schedule=schedule,
+                                           **knobs, **zs_knob))
     twins = [sac.apply_cli_variants(c, clear_buffer=True) for c in base]
     chosen = {"retention": base, "savings": twins, "both": base + twins}[version]
     seen, out = set(), []
@@ -263,11 +276,12 @@ def _parse_args(argv=None):
                               "at every switch); both: parents then twins")
     parser.add_argument("--episode-buffer", action="store_true",
                          help="episode-indexed replay for every selected preset "
-                              "(sac.AblationConfig.replay_units='episodes'); run names "
-                              "get _epbuf. Already the default under --schedule.")
+                              "(sac.AblationConfig.replay_units='episodes'). The default "
+                              "for every schedule since 2026-09-23, so a no-op; kept so "
+                              "old command lines parse")
     parser.add_argument("--transition-buffer", action="store_true",
-                         help="opt a --schedule sweep out of the episode buffer; run names "
-                              "get _transbuf")
+                         help="opt the sweep out of the episode buffer (transition-indexed "
+                              "replay, as every run before 2026-09-18); run names get _transbuf")
     parser.add_argument("--action-mode", default=None,
                          choices=list(sac.M.ACTION_MODES) + list(sac.M.LEGACY_ACTION_MODES),
                          help="frozen circuit's action process, applied to the "
@@ -293,6 +307,16 @@ def _parse_args(argv=None):
     parser.add_argument("--contexts", default=None, choices=list(sac.PHASE_SETS),
                          help="which four contexts the task uses, for every selected "
                               "preset (names get _rot / _refl)")
+    parser.add_argument("--zs-learn-angle", type=float, default=None,
+                         help="--schedule zero_shot only: the few-shot block's novel "
+                              f"rotation in degrees (default {sac.ZS_LEARN_ANGLE:g}); names "
+                              "get _zs<angle>")
+    parser.add_argument("--zs-max-steps", type=int, default=None,
+                         help="--schedule zero_shot only: horizon of the test blocks in steps "
+                              "(default the run's MAX_STEPS); names get _h<N>")
+    parser.add_argument("--zs-probe-ep", type=int, default=None,
+                         help="--schedule zero_shot only: frozen reaches per test angle "
+                              f"(default {sac.ZS_PROBE_EP}); names get _p<N>")
     parser.add_argument("--workers", type=int, default=None,
                          help="parallel processes (default: cpu_count-1; 1 = serial)")
     parser.add_argument("--no-save-agg", dest="save_agg", action="store_false", default=True)
@@ -309,7 +333,9 @@ if __name__ == "__main__":
                           phase_set=args.contexts, train_contexts=args.train_contexts,
                           schedule=args.schedule, ec_prior=args.ec_prior,
                           relabel_z=args.relabel_z, count_prior=args.count_prior,
-                          transition_buffer=args.transition_buffer)
+                          transition_buffer=args.transition_buffer,
+                          zs_learn_angle=args.zs_learn_angle, zs_max_steps=args.zs_max_steps,
+                          zs_probe_ep=args.zs_probe_ep)
     run_named_sweep(presets, seeds=args.seeds, arm_seed=args.arm_seed,
                      save_agg=args.save_agg, workers=args.workers,
                      make_plots=args.make_plots)

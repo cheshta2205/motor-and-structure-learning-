@@ -66,8 +66,8 @@ import model as M
 from data import generate_sequences
 from decode import _clf, seq_split
 from task import (CONTEXTS, C_LABEL, FAMILY, FAM_NAMES, N_CONTEXTS, TSS_MIN)
-from plotting_utils import (use_paper_style, offset_spines, PALETTE, INK, figsize,
-                            colorbar, label_panels, save)
+from plotting_utils import (use_paper_style, offset_spines, bracket_xticks, PALETTE, INK,
+                            figsize, colorbar, label_panels, save)
 
 N_SEQ = 1200
 N_SPLITS = 8
@@ -370,50 +370,69 @@ def pc_variance(d, P, n_pc=10):
     return out
 
 
-def fig_pc_variance(arm, seed, V, path, n_pc=10):
-    """One panel per site: grouped bars of what each PC encodes."""
-    cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
-            "velocity": "#edb060"}
-    fig, axes = plt.subplots(1, len(SITES), figsize=(4.6 * len(SITES), 4.4),
-                             sharey=True)
+def _pc_variance_panels(axes, per_site, cols, n_pc, err=False):
+    """The shared body of fig_pc_variance and pool_pc_variance: one panel per
+    site, grouped bars of what each PC encodes (`per_site[site][name]` is a
+    vector, or a seeds x PCs array when `err`, drawn as mean +- SD) and the
+    scree curve on a twin axis. Each PC's bars sit under one bracket
+    (bracket_xticks; the group is 0.8 wide, so neighbours stay 0.2 apart)."""
     x = np.arange(n_pc)
     nb = len(cols)
     w = 0.8 / nb
-    for ai, site in enumerate(SITES):
-        a = axes[ai]
-        v = V[site]
+    for ai, (a, site) in enumerate(zip(axes, SITES)):
+        v = per_site[site]
         for bi, (name, c) in enumerate(cols.items()):
             if name not in v:                       # an older npz without family
                 continue
-            a.bar(x + (bi - (nb - 1) / 2) * w, v[name][:n_pc], width=w * 0.95, color=c,
-                  label=name if ai == 0 else None)
+            R = np.asarray(v[name])[..., :n_pc]
+            kw = (dict(yerr=R.std(0), capsize=1, error_kw={"lw": .6, "ecolor": INK})
+                  if err else {})
+            a.bar(x + (bi - (nb - 1) / 2) * w, R.mean(0) if err else R, width=w * 0.95,
+                  color=c, label=name if ai == 0 else None, **kw)
+        var = np.asarray(v["var"])[..., :n_pc]
+        var = var.mean(0) if err else var
         a2 = a.twinx()
-        a2.plot(x, v["var"][:n_pc] * 100, "k.--", ms=5, lw=1, alpha=.6)
-        a2.set_ylim(0, max(40, v["var"][0] * 115))
+        a2.plot(x, var * 100, "k.--", ms=3, lw=.8, alpha=.6)
+        a2.set_ylim(0, max(40, var[0] * 115))
+        # the twin duplicates the host's left spine and, on all but the last
+        # panel, would show an unlabelled right spine between panels: one
+        # labelled scree axis on the right of the row is enough
+        a2.spines["top"].set_visible(False)
+        a2.spines["left"].set_visible(False)
         if ai == len(SITES) - 1:
-            a2.set_ylabel("% of that site's total variance (dashed)", fontsize=8)
+            a2.set_ylabel("% of the site's variance (dashed)")
         else:
-            a2.set_yticklabels([])
-        a.set_xticks(x); a.set_xticklabels([f"{i+1}" for i in x], fontsize=8)
+            a2.spines["right"].set_visible(False)
+            a2.tick_params(right=False, labelright=False)
+        a.set_xticks(x, [f"{i + 1}" for i in x])
         a.set_xlabel("principal component")
-        a.set_title(site, fontsize=11)
+        a.set_title(site)
         a.set_ylim(0, 1)
         _despine(a)
-        for sp in ("top",):
-            a2.spines[sp].set_visible(False)
     axes[0].set_ylabel("variance of that PC explained ($R^2$)")
-    axes[0].legend(frameon=False, fontsize=9)
-    fig.suptitle(
-        f"{arm} seed {seed} -- what does each principal component encode?  "
-        f"(tss >= {TSS_MIN})\n"
-        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts, family $\\eta^2$ over the 2 "
-        f"families (nested in context: family $\\leq$ context, the gap is within-family "
-        f"identity); position and velocity are linear $R^2$.  They may overlap.\n"
-        f"dashed line: how much of the site's total variance that PC carries.",
-        fontsize=10)
+    axes[0].legend(frameon=False)
+
+
+# the four encodings' colours, shared by the per-seed and pooled figures
+PC_VARIANCE_COLS = {"context": PALETTE["violet"], "family": "#c39bd3",
+                    "position": PALETTE["teal"], "velocity": PALETTE["amber"]}
+
+
+def fig_pc_variance(arm, seed, V, path, n_pc=10):
+    """One panel per site: grouped bars of what each PC encodes. Built at
+    double-column width; the methods prose goes to the caption file."""
+    fig, axes = plt.subplots(1, len(SITES), figsize=figsize("double", height=2.2),
+                             sharey=True, layout="constrained")
+    _pc_variance_panels(axes, V, PC_VARIANCE_COLS, n_pc)
+    caption = (
+        f"{arm} seed {seed}: what each principal component encodes (tss >= {TSS_MIN}). "
+        f"context is eta^2 over the {N_CONTEXTS} contexts, family eta^2 over the 2 "
+        f"families (nested in context: family <= context, the gap is within-family "
+        f"identity); position and velocity are linear R^2. They may overlap. "
+        f"Dashed line: how much of the site's total variance that PC carries.")
     offset_spines(fig)
-    fig.tight_layout(rect=(0, 0, 1, .88))
-    save(fig, path)
+    bracket_xticks(fig)
+    save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 
 
@@ -681,6 +700,8 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0,
         f"(linear R^2), mean +- SD across seeds. The shares need not sum to 1: "
         f"drift contexts move the agent, so context and position are correlated.")
     offset_spines(fig)
+    if got:
+        bracket_xticks(ax, half_width=0.4)        # three .26 bars at .27 spacing: 0.8 wide
     label_panels(fig, top + [ax])
     save(fig, path, caption=caption)
     print(f"  saved -> {path}")
@@ -897,46 +918,21 @@ def pool_pc_variance(arm, seeds, tag="", n_pc=10,
         got.append(sd_)
     if not got:
         print(f"  {arm}: no pc_variance to pool"); return
-    cols = {"context": "#8e44ad", "family": "#c39bd3", "position": "#1e8449",
-            "velocity": "#edb060"}
-    cols = {k: c for k, c in cols.items() if A["z"][k]}
-    fig, axes = plt.subplots(1, len(SITES), figsize=(4.8 * len(SITES), 4.6),
-                             sharey=True)
-    x = np.arange(n_pc)
-    nb = len(cols); w = 0.8 / nb
-    for ai, site in enumerate(SITES):
-        a = axes[ai]
-        for bi, (name, c) in enumerate(cols.items()):
-            R = np.array(A[site][name])[:, :n_pc]
-            a.bar(x + (bi - (nb - 1) / 2) * w, R.mean(0), yerr=R.std(0), width=w * 0.95,
-                  color=c, label=name if ai == 0 else None, capsize=2,
-                  error_kw={"lw": .8, "ecolor": "#444"})
-        v = np.array(A[site]["var"])[:, :n_pc].mean(0)
-        a2 = a.twinx()
-        a2.plot(x, v * 100, "k.--", ms=5, lw=1, alpha=.6)
-        a2.set_ylim(0, max(45, v[0] * 115))
-        a2.set_ylabel("% of that site's total variance (dashed)", fontsize=8) \
-            if ai == len(SITES) - 1 else a2.set_yticklabels([])
-        a.set_xticks(x); a.set_xticklabels([str(i + 1) for i in x], fontsize=8)
-        a.set_xlabel("principal component"); a.set_title(site, fontsize=12)
-        a.set_ylim(0, 1)
-        _despine(a)
-        offset_spines(a)
-        a2.spines["top"].set_visible(False)
-    axes[0].set_ylabel("variance of that PC explained ($R^2$)")
-    axes[0].legend(frameon=False, fontsize=10)
-    fig.suptitle(
-        f"{arm} -- what does each principal component encode?  mean $\\pm$ SD "
-        f"across {len(got)} seeds {got}  (tss >= {TSS_MIN})\n"
-        f"context is $\\eta^2$ over the {N_CONTEXTS} contexts (assumption-free); position "
-        f"and velocity are linear $R^2$.  Only $z$ leads with context.",
-        fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, .89))
+    cols = {k: c for k, c in PC_VARIANCE_COLS.items() if A["z"][k]}
+    fig, axes = plt.subplots(1, len(SITES), figsize=figsize("double", height=2.2),
+                             sharey=True, layout="constrained")
+    _pc_variance_panels(axes, A, cols, n_pc, err=True)
+    caption = (
+        f"{arm}: what each principal component encodes, mean +- SD across {len(got)} "
+        f"seeds {got} (tss >= {TSS_MIN}). context is eta^2 over the {N_CONTEXTS} contexts "
+        f"(assumption-free); position and velocity are linear R^2. Dashed line: how "
+        f"much of the site's total variance that PC carries. Only z leads with context.")
     offset_spines(fig)
+    bracket_xticks(fig)
     d = os.path.join(M.FIG_DIR, arm, "across_seeds")
     os.makedirs(d, exist_ok=True)
     p_ = os.path.join(d, f"pc_variance{tag}.png")
-    save(fig, p_)
+    save(fig, p_, caption=caption)
     print(f"  saved -> {p_}   (pooled over {len(got)} seeds)")
 
 

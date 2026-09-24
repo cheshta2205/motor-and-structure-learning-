@@ -300,6 +300,8 @@ def context_affine(c):
         return rot_mat(np.deg2rad(param)), Z, z
     if kind == 1:                                     # curl: k R(90) v
         return I, (np.float32(param) * rot_mat(np.pi / 2)).astype(np.float32), z
+    if kind == LINEAR_KIND:                           # a general action transform
+        return LINEAR_MATS[int(c)], Z, z
     return I, Z, (DRIFT_VEL * unit(param)).astype(np.float32)     # drift
 
 
@@ -308,6 +310,146 @@ def context_matrix(c):
     callers that only ask how the ACTION is mapped; the full law is
     context_affine."""
     return context_affine(c)[0]
+
+
+# ── Off-table rotations, for the zero-shot experiment (2026-09-21) ──────────
+#
+# sac.py's "zero_shot" schedule drops an agent trained on the table's four
+# rotations into rotations the table does not hold -- 45 degrees, between two
+# anchors; 90, beyond them -- and asks what it does before it has learned
+# anything there. Those angles have to be contexts in every sense the rest of
+# the code relies on: an integer id the plant, the experience bank and the
+# logged curve can carry, a FAMILY entry that routes context_affine to
+# rot_mat, a C_PARAM entry holding the angle, a C_LABEL entry naming it. So
+# they are REGISTERED into the same tables the fixed contexts live in.
+#
+# Ids start at EXTRA_ID_BASE, far above the table, so nothing can mistake one
+# for a table context; N_CONTEXTS is unchanged and still counts the table
+# alone, and everything that enumerates range(N_CONTEXTS) -- the supervised
+# data, the phase sets, the decoders -- never sees them. The id is a function
+# of the angle (tenths of a degree, modulo 360), not of registration order,
+# so a spawned worker and its parent agree on it without talking. An angle
+# the table already holds returns the TABLE id: "the rotation at +30" is one
+# context however it is asked for, which is what lets the zero-shot sweep
+# include the trained anchors as ordinary points.
+#
+# A rotation of 0 is the identity plant, i.e. the same force law as the
+# c=None null field -- but as a context with an id, not a sentinel, so the
+# sweep can put "no perturbation" on the same axis as the rest.
+EXTRA_ID_BASE = 1000
+
+
+def rotation_id(theta_deg):
+    """The context id of the rotation by `theta_deg`, registering it if the
+    table does not hold it. Idempotent."""
+    theta = float(theta_deg)
+    for c, kind in FAMILY.items():
+        if kind == 0 and c < EXTRA_ID_BASE and np.isclose(C_PARAM[c], theta):
+            return c
+    c = EXTRA_ID_BASE + int(round((theta % 360.0) * 10.0))
+    if c not in FAMILY:
+        FAMILY[c] = 0
+        C_PARAM[c] = theta
+        C_LABEL[c] = f"rot {theta:+g}"
+    return c
+
+
+def is_table_context(c) -> bool:
+    """False for a registered off-table context (and for the None sentinel)."""
+    return c is not None and 0 <= int(c) < N_CONTEXTS
+
+
+# THE WIDE, SPARSE ROTATION SET (2026-09-21, user). With the table's anchors
+# 30 degrees apart, a 50/50 mixture of two neighbouring policies is close to
+# the policy for the angle between them, so interpolation cannot tell a
+# mixture code (COIN) from an axis code (the circuit): both looked alike at
+# +-45 in the first zero-shot sweep. Doubling the gap is the test: anchors at
+# +-30 and +-90, midpoints at +-60 where averaging the two policies should
+# stop being a good policy while a point on the axis between them should
+# not. Within 90 degrees so the feedback sign never flips. +-30 is kept so
+# the near-anchor tests at 15 and 45 stay comparable with the table's.
+#
+# NOT a change to the table: that would silently redefine the COIN paradigms
+# (P+ is the largest rotation), the mixed context set and every checkpoint.
+# It is a named set -- model.TRAIN_CONTEXT_SETS "rotations_wide" for the
+# circuit, sac.PHASE_SETS "rotations_wide" for the agent -- built from the
+# registry above, so the +-90 contexts are real ids everywhere.
+WIDE_ROT_ANGLES = [-90.0, -30.0, 30.0, 90.0]
+
+
+def wide_rotation_ids():
+    """The four wide rotations' context ids (table ids for +-30, registered
+    ids for +-90), in WIDE_ROT_ANGLES order."""
+    return [rotation_id(th) for th in WIDE_ROT_ANGLES]
+
+
+# ── Unstructured action transforms: the structure-learning CONTROL ──────────
+#
+# (2026-09-21, user.) Braun, Aertsen, Wolpert & Mehring (2009) established
+# structural learning with a contrast: exposure to a STRUCTURED family of
+# transformations (rotations, one parameter) against exposure to
+# UNSTRUCTURED ones (random linear transforms), measured as how fast a novel
+# family member is learned afterwards. The zero-shot experiment has the
+# structured arm -- a circuit fitted on the wide rotations -- and this is the
+# other: a circuit fitted on the same NUMBER of action transforms at the same
+# EFFECT SIZES, drawn at random from the general linear group, so nothing
+# about them lies on a one-parameter axis. A novel rotation lies inside that
+# family too (every rotation is a linear map), so the unstructured circuit
+# can represent it -- but it has to identify four numbers rather than one.
+# Whatever the rotation-trained circuit does better at novel rotations is
+# what learning the structure bought. And it is where the circuit parts
+# from COIN most sharply: the inferred oracle has no circuit, so which family
+# was seen in pretraining cannot reach it at all.
+#
+# EFFECT SIZE of an action transform A, as the module measures it (the rms
+# over unit action directions of |A u - u|): ||A - I||_F / sqrt(2), which for
+# a rotation is 2 |sin(theta/2)| -- 0.52 at 30 degrees, 1.41 at 90. The
+# random set draws A - I uniformly on the Frobenius sphere of exactly those
+# radii, two at each, so the two sets differ in structure alone.
+#
+# A fourth context KIND, outside FAM_NAMES on purpose: the three families
+# are the table's design and everything that enumerates them (the phase
+# sets, the decoders' per-family scores) must keep seeing three. These
+# contexts exist only through the registry, under ids from LINEAR_ID_BASE.
+# C_PARAM holds the draw index; the matrix lives in LINEAR_MATS.
+LINEAR_KIND = 3
+LINEAR_ID_BASE = 10_000
+LINEAR_MATS = {}
+RANDOM_LINEAR_SEED = 2026
+
+
+def effect_size(A) -> float:
+    """rms over unit action directions of |A u - u|: ||A - I||_F / sqrt(2)."""
+    return float(np.linalg.norm(np.asarray(A, dtype=np.float64) - np.eye(2)) / np.sqrt(2.0))
+
+
+def register_linear(A, index, label=None):
+    """Register the action transform `A` (2x2) as a context of LINEAR_KIND
+    under draw index `index`; idempotent for the same index."""
+    c = LINEAR_ID_BASE + int(index)
+    if c not in FAMILY:
+        FAMILY[c] = LINEAR_KIND
+        C_PARAM[c] = float(index)
+        C_LABEL[c] = label or f"lin {int(index)}"
+        LINEAR_MATS[c] = np.asarray(A, dtype=np.float32).reshape(2, 2)
+    return c
+
+
+def random_linear_ids(effects=None, seed=RANDOM_LINEAR_SEED):
+    """The unstructured control set: one random linear transform per entry
+    of `effects` (default: the wide rotations' effect sizes, so two at 0.52
+    and two at 1.41), A - I uniform on the Frobenius sphere of radius
+    sqrt(2) * effect. Deterministic in `seed`; registered on first call."""
+    if effects is None:
+        effects = [effect_size(rot_mat(np.deg2rad(th))) for th in WIDE_ROT_ANGLES]
+    rng = np.random.default_rng(seed)
+    ids = []
+    for i, eff in enumerate(effects):
+        E = rng.standard_normal(4)
+        E = E / np.linalg.norm(E) * np.sqrt(2.0) * float(eff)
+        A = np.eye(2) + E.reshape(2, 2)
+        ids.append(register_linear(A, i, label=f"lin {i} ({eff:.2f})"))
+    return ids
 
 
 # ── Sequences ────────────────────────────────────────────────────────────

@@ -26,8 +26,9 @@ paper figures so far: figures.fig_ablation, representation_analysis.
 fig_paper_pca_z, make_ablations_plot.plot_savings_washout and
 plot_recovery_comparison (the paradigm frame _paradigm_figure and
 _timecourse_panel came with them, so plot_schedule_timecourse is at print
-size too). Apply the same to each further figure as it is chosen for the
-paper. Titles stay centred (decided 2026-09-21).
+size too), and both figures in multimodality.py. Apply the same to each
+further figure as it is chosen for the paper. Titles stay centred (decided
+2026-09-21).
 
 `set_plt_params` and `make_axis_nice` at the bottom are the pre-2026-09-21
 helpers, kept only for reference; nothing calls them.
@@ -112,6 +113,8 @@ def figsize(width: Union[str, float] = "single", aspect: float = 0.62,
 # Tick policy for trim_spines: as few round ticks as still read well.
 MIN_TICKS, MAX_TICKS = 3, 7
 MAX_OVERSHOOT = 0.2      # extension beyond the data, as a fraction of its range
+EXTEND_TOL = 0.02        # data past the outer tick by less than this fraction of
+                         # the view is not worth an extra tick step
 
 
 def _fmt_g(v, _pos=None) -> str:
@@ -128,12 +131,20 @@ def _nice_steps(step: float):
 
 
 def _retickable(axis) -> bool:
+    from matplotlib.category import StrCategoryFormatter, StrCategoryLocator
     from matplotlib.ticker import FixedFormatter, FixedLocator
     if axis.get_scale() != "linear":
         return False
     if isinstance(axis.get_major_locator(), FixedLocator) or \
             isinstance(axis.get_major_formatter(), FixedFormatter):
         return False                     # user-set ticks / category labels
+    # A categorical axis matplotlib built through its unit machinery (what
+    # seaborn's violin/box/strip plots leave behind): the positions are the
+    # category indices and the formatter labels a position by ROUNDING it, so
+    # re-ticking at 0, 0.5, 1, ... would read "0 0 0 1 2 2 2". Trim only.
+    if isinstance(axis.get_major_locator(), StrCategoryLocator) or \
+            isinstance(axis.get_major_formatter(), StrCategoryFormatter):
+        return False
     return len(axis.get_majorticklocs()) >= 2
 
 
@@ -152,7 +163,9 @@ def _choose_ticks(axis, lo: float, hi: float, enclose: bool, data=None):
     stops short: a +-1.5 frame holding values up to 1.02 gets ticks every 0.5
     rather than -1, 0, 1 with the spine ending inside the data."""
     import numpy as np
-    if not _retickable(axis) or not hi > lo:
+    # an axes with nothing plotted (a twinx partner used for a label, a panel
+    # that only holds text) has an inverted, infinite data interval
+    if not _retickable(axis) or not (np.isfinite(lo) and np.isfinite(hi)) or not hi > lo:
         return None
     locs = np.asarray(axis.get_majorticklocs())
     step0 = float(np.median(np.diff(locs)))
@@ -176,7 +189,8 @@ def _choose_ticks(axis, lo: float, hi: float, enclose: bool, data=None):
         (ok if over <= MAX_OVERSHOOT else fallback).append((over, len(t), t))
     if ok and not enclose and data is not None:
         dlo, dhi = data
-        holds = [r for r in ok if r[2][0] <= dlo + 1e-9 and r[2][-1] >= dhi - 1e-9]
+        tol = EXTEND_TOL * (hi - lo)
+        holds = [r for r in ok if r[2][0] <= dlo + tol and r[2][-1] >= dhi - tol]
         if holds:
             return min(holds, key=lambda r: r[1])[2]   # coarsest that holds the data
     if ok:
@@ -257,11 +271,14 @@ def _trim_one(a, axis, s, horizontal, extend):
             # add one more step on the failing side and widen the limit to it:
             # reach data to 770 with ticks by 200 gets an 800; data at -4 with
             # ticks 0, 5, 10 gets a -5.
+            # ... unless the overshoot is negligible (a shaded span ending half
+            # a reach past the last point must not buy a whole extra step)
             ticks = list(ticks)
             step = ticks[1] - ticks[0]
-            if dlo < ticks[0] - 1e-9 * step:
+            tol = EXTEND_TOL * (hi - lo)
+            if dlo < ticks[0] - tol:
                 ticks.insert(0, round(ticks[0] - step, 10))
-            if dhi > ticks[-1] + 1e-9 * step:
+            if dhi > ticks[-1] + tol:
                 ticks.append(round(ticks[-1] + step, 10))
             if ticks[0] < lo or ticks[-1] > hi:
                 set_lim(min(lo, ticks[0]), max(hi, ticks[-1]))
@@ -294,6 +311,60 @@ def offset_spines(ax: Union[plt.Axes, plt.Figure, None] = None, offset: float = 
             _restore_label_style(axis, style)
     if trim:
         trim_spines(ax, spines)
+
+
+def bracket_xticks(ax: Union[plt.Axes, plt.Figure, None] = None, half_width: float = 0.4,
+                   offset: float = 4, arm: float = 3, drop: float = 3, gap: float = 2,
+                   positions=None, labels=None, color=None, lw=None) -> None:
+    """Replace a grouped categorical x axis's ticks with BRACKETS: under each
+    category a horizontal bar spanning `half_width` either side of its centre
+    (data units -- seaborn's `width` / 2, 0.4 for its default 0.8), with its
+    ends turned up toward the data (`arm` pt) and a tick down from its middle
+    (`drop` pt) to the label. So a group of hue-split violins or bars reads as
+    one bracketed unit rather than a row of shapes above a lone tick.
+
+    The bar sits `offset` pt below the axes, where offset_spines puts the
+    spine; the bottom spine is hidden since the brackets replace it, and the
+    ticks become fixed so trim_spines leaves them alone. Call after the layout
+    and after offset_spines. `positions` / `labels` default to the axis's own
+    (a seaborn categorical axis: 0, 1, ... and the category names). On a
+    figure, every axes is done; axes whose tick labels are hidden (a
+    FacetGrid's inner rows) keep them hidden.
+
+    Everything vertical is in points (the arms and the drop are line MARKERS
+    of that size), so the bracket keeps its shape whatever the axes' aspect
+    or the figure's size."""
+    from matplotlib.lines import Line2D, TICKDOWN, TICKUP
+    from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+    if ax is None:
+        ax = plt.gca()
+    axes = ax.axes if isinstance(ax, plt.Figure) else [ax]
+    color = color if color is not None else plt.rcParams["axes.edgecolor"]
+    lw = lw if lw is not None else plt.rcParams["axes.linewidth"]
+    for a in axes:
+        if not a.xaxis.get_visible():             # a twinx partner: its host draws
+            continue
+        pos = list(a.get_xticks()) if positions is None else list(positions)
+        labs = (a.xaxis.get_major_formatter().format_ticks(pos) if labels is None
+                else list(labels))
+        shown = any(t.get_visible() for t in a.xaxis.get_ticklabels())
+        fig = a.figure
+        # data x, axes y, then `offset` pt straight down: y = 0 is the axes'
+        # bottom edge whatever the y limits do afterwards
+        tr = (blended_transform_factory(a.transData, a.transAxes)
+              + ScaledTranslation(0, -offset / 72.0, fig.dpi_scale_trans))
+        style = dict(color=color, transform=tr, clip_on=False, zorder=2.5)
+        for c in pos:
+            a.add_line(Line2D([c - half_width, c + half_width], [0, 0], lw=lw,
+                              solid_capstyle="butt", **style))
+            a.add_line(Line2D([c - half_width, c + half_width], [0, 0], linestyle="none",
+                              marker=TICKUP, markersize=arm, markeredgewidth=lw, **style))
+            a.add_line(Line2D([c], [0], linestyle="none", marker=TICKDOWN, markersize=drop,
+                              markeredgewidth=lw, **style))
+        a.spines["bottom"].set_visible(False)
+        a.set_xticks(pos, labs)                      # fixed: trim_spines skips it
+        a.tick_params(axis="x", which="both", length=0, pad=offset + drop + gap,
+                      labelbottom=shown)
 
 
 def label_panels(fig: plt.Figure, axes=None, x: float = -0.12, y: float = 1.05,
@@ -534,41 +605,73 @@ def colorbar(mappable, ax=None, label: Optional[str] = None, ticks=3, fraction: 
 
 def swarm_ci(ax: plt.Axes, groups, colors=None, labels=None, x=None, ci: float = 1.96,
              point_kw=None, mean_kw=None, ci_kw=None, jitter: float = 0.22, seed: int = 0,
-             mean_ms: float = 5, point_color: str = INK, point_alpha: float = 0.45):
-    """Per-group observations as a jittered swarm in muted ink, with the mean and
-    its confidence interval (mean +- ci * sem) drawn over them in the group's
-    colour -- the honest replacement for a bar behind a swarm.
+             mean_ms: float = 5, point_color: str = INK, point_alpha: float = 0.45,
+             stat: str = "mean", hollow=None, orient: str = "v"):
+    """Per-group observations as a jittered swarm in muted ink, with a summary
+    drawn over them in the group's colour -- the honest replacement for a bar
+    behind a swarm. `stat="mean"`: the mean and its confidence interval (mean
+    +- ci * sem). `stat="median"`: the median and the interquartile range, for
+    skewed or censored data where the mean says little.
 
     `groups` is a list of 1-d arrays; `x` the group positions (default 0..n-1,
     in which case the x limits are set too); `labels` become the x tick
-    labels. `mean_kw` / `ci_kw` restyle the mean marker and interval line, e.g.
+    labels. `hollow`, if given, is one boolean mask per group: those points
+    are drawn as open circles -- e.g. observations censored at a ceiling,
+    which count in the summary but should not read as measured values.
+    `mean_kw` / `ci_kw` restyle the summary marker and interval line, e.g.
     mean_kw=dict(mfc="white") for a hollow marker or ci_kw=dict(ls="--").
-    Returns the x positions used."""
+    `orient="h"` lays the groups out along y instead, values along x -- for a
+    swarm that shares its value axis with a trace drawn above it.
+    Returns the group positions used."""
     import numpy as np
+    if stat not in ("mean", "median"):
+        raise ValueError(f"stat must be 'mean' or 'median', got {stat!r}")
+    if orient not in ("v", "h"):
+        raise ValueError(f"orient must be 'v' or 'h', got {orient!r}")
+    horizontal = orient == "h"
+
+    def pv(pos, val):                        # (position, value) -> (x, y)
+        return (val, pos) if horizontal else (pos, val)
     rng = np.random.default_rng(seed)
     n = len(groups)
     own_x = x is None
     x = np.arange(n, dtype=float) if own_x else np.asarray(x, float)
     colors = list(colors) if colors is not None else COLORS[:n]
+    hollow = [None] * n if hollow is None else list(hollow)
     pk = dict(s=4, lw=0, alpha=point_alpha, color=point_color, zorder=1)
     pk.update(point_kw or {})
-    for xi, g, c in zip(x, groups, colors):
+    for xi, g, c, h in zip(x, groups, colors, hollow):
         g = np.asarray(g, float)
-        g = g[np.isfinite(g)]
+        keep = np.isfinite(g)
+        h = np.zeros(len(g), bool) if h is None else np.asarray(h, bool)
+        g, h = g[keep], h[keep]
         if not len(g):
             continue
-        ax.scatter(xi + rng.uniform(-jitter, jitter, len(g)), g, **pk)
-        m = g.mean()
+        jx = xi + rng.uniform(-jitter, jitter, len(g))
+        ax.scatter(*pv(jx[~h], g[~h]), **pk)
+        if h.any():
+            hk = dict(pk, facecolors="none", edgecolors=pk.get("color", INK),
+                      lw=max(0.5, pk.get("lw", 0) or 0.5))
+            hk.pop("color", None)
+            ax.scatter(*pv(jx[h], g[h]), **hk)
+        if stat == "median":
+            m = float(np.median(g))
+            lo, hi = np.percentile(g, [25, 75]) if len(g) > 1 else (m, m)
+        else:
+            m = float(g.mean())
+            half = ci * g.std(ddof=1) / np.sqrt(len(g)) if len(g) > 1 else 0.0
+            lo, hi = m - half, m + half
         if len(g) > 1:
-            half = ci * g.std(ddof=1) / np.sqrt(len(g))
             ck = dict(color=c, lw=1.5, solid_capstyle="butt", zorder=3)
             ck.update(ci_kw or {})
-            ax.plot([xi, xi], [m - half, m + half], **ck)
+            ax.plot(*pv(np.array([xi, xi]), np.array([lo, hi])), **ck)
         mk = dict(color=c, ms=mean_ms, mew=1.2, zorder=4)
         mk.update(mean_kw or {})
-        ax.plot(xi, m, "o", **mk)
+        ax.plot(*pv(xi, m), "o", **mk)
+    set_ticks = ax.set_yticks if horizontal else ax.set_xticks
+    set_lim = ax.set_ylim if horizontal else ax.set_xlim
     if labels is not None:
-        ax.set_xticks(x, labels)
+        set_ticks(x, labels)
     if own_x:
-        ax.set_xlim(x[0] - 0.6, x[-1] + 0.6)
+        set_lim(x[0] - 0.6, x[-1] + 0.6)
     return x

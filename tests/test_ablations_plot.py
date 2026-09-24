@@ -388,6 +388,23 @@ def test_get_shared_seeds_intersects_across_configs():
 
 # ── circuit variants: derived names registered when their runs are found ──────
 
+def test_display_name_follows_the_base_preset_and_marks_the_savings_twin():
+    """The figures name presets by anatomy (user, 2026-09-24); derived runs
+    inherit the parent's name, only the cleared-buffer twin is marked, and
+    an unlisted preset keeps its run name."""
+    assert MAP.display_name("main") == "Full Circuit"
+    assert MAP.display_name("main_carry") == "Full Circuit"
+    assert MAP.display_name("main_iid_noisy0.001_carry") == "Full Circuit"
+    assert MAP.display_name("main_carry_clearbuf") == "Full Circuit (buffer cleared)"
+    assert MAP.display_name("baseline") == "Motor Cortex"
+    assert MAP.display_name("cb_only_end_to_end") == "Motor Cortex + Cerebellum"
+    assert MAP.display_name("cb_only_end_to_end", wrap=True) == "Motor Cortex\n+ Cerebellum"
+    assert MAP.display_name("main", wrap=True) == "Full Circuit"          # nothing to break
+    assert MAP.display_name("coin") == "COIN"
+    assert MAP.display_name("oracle_geom") == "oracle_geom"
+    assert set(MAP.DISPLAY_NAME) <= set(MAP.CONFIG_COLORS)
+
+
 def test_split_run_name_separates_base_circuit_and_buffer():
     assert MAP.split_run_name("main") == ("main", "", "")
     assert MAP.split_run_name("main_clearbuf") == ("main", "", "_clearbuf")

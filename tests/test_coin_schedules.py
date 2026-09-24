@@ -1,16 +1,21 @@
 """COIN's paradigms as block schedules, the channel plant, EC's experience
 prior, hindsight z relabelling and the observers' visit-count prior.
 
-What has to hold, first of all: EVERYTHING IS INERT BY DEFAULT -- the cycle
-schedule's block list is the one every earlier run used and the config
-defaults name the old behaviour -- so the existing savings/retention runs
-stay reproducible.
+What has to hold, first of all: the paradigm-only MACHINERY is inert under the
+cycle -- the cycle schedule's block list is the one every earlier run used,
+and the readout probe, the z-centroid belief and the null hypothesis stay off
+there.
 
-ONE EXCEPTION, deliberate: observer_count_prior went 0 -> 1 on 2026-09-20
-(user). At 0 an inferred oracle's channel belief relaxes toward UNIFORM, not
-toward the visit frequency, so it never tested the account it exists to test;
-see AblationConfig.observer_count_prior. That changes every inferred-oracle
-run (`coin*`), and only those: no other config reads the term.
+TWO EXCEPTIONS, both deliberate:
+  * observer_count_prior went 0 -> 1 on 2026-09-20 (user). At 0 an inferred
+    oracle's channel belief relaxes toward UNIFORM, not toward the visit
+    frequency, so it never tested the account it exists to test; see
+    AblationConfig.observer_count_prior. That changes every inferred-oracle
+    run (`coin*`), and only those: no other config reads the term.
+  * the paradigms' replay and effort settings became EVERY schedule's
+    defaults on 2026-09-23 (user): the fixed rehearsal budget, the effort
+    cost, the episode buffer and the null-field clear on leaving the warmup.
+    The cycle runs made before that sit in sac_runs/_retired_cycle_v0/.
 """
 import numpy as np
 import pytest
@@ -314,10 +319,10 @@ def test_cli_names_the_paradigm_knobs_in_order():
         sac.config_from_cli(sac._parse_args(["--config", "oracle", "--relabel-z"]))
 
 
-def test_paradigms_default_to_the_episode_buffer():
-    """A paradigm schedule implies replay_units='episodes' with no suffix;
-    --episode-buffer is then a no-op, --transition-buffer opts out with
-    _transbuf, and the cycle schedule keeps transitions (its runs unchanged)."""
+def test_every_schedule_defaults_to_the_episode_buffer():
+    """replay_units='episodes' with no suffix under every schedule (the cycle
+    since 2026-09-23); --episode-buffer is a no-op, --transition-buffer opts
+    out with _transbuf, on the cycle as on a paradigm."""
     base = dict(SW.CONFIG_BY_NAME["baseline"])
     sr = sac.AblationConfig(**sac.apply_cli_variants(base, schedule="spontaneous_recovery"))
     assert sr.replay_units == "episodes" and sr.name == "baseline_rot_sr"
@@ -328,10 +333,10 @@ def test_paradigms_default_to_the_episode_buffer():
                                                       transition_buffer=True, clear_buffer=True))
     assert out.replay_units == "transitions" and out.name == "baseline_rot_savw_transbuf_clearbuf"
     cyc = sac.AblationConfig(**sac.apply_cli_variants(base))
-    assert cyc.replay_units == "transitions" and cyc.name == "baseline"
+    assert cyc.replay_units == "episodes" and cyc.name == "baseline"
     assert sac._parse_args(["--config", "baseline", "--transition-buffer"]).transition_buffer is True
-    with pytest.raises(ValueError):
-        sac.apply_cli_variants(base, transition_buffer=True)          # cycle: nothing to opt out of
+    old = sac.AblationConfig(**sac.apply_cli_variants(base, transition_buffer=True))
+    assert old.replay_units == "transitions" and old.name == "baseline_transbuf"
     with pytest.raises(ValueError):
         sac.apply_cli_variants(dict(SW.CONFIG_BY_NAME["baseline"]), schedule="spontaneous_recovery",
                                episode_buffer=True, transition_buffer=True)
@@ -482,31 +487,41 @@ def _count_clears(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("schedule,n_clears", [("spontaneous_recovery", 1), ("evoked_recovery", 1),
-                                                ("savings_washout", 0)])
-def test_null_field_block_is_never_replayed(schedule, n_clears, tmp_path, monkeypatch):
-    """A replay run clears the buffer ONCE, on leaving the logged P0 block,
-    and never otherwise: SR and ER have one P0 block, savings-washout has
-    none (its baseline is a trained context and is replayed)."""
+@pytest.mark.parametrize("schedule,warmup,n_clears", [
+    ("spontaneous_recovery", 2, 1), ("evoked_recovery", 2, 1), ("savings_washout", 2, 1),
+    ("spontaneous_recovery", 0, 1), ("evoked_recovery", 0, 1), ("savings_washout", 0, 0)])
+def test_null_field_block_is_never_replayed(schedule, warmup, n_clears, tmp_path, monkeypatch):
+    """A replay run clears the buffer ONCE, on leaving null-field data for
+    the first real context, and never otherwise. SR and ER: on leaving P0
+    (warmup -> P0 is null field to null field and does not clear). Savings-
+    washout has no P0 -- its baseline is a trained context and is replayed --
+    so the clear falls on leaving the warmup, and with no warmup there is
+    none. The channel never clears (ER's evoked P+ needs the buffer)."""
     monkeypatch.setattr(sac, "RUN_DIR", str(tmp_path / "sac_runs"))
     monkeypatch.setattr(sac, "FIG_DIR", str(tmp_path / "figs"))
     calls = _count_clears(monkeypatch)
     cfg = sac.AblationConfig(**sac.apply_cli_variants(SW.CONFIG_BY_NAME["baseline"], schedule=schedule))
     assert not cfg.clear_buffer_on_switch                              # replay is the paradigm default
-    sac.main(cfg, seeds=1, save_agg=False, workers=1, **_TINY)
-    assert len(calls) == n_clears and all(n > 0 for n in calls)      # the P0 data were there to drop
+    sac.main(cfg, seeds=1, save_agg=False, workers=1, **{**_TINY, "warmup_episodes": warmup})
+    assert len(calls) == n_clears and all(n > 0 for n in calls)      # the null-field data were there to drop
     sac.apply_phase_set(sac.DEFAULT_PHASE_SET)
 
 
-def test_cycle_and_clearbuf_clearing_are_unchanged(tmp_path, monkeypatch):
-    """The cycle schedule's warmup is a null-field block too, but unlogged:
-    a cycle replay run never clears; a clearbuf paradigm run clears at every
-    logged switch as before (the P0 rule adds nothing on top)."""
+def test_cycle_clears_once_on_leaving_the_warmup_and_clearbuf_is_unchanged(tmp_path, monkeypatch):
+    """The cycle schedule's warmup is a null-field block too, unlogged. Since
+    2026-09-23 a cycle replay run clears ONCE, on leaving it for the first
+    rotation block (before that the warmup rode into that block); with no
+    warmup there is nothing to clear. A clearbuf paradigm run clears at every
+    logged switch as before (the null-field rule adds nothing on top)."""
     monkeypatch.setattr(sac, "RUN_DIR", str(tmp_path / "sac_runs"))
     monkeypatch.setattr(sac, "FIG_DIR", str(tmp_path / "figs"))
     calls = _count_clears(monkeypatch)
     kw = {k: v for k, v in _TINY.items() if k != "coin_block_ep"}
     sac.main(sac.AblationConfig(**SW.CONFIG_BY_NAME["baseline"]), seeds=1, save_agg=False, workers=1, **kw)
+    assert len(calls) == 1 and calls[0] > 0                          # the warmup data were there to drop
+    calls.clear()
+    sac.main(sac.AblationConfig(**SW.CONFIG_BY_NAME["baseline"]), seeds=1, save_agg=False, workers=1,
+             **{**kw, "warmup_episodes": 0})
     assert calls == []
     cfg = sac.AblationConfig(**sac.apply_cli_variants(SW.CONFIG_BY_NAME["baseline"],
                                                       schedule="spontaneous_recovery", clear_buffer=True))
@@ -687,3 +702,6 @@ def test_paradigm_run_logs_a_z_belief_and_a_cycle_run_does_not(tmp_path, monkeyp
              **{k: v for k, v in _TINY.items() if k != "coin_block_ep"})
     cyc_df = pd.read_csv(tmp_path / "sac_runs" / cyc.name / "aggregated_results.csv")
     assert cyc_df[cols].isna().all().all()
+    # the cycle run above rebound the module's set to rotations; without this
+    # the next test FILE inherits it (test_phase_set's rebinding test fails)
+    sac.apply_phase_set(sac.DEFAULT_PHASE_SET)

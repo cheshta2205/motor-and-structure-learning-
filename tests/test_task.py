@@ -45,11 +45,17 @@ def _spread(per_family=2):
 def test_contexts_are_three_flat_families_of_four():
     assert T.FAM_NAMES == ["rotation", "curl", "drift"]
     assert T.N_CONTEXTS == len(T.ROT_ANGLES) + len(T.CURL_GAINS) + len(T.DRIFT_ANGLES) == 12
-    assert set(T.FAMILY.values()) == {0, 1, 2}
+    # over the TABLE: registered off-table contexts (task.rotation_id,
+    # task.register_linear) share the dict under ids >= EXTRA_ID_BASE
+    assert set(T.FAMILY[c] for c in range(T.N_CONTEXTS)) == {0, 1, 2}
     per = [sum(1 for c in range(T.N_CONTEXTS) if T.FAMILY[c] == f)
            for f in range(len(T.FAM_NAMES))]
     assert per == [4, 4, 4]
-    assert len(set(T.C_LABEL.values())) == T.N_CONTEXTS       # labels unique
+    # labels unique over the TABLE; registered off-table rotations
+    # (task.rotation_id) share these dicts under ids >= EXTRA_ID_BASE
+    table_labels = [T.C_LABEL[c] for c in range(T.N_CONTEXTS)]
+    assert len(set(table_labels)) == T.N_CONTEXTS
+    assert all(T.is_table_context(c) for c in range(T.N_CONTEXTS))
     assert T.ROT_ANGLES == [-60.0, -30.0, 30.0, 60.0]
 
 
