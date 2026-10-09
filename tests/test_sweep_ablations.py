@@ -9,7 +9,7 @@ import sac
 import sweep_ablations as SW
 
 
-CORE = ["baseline", "oracle", "coin", "coin_cb", "oracle_geom", "main", "control",
+CORE = ["baseline", "oracle", "coin", "coin_cb", "coin_open", "oracle_geom", "main", "control",
         "end_to_end", "cb_only_end_to_end"]
 
 
@@ -17,9 +17,10 @@ def test_config_presets_are_the_core_and_their_clearbuf_twins():
     """The table was cut back to the core presets on 2026-09-16 -- the
     oracle_snr ladder, the gp circuit and the no_cb lesion were removed -- and
     every core preset has exactly one *_clearbuf twin. Nothing else. `coin`
-    (the inferred oracle) joined the core on 2026-09-17."""
+    (the inferred oracle) joined the core on 2026-09-17, `coin_open` (COIN
+    with its novel-context process) on 2026-10-08."""
     names = list(SW.CONFIG_BY_NAME)
-    assert len(names) == len(set(names)) == 18
+    assert len(names) == len(set(names)) == 20
     assert set(names) == set(CORE) | {f"{c}_clearbuf" for c in CORE}
     assert list(SW.CORE_PRESETS) == CORE
     # every preset's dict must name itself: the run directory is config.name

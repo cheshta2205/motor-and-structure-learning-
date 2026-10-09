@@ -307,6 +307,18 @@ def test_criterion_crossing_not_reported_before_the_smoothing_window():
     assert crossing == MAP.TRACE_SMOOTH_WINDOW - 1
 
 
+def test_criterion_crossing_at_criterion_from_the_start_but_drifting_down_is_not_censored():
+    """The regression of 2026-10-07: a block above criterion from its first
+    episode that ends a little lower than it began (the savings probes'
+    revisit, 1.0 -> 0.9) must report the window edge like any other block that
+    starts above criterion -- not the block end. The old endpoint heuristic
+    took it to be approaching the criterion from above."""
+    values = np.concatenate([np.full(200, 1.0), np.full(200, 0.9)])
+    crossing = MAP.estimate_criterion_crossing_episode(
+        np.arange(len(values), dtype=float), values, target=0.8)
+    assert crossing == MAP.TRACE_SMOOTH_WINDOW - 1
+
+
 def test_criterion_trace_consistency_is_tight_on_a_bimodal_block():
     """Same data as the lucky-run test, checked from the other side: the
     criterion episode and the plotted-trace crossing must now be the same
@@ -421,8 +433,25 @@ def test_split_run_name_separates_base_circuit_and_buffer():
     assert MAP.base_config("coin_rot_savw_cprior_clearbuf") == "coin"
     assert MAP._replay_off("main_clearbuf") and not MAP._replay_off("main")
     assert MAP._replay_off("coin_rot_sr_cprior_clearbuf") and not MAP._replay_off("coin_rot_sr_cprior")
-    assert MAP._model_label("coin_rot_sr_cprior") == "coin · replay"
-    assert MAP._model_label("coin_rot_sr_cprior_clearbuf") == "coin · no replay"
+    assert MAP._model_label("coin_rot_sr_cprior") == "COIN · replay"      # display name since 2026-10-06
+    assert MAP._model_label("coin_rot_sr_cprior_clearbuf") == "COIN · no replay"
+    # the cycle-length experiment's task infixes (2026-10-07) parse like the others
+    assert MAP.split_run_name("main_n2rot_ep300_carry") == ("main", "_n2rot_ep300_carry", "")
+    assert MAP.base_config("baseline_n3") == "baseline"
+    assert MAP.display_name("coin_n2mix_ep300") == "COIN"
+
+
+def test_cycle_cell_reads_n_composition_and_block_length_off_the_name():
+    import sac
+    assert MAP.cycle_cell("main_carry") == (6, "mixed", sac.N_PHASE_EP)
+    assert MAP.cycle_cell("baseline_n2rot_pr") == (2, "pair_rotations", sac.N_PHASE_EP)
+    assert MAP.cycle_cell("coin_n2mix") == (2, "pair_mixed", sac.N_PHASE_EP)
+    assert MAP.cycle_cell("main_n3_ep300_pr_carry_clearbuf") == (3, "triple", 300)
+    assert MAP.cell_tag("main_carry") == "n6"
+    assert MAP.cell_tag("baseline_n2rot_pr") == "n2rot"
+    assert MAP.cell_tag("main_n2rot_ep300_pr_carry") == "n2rot_ep300"
+    # _n2rot must not be mistaken for the rotations-family set (_rot)
+    assert MAP.cycle_cell("baseline_rot_sr")[1] == "rotations"
 
 
 def test_register_circuit_variant_derives_slot_shade_and_twins(monkeypatch):

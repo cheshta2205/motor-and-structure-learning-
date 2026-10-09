@@ -18,6 +18,9 @@ TWO POOLED, into figures/<arm>/across_seeds/ :
 
   ablation_seeds.png       the main figure, banded across TRAINING SEEDS
   switch_aligned_seeds.png the same for the switch-aligned window
+  training_seeds.png       training history and context confusion, pooled:
+                           MSE and within-family decoding by epoch, banded
+                           across seeds, and the seed-averaged confusion of z
 
 WHICH ERROR BAR.  A per-seed band is +-1 SD over decoder train/test SPLITS: how
 precisely context can be read out of THIS network. 
@@ -45,13 +48,13 @@ import numpy as np
 import torch
 from matplotlib.lines import Line2D
 from plotting_utils import (use_paper_style, offset_spines, PALETTE, INK, MUTED, figsize,
-                            plot_band, chance_line, label_panels, save)
+                            plot_band, chance_line, label_panels, save, colorbar)
 
 import model as M
 import oracle as O
 from data import generate_sequences
 from decode import by_tss, family_by_tss
-from task import (CONTEXTS, N_CONTEXTS, FAMILY, FAM_NAMES, DT, MASS,
+from task import (CONTEXTS, N_CONTEXTS, FAMILY, FAM_NAMES, C_LABEL, DT, MASS,
                   POS_SCALE, VEL_SCALE, POS_LIM, TSS_MIN, RHO, force_of)
 
 N_SEQ    = 1200
@@ -132,6 +135,9 @@ def collect(arm, seed, n=N_SEQ, action_mode=M.DEFAULT_ACTION_MODE):
            "fam": ctx[:, :, 1].numpy().astype(int),
            "tss": tss.numpy(),
            "sid": np.repeat(np.arange(n)[:, None], trans.shape[1], 1)}
+    # the observation stream, for the velocity CHANGE: pred[:, t] and tgt[:, t]
+    # are the next state, obs[:, t] the current one (model.rollout's timing)
+    obs = M.build(trans)[0]
     for mode, _, _, _ in COND:
         with torch.no_grad():
             z, pred, tgt = M.rollout(ec, cb, trans, arm, mode,
@@ -145,13 +151,43 @@ def collect(arm, seed, n=N_SEQ, action_mode=M.DEFAULT_ACTION_MODE):
         # see multimodality.position_invariance -- so that is what `se` is.
         out[mode] = {"z": z.numpy(), "pred": pred.numpy(),
                      "se": e[..., 2:].mean(-1).numpy(),
-                     "se_pos": e[..., :2].mean(-1).numpy()}
+                     "se_pos": e[..., :2].mean(-1).numpy(),
+                     # (predicted, actual) velocity CHANGE, v' - v, a fixed random
+                     # subsample of the entries the MSE is taken over, for the
+                     # calibration panel of fig_ablation. The change, not v'
+                     # itself: v' is mostly v carried over, so every condition
+                     # sits on the identity in v'; what the context determines,
+                     # and the ablations lose, is the increment.
+                     "scatter": _velocity_scatter(pred[:, :-1, 2:] - obs[:, :-1, 2:],
+                                                  tgt[:, :-1, 2:] - obs[:, :-1, 2:])}
         out[mode]["mse"] = float(out[mode]["se"].mean())
         # kept for the convergence check: the two should sit in the ratio
         # (VEL_SCALE/POS_SCALE)^2 once the heads tie -- see model.ALPHA
         out[mode]["mse_pos"] = float(out[mode]["se_pos"].mean())
         print(f"    [{arm} seed {seed}] {mode} rolled out", flush=True)
     return out
+
+
+N_SCATTER = 3000
+
+
+def _velocity_scatter(pred, tgt, n=N_SCATTER, seed=0):
+    """`n` (predicted, actual) pairs drawn without replacement from every
+    component of every (sequence, step) of the arrays given: the two components are
+    pooled, since the plant is isotropic and the question is calibration, not
+    direction. Returns (pred, actual) float arrays."""
+    p = np.asarray(pred, float).ravel()
+    t = np.asarray(tgt, float).ravel()
+    idx = np.random.default_rng(seed).choice(len(p), size=min(n, len(p)), replace=False)
+    return p[idx], t[idx]
+
+
+def prediction_scatter(arm, seed, action_mode=M.DEFAULT_ACTION_MODE):
+    """{mode: (pred, actual)} for one seed from a fresh rollout -- the cheap
+    part of collect (no decoders), for pooling across seeds whose saved npz
+    predates the scatter keys."""
+    d = collect(arm, seed, action_mode=action_mode)
+    return None if d is None else {m: d[m]["scatter"] for m, _, _, _ in COND}
 
 
 def curves(d):
@@ -233,75 +269,150 @@ def fig_mtl_control(arm, seed, r, path):
     print(f"    saved -> {path}", flush=True)
 
 
-def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None):
-    """The main figure: MSE per condition, then one decoding panel per readout.
+def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
+                 switch=None):
+    """The main figure, 2 x 3 at double-column width:
 
-    Built at double-column width with the style's type (no per-call font
-    sizes), one y label per row with inner tick labels dropped, and the
-    which-error-bar note in <path>_caption.txt rather than a suptitle
-    (plotting_utils follow-ups 1, 2, 5). Written as PDF + PNG."""
-    ncol = int(np.ceil((1 + len(READOUTS)) / 2))
-    fig, axes = plt.subplots(2, ncol, figsize=figsize("double", height=4.4),
+      a  calibration: predicted against actual velocity component, per
+         condition -- faint points and the binned mean, against the identity
+      b  held-out velocity MSE per condition
+      c  decoding of the context among all N_CONTEXTS vs steps since switch
+      d-f  per family: decoding in a window around the switch with e lesioned
+           ONLY in that window (fig_switch's panels; user, 2026-10-07) when
+           `switch` is given, else decoding vs steps since switch
+
+    "Which family?" is left to fig_global. `scatter` is {mode: (pred, actual)};
+    when None it is read off `d` (a rollout dict). `switch` is
+    {(mode, family): (mean over OFFSETS, sd)} -- fig_switch's `band`; sd may
+    be None for a single seed.
+    Style type throughout, one y label per row, caption file beside the PDF."""
+    panels = ["all"] + LEVELS           # c: all contexts; d-f: per family (user, 2026-10-07)
+    fig, axes = plt.subplots(2, 3, figsize=figsize("double", height=4.4),
                              layout="constrained")
     ax = axes.ravel()
-    for k in range(1 + len(READOUTS), len(ax)):
-        ax[k].axis("off")
-    # d[m] is a rollout dict (per seed: one MSE), a float, or an ARRAY of
-    # per-seed MSEs (across_seeds): then the bar is the mean with a +-1 SD
-    # whisker and one dot per seed, and the label quotes both.
+    axS, axM, dec = ax[0], ax[1], list(ax[2:2 + len(panels)])
+
+    # a: the prediction RESIDUAL, actual - predicted velocity change, as one
+    # density per condition. Calibration was tried first (predicted vs actual
+    # change): every condition sits on the identity with slope 0.92-1.03, so
+    # the ablations do not bias the prediction -- they widen it, and a
+    # density shows that where overlapping scatters could not (user,
+    # 2026-10-07). SD of the residual is printed per condition.
+    if scatter is None and all(isinstance(d[m], dict) and "scatter" in d[m] for m, _, _, _ in COND):
+        scatter = {m: d[m]["scatter"] for m, _, _, _ in COND}
+    if scatter:
+        from scipy.stats import gaussian_kde
+        res = {m: np.asarray(t, float) - np.asarray(p, float) for m, (p, t) in scatter.items()}
+        # window from the 99th percentile of |residual|: wall contacts leave a
+        # few residuals of a whole speed cap that would otherwise set the axis
+        lim = float(np.ceil(np.percentile(np.abs(np.concatenate(list(res.values()))), 99) * 10) / 10)
+        lim = max(lim, 0.1)
+        grid = np.linspace(-lim, lim, 400)
+        for mode, lab, col, ls in COND:
+            r_ = res[mode]
+            dens = gaussian_kde(r_[np.abs(r_) <= lim])(grid)
+            axS.plot(grid, dens, ls, color=col, lw=1.4,
+                     label=f"$\\sigma$ = {r_.std():.3f}")
+        axS.axvline(0, ls=":", color=MUTED, lw=0.8, zorder=0)
+        axS.set_xlim(-lim, lim); axS.set_ylim(0, None)
+        axS.set_xlabel("actual $-$ predicted $\\Delta v$"); axS.set_ylabel("density")
+        axS.set_title("prediction residual")
+        # the SDs, in the condition colours, where the curves have fallen off
+        leg = axS.legend(loc="upper right", handlelength=0, handletextpad=0)
+        for t, (_, _, col, _) in zip(leg.get_texts(), COND):
+            t.set_color(col)
+        for h in leg.legend_handles:
+            h.set_visible(False)
+    else:
+        axS.axis("off")
+
+    # b: MSE. d[m] is a rollout dict (one MSE), a float, or an ARRAY of
+    # per-seed MSEs (across_seeds): then mean, +-1 SD whisker, one dot per seed.
     per_seed = [np.atleast_1d(d[m]["mse"] if isinstance(d[m], dict) else d[m]).astype(float)
                 for m, _, _, _ in COND]
     ms = [v.mean() for v in per_seed]
-    ax[0].bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62, zorder=1)
+    axM.bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62, zorder=1)
     for k, v in enumerate(per_seed):
         if len(v) > 1:
-            ax[0].errorbar(k, v.mean(), v.std(ddof=1), color=INK, lw=0.8, capsize=0, zorder=3)
-            ax[0].scatter(k + np.linspace(-0.18, 0.18, len(v)), v, s=4, color=INK,
-                          alpha=0.5, lw=0, zorder=2)
-    ax[0].set_xticks(range(len(COND)), [l for _, l, _, _ in COND])
-    ax[0].set_ylabel("velocity MSE")
-    ax[0].set_title("prediction")
+            axM.errorbar(k, v.mean(), v.std(ddof=1), color=INK, lw=0.8, capsize=0, zorder=3)
+            axM.scatter(k + np.linspace(-0.18, 0.18, len(v)), v, s=4, color=INK,
+                        alpha=0.5, lw=0, zorder=2)
+    axM.set_xticks(range(len(COND)), [l for _, l, _, _ in COND])
+    axM.set_ylabel("velocity MSE")
+    axM.set_title("prediction error")
     for k, v in enumerate(per_seed):
-        top = v.mean() + (v.std(ddof=1) if len(v) > 1 else 0.0)
-        top = max(top, v.max())
+        top = max(v.mean() + (v.std(ddof=1) if len(v) > 1 else 0.0), v.max())
         text = f"{v.mean():.4f}" if len(v) == 1 else f"{v.mean():.4f}\n±{v.std(ddof=1):.4f}"
-        ax[0].annotate(text, (k, top), xytext=(0, 1.5), textcoords="offset points",
-                       ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
-    # LEVEL readouts are titled in their level's colour; the whole-factor
-    # readouts (family / all contexts) are not levels and stay in ink
-    ttl = {"family": "which family?", "all": f"which context? (all {N_CONTEXTS})"}
-    dec = list(ax[1:1 + len(READOUTS)])
-    for a, ro in zip(dec, READOUTS):
+        axM.annotate(text, (k, top), xytext=(0, 1.5), textcoords="offset points",
+                     ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
+
+    # c-f: decoding. LEVEL readouts are titled in their level's colour; the
+    # all-contexts readout is not a level and stays in ink.
+    ttl = {"all": f"which context? (all {N_CONTEXTS})"}
+    for a, ro in zip(dec, panels):
         if a is not dec[0]:
             a.sharey(dec[0])
-        for mode, lab, col, ls in COND:
-            mu, sd = r[(mode, ro)]
-            plot_band(a, KS, mu, sd, color=col, ls=ls, label=lab)
+        if switch is not None and ro in LEVELS:
+            # the switch-aligned lesion: e removed PRE steps before to POST - 1
+            # after each switch and decoded in that window
+            for mode, lab, col, ls in COND:
+                mu, sd = switch[(mode, ro)]
+                if sd is None:
+                    a.plot(OFFSETS, mu, ls, color=col, marker="o", ms=3, lw=1.2, label=lab)
+                else:
+                    plot_band(a, OFFSETS, mu, sd, color=col, ls=ls, label=lab)
+            a.axvline(-.5, color=MUTED, lw=.8)       # the switch
+            a.set_xticks(OFFSETS)
+            a.set_xlabel("steps relative to switch")
+        else:
+            for mode, lab, col, ls in COND:
+                mu, sd = r[(mode, ro)]
+                plot_band(a, KS, mu, sd, color=col, ls=ls, label=lab)
+            a.set_xlabel("steps since context switch")
         ch = _chance(ro)
-        chance_line(a, ch, f"chance {ch:.2f}")
+        if switch is not None and ro in LEVELS:
+            # every condition sits at chance just after the switch, so the
+            # label goes below the line at the left, where nothing is
+            chance_line(a, ch, f"chance {ch:.2f}", x=0.0, above=False)
+            for t in a.texts:
+                if t.get_text().startswith("chance"):
+                    t.set_ha("left")
+        else:
+            chance_line(a, ch, f"chance {ch:.2f}")
         a.set_ylim(0, 1)
         a.set_title(ttl.get(ro, ro), color=INK if ro in ttl else FCOL.get(ro, INK))
-        a.set_xlabel("steps since context switch")
-    # one y label per row (the first decoding panel of each), inner labels off
-    row_first = {axes[i, 1 if i == 0 else 0] for i in range(axes.shape[0])}
+    # one y label per row: the first decoding panel of each row
     for a in dec:
-        if a in row_first:
+        if a in (axes[0, 2], axes[1, 0]):
             a.set_ylabel("decoding accuracy")
         else:
             a.tick_params(labelleft=False)
     fig.legend(handles=_handles(), ncol=len(COND), loc="outside upper center")
     if band == "split":
-        err = (f"Line: mean over {N_SPLITS} sequence-level decoder splits; band: +-1 SD "
-               f"across splits, an internal check and not the error bar to quote "
+        err = (f"Decoding line: mean over {N_SPLITS} sequence-level decoder splits; band: "
+               f"+-1 SD across splits, an internal check and not the error bar to quote "
                f"(see across_seeds/).")
     else:
-        err = (f"Line: mean over {n_seed} training seeds; band: +-1 SD across them, "
-               f"the error bar to quote. In (a) the bar is the mean MSE over seeds, "
-               f"the whisker +-1 SD and each dot one seed.")
+        err = (f"Decoding line: mean over {n_seed} training seeds; band: +-1 SD across "
+               f"them, the error bar to quote. In (b) the bar is the mean MSE over "
+               f"seeds, the whisker +-1 SD and each dot one seed.")
     caption = (f"{ARM_TITLE.get(arm, arm)}: is the cerebellar error necessary? "
-               f"(a) Held-out velocity MSE per condition. (b-f) Linear decoding of "
-               f"context from z against steps since the context switch, per readout; "
-               f"dotted line is chance. {err}")
+               f"(a) Residual of the predicted velocity change, actual minus predicted "
+               f"v' - v in units of the speed cap, both components pooled over {N_SCATTER} "
+               f"held-out entries per condition: a kernel density per condition with its "
+               f"SD. Predicted against actual change lies on the identity for every "
+               f"condition (slopes 0.92-1.03), so the ablations widen the prediction "
+               f"rather than bias it. "
+               f"(b) Held-out velocity MSE per condition. (c) Linear decoding of the "
+               f"context among all {N_CONTEXTS} from z against steps since the context "
+               f"switch; dotted line is chance. "
+               + (f"(d-f) Per family, e lesioned only in a window from {PRE} steps before "
+                  f"to {POST - 1} after a context switch (grey line) and the context "
+                  f"decoded in that window: decoding falls on both sides of the switch, so "
+                  f"the error feeds a continuous state estimate rather than a change "
+                  f"detector alone. " if switch is not None else
+                  f"(d-f) The same within each family. ")
+               + err)
     offset_spines(fig)
     label_panels(fig, [a for a in ax if a.axison])
     save(fig, path, caption=caption)
@@ -463,6 +574,147 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     print(f"  saved -> {path}")
 
 
+def fig_training_seeds(arm, seeds, path, action_mode=M.DEFAULT_ACTION_MODE, site="z"):
+    """The prediction task across TRAINING SEEDS (user, 2026-10-09): (a)
+    held-out velocity MSE by epoch, overall and per family; (b) within-family
+    linear decoding of context from z at the tracked epochs; (c) the 12-way
+    context confusion of z, row-normalised per seed and averaged.
+
+    Reads each seed's track.npz (written only by train()) and
+    confusion_<site>.npz (representation_analysis --confusion). Seeds missing
+    either are skipped for that panel, and the counts actually used are in the
+    caption. MSE is pooled on a LOG scale -- geometric mean, band x/÷ one
+    geometric SD -- because it spans decades and an arithmetic SD band would
+    cross zero; decoding is mean +- SD."""
+    from representation_analysis import ORDER, _within_family_mass
+    tracks, confs = {}, {}
+    for s_ in seeds:
+        d = M.fig_dir(arm, s_, action_mode=action_mode)
+        pt, pc = os.path.join(d, "track.npz"), os.path.join(d, f"confusion_{site}.npz")
+        if os.path.exists(pt):
+            tracks[s_] = np.load(pt)
+        if os.path.exists(pc):
+            confs[s_] = np.load(pc, allow_pickle=True)["C"]
+    if not tracks and not confs:
+        print(f"  {arm}: no track.npz or confusion_{site}.npz to pool; skipping training_seeds")
+        return
+    # a seed whose history is a different length cannot be banded with the rest
+    if tracks:
+        n_ep = min(len(z["hist"]) for z in tracks.values())
+        levels = [str(l) for l in next(iter(tracks.values()))["levels"]]
+
+    fig = plt.figure(figsize=figsize("double", height=4.4), layout="constrained")
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.15])
+    axM, axD = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0], sharex=None)
+    axC = fig.add_subplot(gs[:, 1])
+
+    if tracks:
+        ep = np.arange(1, n_ep + 1)
+        H = np.log10(np.array([z["hist"][:n_ep] for z in tracks.values()], float))
+        P = np.log10(np.array([z["per_fam"][:n_ep] for z in tracks.values()], float))
+        def geo(L):
+            m, sd = L.mean(0), L.std(0)
+            return 10 ** m, 10 ** (m - sd), 10 ** (m + sd)
+        m, lo, hi = geo(H)
+        plot_band(axM, ep, m, lo=lo, hi=hi, color=INK, label="overall", marker=None)
+        for i, f in enumerate(levels):
+            m, lo, hi = geo(P[:, :, i])
+            plot_band(axM, ep, m, lo=lo, hi=hi, color=FCOL[f], label=f, marker=None, lw=0.9)
+        axM.set_yscale("log")
+        # plain decimal ticks at round values inside the data, no minor labels
+        from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+        lo_v, hi_v = float(np.min(10 ** P.mean(0))), float(np.max(10 ** H.mean(0)))
+        lo_v, hi_v = min(lo_v, float(10 ** H.mean(0).min())), max(hi_v, float(np.max(10 ** P.mean(0))))
+        cands = [k * 10.0 ** e for e in range(-5, 2) for k in (1, 1.5, 2, 3, 4, 5, 7)]
+        # enclose the data: the round value just below the minimum and just
+        # above the maximum, and the round values between
+        below = max(t for t in cands if t <= lo_v)
+        above = min(t for t in cands if t >= hi_v * 0.98)
+        ticks = [t for t in cands if below <= t <= above]
+        if len(ticks) > 5:
+            ticks = ticks[::2] if ticks[::2][-1] == ticks[-1] else ticks[::2] + [ticks[-1]]
+        axM.set_ylim(below, above)
+        axM.yaxis.set_major_locator(FixedLocator(ticks))
+        axM.yaxis.set_minor_locator(NullLocator())
+        axM.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        axM.set_xlabel("Epoch"); axM.set_ylabel("Held-out velocity MSE")
+        axM.legend(loc="upper right", ncol=2)
+        dec_ep = next(iter(tracks.values()))["dec_ep"]
+        for f in levels:
+            if not all(f in z.files for z in tracks.values()):
+                continue
+            R = np.array([z[f][:len(dec_ep)] for z in tracks.values()], float)
+            plot_band(axD, dec_ep, R.mean(0), R.std(0), color=FCOL[f], label=f)
+        ch = _chance(levels[0])
+        chance_line(axD, ch, "Chance")
+        axD.set_ylim(0, 1.0)
+        axD.set_xlabel("Epoch"); axD.set_ylabel("Within-family decoding")
+    else:
+        for a in (axM, axD):
+            a.text(0.5, 0.5, "no training history", ha="center", va="center",
+                   color=MUTED, transform=a.transAxes)
+
+    acc_txt = ""
+    if confs:
+        C = np.mean(list(confs.values()), 0)
+        im = axC.imshow(C, cmap="paper_seq", vmin=0, vmax=1)
+        def two_line(label):
+            # family over identity (user, 2026-10-09): 'rot -60' -> 'rotation\n(−60°)'
+            kind, _, val = label.partition(" ")
+            fam = {"rot": "rotation", "curl": "curl", "drift": "drift"}.get(kind, kind)
+            val = val.replace("-", "−")
+            unit = "°" if kind in ("rot", "drift") else ""
+            return f"{fam}\n({val}{unit})" if val else label
+        labels = [two_line(C_LABEL[c]) for c in ORDER]
+        axC.set_xticks(range(N_CONTEXTS)); axC.set_yticks(range(N_CONTEXTS))
+        # two-line labels, each centred on its own tick
+        axC.set_xticklabels(labels, rotation=90, ha="center", va="top", multialignment="center")
+        axC.set_yticklabels(labels, ha="center", va="center", multialignment="center")
+        fig.canvas.draw()
+        # centred y labels need a pad of half the widest label to clear the axis
+        w = max(t.get_window_extent().width for t in axC.get_yticklabels())
+        axC.tick_params(axis="y", pad=w / 2 * 72 / fig.dpi + 3)
+        axC.set_xlabel("Predicted context"); axC.set_ylabel("True context")
+        bnd = np.cumsum([sum(1 for c in ORDER if FAMILY[c] == f)
+                         for f in range(len(FAM_NAMES))])[:-1] - .5
+        for x in bnd:
+            axC.axhline(x, color="w", lw=1.2); axC.axvline(x, color="w", lw=1.2)
+        for sp in axC.spines.values():
+            sp.set_visible(False)
+        axC.tick_params(length=0)
+        colorbar(im, ax=axC, label="P(predicted | true)")
+        accs = np.array([float(np.mean(np.diag(c))) for c in confs.values()])
+        wf = _within_family_mass(C)
+        acc_txt = (f" Accuracy {accs.mean():.2f} +- {accs.std():.2f} (chance "
+                   f"{1 / N_CONTEXTS:.2f}); {wf['family']:.0%} of errors stay inside the "
+                   f"true family (chance {wf['chance']:.0%}).")
+    else:
+        axC.text(0.5, 0.5, "no confusion data", ha="center", va="center",
+                 color=MUTED, transform=axC.transAxes)
+        axC.axis("off")
+
+    for a in (axM, axD):
+        offset_spines(a)
+    label_panels(fig, [axM, axD])
+    # c on the same baseline as a: the square heatmap's top sits lower than a's
+    fig.canvas.draw()
+    ta = next(t for t in axM.texts if t.get_text() == "a")
+    ya = fig.transFigure.inverted().transform(ta.get_window_extent().p0)[1]
+    xc = axC.get_tightbbox().transformed(fig.transFigure.inverted()).x0
+    fig.text(xc, ya, "c", size=9, weight="bold", ha="left", va="bottom")
+    caption = (
+        f"{ARM_TITLE.get(arm, arm)}: the prediction task across training seeds. (a) "
+        f"Held-out velocity MSE by epoch, overall (ink) and per family; geometric mean "
+        f"across {len(tracks)} seeds, band x/÷ one geometric SD. (b) Within-family linear "
+        f"decoding of context from z at the tracked epochs, mean +- SD across "
+        f"{len(tracks)} seeds; dotted line is chance. (c) 12-way linear decoding of context "
+        f"from {site} at the end of training (tss >= {TSS_MIN}): row-normalised confusion "
+        f"averaged over {len(confs)} seeds, contexts grouped by family (white lines)."
+        + acc_txt)
+    save(fig, path, caption=caption)
+    print(f"  saved -> {path}  ({len(tracks)} histories, {len(confs)} confusions)")
+
+
 def fig_forces(arm, seed, d, path):
     """Angle between CB's predicted force and the true one.
 
@@ -619,18 +871,22 @@ def per_seed(arm, seed, action_mode=M.DEFAULT_ACTION_MODE):
     np.savez(os.path.join(out, "decoding.npz"),
              ks=np.array(KS, float),
              **{f"{m}|mse": d[m]["mse"] for m, _, _, _ in COND},
+             **{f"{m}|scatter|{w}": d[m]["scatter"][j]
+                for m, _, _, _ in COND for j, w in ((0, "pred"), (1, "actual"))},
              **{f"{m}|{ro}|{w}": r[(m, ro)][j]
                 for m, _, _, _ in COND
                 for ro in READOUTS + ["family_derived"]
                 for j, w in ((0, "mu"), (1, "sd"))})
-    fig_ablation(arm, seed, d, r, os.path.join(out, "ablation.png"))
+    sa = switch_aligned(arm, seed, action_mode=action_mode)
+    sw_band = ({(m, f): (np.array([sa.get((m, f, o), np.nan) for o in OFFSETS]), None)
+                for m, _, _, _ in COND for f in LEVELS} if sa else None)
+    fig_ablation(arm, seed, d, r, os.path.join(out, "ablation.png"), switch=sw_band)
     fig_mtl_control(arm, seed, r, os.path.join(out, "mtl_control.png"))
     fig_global(arm, seed, r, os.path.join(out, "decoding_global.png"))
     fig_tss(arm, seed, d, os.path.join(out, "tss_curves.png"))
     fig_epochs(arm, seed, os.path.join(out, "epoch_curves.png"),
                action_mode=action_mode)
     fig_forces(arm, seed, d, os.path.join(out, "forces.png"))
-    sa = switch_aligned(arm, seed, action_mode=action_mode)
     if sa:
         np.savez(os.path.join(out, "switch_aligned.npz"),
                  offsets=np.array(OFFSETS),
@@ -675,8 +931,35 @@ def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
                 continue
             R = np.array([z[key] for z in d.values()], float)
             r[(m, ro)] = (R.mean(0), R.std(0))
+    # calibration points pooled across seeds, an equal share from each: read
+    # from the npz where it has them, else one fresh (cheap) rollout
+    per = max(N_SCATTER // n, 1)
+    pooled = {m: ([], []) for m, _, _, _ in COND}
+    for s_, z in d.items():
+        if all(f"{m}|scatter|pred" in z.files for m, _, _, _ in COND):
+            sc = {m: (z[f"{m}|scatter|pred"], z[f"{m}|scatter|actual"]) for m, _, _, _ in COND}
+        else:
+            sc = prediction_scatter(arm, s_, action_mode=action_mode)
+        if sc is None:
+            continue
+        for m, _, _, _ in COND:
+            pooled[m][0].append(sc[m][0][:per]); pooled[m][1].append(sc[m][1][:per])
+    scatter = {m: (np.concatenate(v[0]), np.concatenate(v[1]))
+               for m, v in pooled.items() if v[0]} or None
+    sw = {}
+    for s_ in seeds:
+        p = os.path.join(M.fig_dir(arm, s_, action_mode=action_mode), "switch_aligned.npz")
+        if os.path.exists(p):
+            sw[s_] = np.load(p)
+    sw_band = None
+    if sw:
+        sw_band = {}
+        for m, _, _, _ in COND:
+            for f in LEVELS:
+                R = np.array([z[f"{m}|{f}"] for z in sw.values()], float)
+                sw_band[(m, f)] = (np.nanmean(R, 0), np.nanstd(R, 0))
     fig_ablation(arm, None, mse, r, os.path.join(out, "ablation_seeds.png"),
-                 band="seed", n_seed=n)
+                 band="seed", n_seed=n, scatter=scatter, switch=sw_band)
     # the two honest readouts, pooled the same way.  Bands here are ACROSS
     # SEEDS, unlike the per-seed version where they are across decoder splits.
     if all((m, "family_derived") in r for m, _, _, _ in COND):
@@ -685,19 +968,11 @@ def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
     else:
         print("  (no family_derived in the per-seed npz -- regenerate figures "
               "to pool decoding_global)")
-    sw = {}
-    for s in seeds:
-        p = os.path.join(M.fig_dir(arm, s, action_mode=action_mode), "switch_aligned.npz")
-        if os.path.exists(p):
-            sw[s] = np.load(p)
-    if sw:
-        band = {}
-        for m, _, _, _ in COND:
-            for f in LEVELS:
-                R = np.array([z[f"{m}|{f}"] for z in sw.values()], float)
-                band[(m, f)] = (np.nanmean(R, 0), np.nanstd(R, 0))
+    if sw_band:
         fig_switch(arm, None, None, os.path.join(out, "switch_aligned_seeds.png"),
-                   band=band, n_seed=len(sw))
+                   band=sw_band, n_seed=len(sw))
+    fig_training_seeds(arm, seeds, os.path.join(out, "training_seeds.png"),
+                       action_mode=action_mode)
     print(f"\n{arm}: pooled over {n} seeds {sorted(d)}")
     print(f"  {'readout':<11}{'mode':<10}" + "".join(f"{k:>13}" for k in KS))
     for ro in READOUTS:

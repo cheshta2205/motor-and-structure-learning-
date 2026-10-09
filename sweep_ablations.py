@@ -57,6 +57,12 @@ CONFIG_BY_NAME = {
     # readout (coin_cb - main). NEEDS the (arm, arm_seed) checkpoint.
     "coin_cb": dict(name="coin_cb", use_ec=False, use_cb=False, use_oracle=True,
                     oracle_source="cb", arm="main"),
+    # COIN WITH ITS NOVEL-CONTEXT PROCESS (2026-10-08, user): no fixed
+    # hypothesis set. Contexts are instantiated when a novel hypothesis wins
+    # and each learns its own plant model (sac.OpenObserver). Same channel and
+    # code width as `coin`; the two are meant to be read side by side.
+    "coin_open": dict(name="coin_open", use_ec=False, use_cb=False, use_oracle=True,
+                      oracle_source="open"),
     # The same perfect context label in the CIRCUIT'S OWN geometry rather than
     # a near-orthogonal one: same width, same density, same GP construction,
     # pairwise cosines drawn from z's measured ones. Against "oracle" it asks
@@ -160,8 +166,9 @@ CONFIG_PRESETS = [AblationConfig(**cfg) for cfg in CONFIG_BY_NAME.values()]
 
 
 def run_named_sweep(presets, seeds, arm_seed=0, save_agg=True, workers=None,
-                     make_plots=True, **run_kwargs):
-    """Run every (config, seed) pair, then aggregate and plot.
+                     make_plots=False, **run_kwargs):
+    """Run every (config, seed) pair, then aggregate; plot only on --plots
+    (user, 2026-10-08: the figures are drawn by make_ablations_plot --only).
 
     Pooling lives in sac.run_tasks, shared with sac.main -- which parallelizes
     over the seeds of a single config the same way.
@@ -193,7 +200,8 @@ def presets_for(names, version="retention", episode_buffer=False,
                 action_mode=None, ec_readout=None, rate_beta=None, noise_sigma=None,
                 phase_set=None, train_contexts=None, schedule=None, ec_prior=None,
                 relabel_z=False, count_prior=None, transition_buffer=False,
-                zs_learn_angle=None, zs_max_steps=None, zs_probe_ep=None):
+                zs_learn_angle=None, zs_max_steps=None, zs_probe_ep=None,
+                phase_episodes=None, probe=False, probe_washout=None):
     """The configs a sweep over `names` runs, for one version of the
     experiment or both.
 
@@ -219,7 +227,8 @@ def presets_for(names, version="retention", episode_buffer=False,
                 out.extend(presets_for(names, version, episode_buffer, action_mode, ec_readout,
                                        rate_beta, noise_sigma, phase_set, train_contexts, s,
                                        ec_prior, relabel_z, count_prior, transition_buffer,
-                                       zs_learn_angle, zs_max_steps, zs_probe_ep))
+                                       zs_learn_angle, zs_max_steps, zs_probe_ep,
+                                       phase_episodes, probe, probe_washout))
             return out
         schedule = schedule[0]
     # the zero-shot knobs only reach a zero_shot sweep (apply_cli_variants
@@ -252,7 +261,8 @@ def presets_for(names, version="retention", episode_buffer=False,
         base.append(sac.apply_cli_variants(cfg, episode_buffer=episode_buffer,
                                            transition_buffer=transition_buffer,
                                            phase_set=phase_set, schedule=schedule,
-                                           **knobs, **zs_knob))
+                                           phase_episodes=phase_episodes, probe=probe,
+                                           probe_washout=probe_washout, **knobs, **zs_knob))
     twins = [sac.apply_cli_variants(c, clear_buffer=True) for c in base]
     chosen = {"retention": base, "savings": twins, "both": base + twins}[version]
     seen, out = set(), []
@@ -305,8 +315,18 @@ def _parse_args(argv=None):
     parser.add_argument("--count-prior", type=float, default=None,
                          help="visit-count prior weight, applied to the inferred oracles")
     parser.add_argument("--contexts", default=None, choices=list(sac.PHASE_SETS),
-                         help="which four contexts the task uses, for every selected "
-                              "preset (names get _rot / _refl)")
+                         help="which contexts the task uses, for every selected preset "
+                              "(names get _rot / _refl, or _n2rot / _n2mix / _n3 for the "
+                              "cycle-length subsets)")
+    parser.add_argument("--probe", action="store_true",
+                         help="append the washout and the savings probe branches to every "
+                              "selected preset's cycle (sac.PROBE_ROLES); names get _pr")
+    parser.add_argument("--no-probe-washout", dest="probe_washout", action="store_false", default=None,
+                         help="with --probe: fork the branches from the last cycle block, no "
+                              "washout (the transfer cell); names get _nowash")
+    parser.add_argument("--phase-episodes", type=int, default=None,
+                         help=f"episodes per cycle block (default {sac.N_PHASE_EP}); a "
+                              "non-default value names the run _ep<N>")
     parser.add_argument("--zs-learn-angle", type=float, default=None,
                          help="--schedule zero_shot only: the few-shot block's novel "
                               f"rotation in degrees (default {sac.ZS_LEARN_ANGLE:g}); names "
@@ -320,7 +340,10 @@ def _parse_args(argv=None):
     parser.add_argument("--workers", type=int, default=None,
                          help="parallel processes (default: cpu_count-1; 1 = serial)")
     parser.add_argument("--no-save-agg", dest="save_agg", action="store_false", default=True)
-    parser.add_argument("--no-plots", dest="make_plots", action="store_false", default=True)
+    parser.add_argument("--plots", dest="make_plots", action="store_true", default=False,
+                        help="also draw every cross-config figure after the sweep (off by default)")
+    parser.add_argument("--no-plots", dest="make_plots", action="store_false",
+                        help="kept for old command lines; plots are off by default")
     return parser.parse_args(argv)
 
 
@@ -335,7 +358,8 @@ if __name__ == "__main__":
                           relabel_z=args.relabel_z, count_prior=args.count_prior,
                           transition_buffer=args.transition_buffer,
                           zs_learn_angle=args.zs_learn_angle, zs_max_steps=args.zs_max_steps,
-                          zs_probe_ep=args.zs_probe_ep)
+                          zs_probe_ep=args.zs_probe_ep, phase_episodes=args.phase_episodes,
+                          probe=args.probe, probe_washout=args.probe_washout)
     run_named_sweep(presets, seeds=args.seeds, arm_seed=args.arm_seed,
                      save_agg=args.save_agg, workers=args.workers,
                      make_plots=args.make_plots)

@@ -44,7 +44,8 @@ from scipy.optimize import curve_fit
 from statannotations.Annotator import Annotator
 
 from plotting_utils import (offset_spines, bracket_xticks, use_paper_style, swarm_ci,
-                            chance_line, plot_band, save, figsize, label_panels, INK, MUTED, SHADE)
+                            chance_line, plot_band, figsize, label_panels, INK, MUTED, SHADE)
+from plotting_utils import save as _pu_save
 import sac
 import task as T
 
@@ -74,6 +75,7 @@ CONFIG_COLORS = {
     "oracle": "#f4ac7b",
     "coin": "#238b7e",           # the inferred oracle: its own hue, not an oracle shade
     "coin_cb": "#1b6f65",        # the same, scored through the learned CB
+    "coin_open": "#edb060",      # COIN with its novel-context process: its own hue
     "oracle_geom": "#e0913f",
     # "main"/"control" are the frozen circuits (frozen is the default and so
     # unsuffixed; renamed from main_frozen/control_frozen on 2026-09-16)
@@ -91,6 +93,7 @@ CONFIG_ORDERS = {
     "control": 7,
     # "end_to_end": 8,
     "coin": 9,
+    "coin_open": 9.5,
     # "coin_cb": 10,
 }
 
@@ -143,7 +146,8 @@ _TASK_INFIX = (_TASK_INFIX + "|" if _TASK_INFIX else "") + "|".join(
     [re.escape(s) + (rf"(?:-?{_NUM})?(?:_h[0-9]+)?(?:_p[0-9]+)?" if k == "zero_shot" else "")
      for k, s in sac.SCHEDULE_SUFFIX.items() if s]
     + ["_prior", "_carrymean", "_carry", "_relabel", sac.NOCPRIOR_SUFFIX, "_cprior",
-       sac.TRANSBUF_SUFFIX])
+       sac.TRANSBUF_SUFFIX, r"_ep[0-9]+",           # block length (AblationConfig.phase_episodes)
+       sac.PROBE_SUFFIX, "_nowash"])                 # the savings probes (sac.PROBE_ROLES), washout off
 _TASK_INFIX = rf"(?:{_TASK_INFIX})*"
 _TRAIN_INFIX = "|".join(re.escape(t) for t in sac.M._TRAIN_TAG.values() if t)
 CIRCUIT_INFIX_RE = re.compile(
@@ -217,6 +221,7 @@ DISPLAY_NAME = {
     "baseline": "Motor Cortex",
     "cb_only_end_to_end": "Motor Cortex + Cerebellum",
     "coin": "COIN",
+    "coin_open": "COIN (open set)",
 }
 
 
@@ -229,6 +234,60 @@ def display_name(run: str, wrap: bool = False) -> str:
     if wrap:
         name = name.replace(" + ", "\n+ ")
     return name + (" (buffer cleared)" if tail and "_clearbuf" in tail else "")
+
+
+def display_text(text: str) -> str:
+    """`text` with any run name it starts with replaced by its display name:
+    'main_rot_er_carry' -> 'Full Circuit', 'baseline_rot · replay' -> 'Motor
+    Cortex · replay', 'coin_rot_sr - Success' -> 'COIN - Success'. Text whose
+    first token is not a known preset is returned unchanged, so this is safe
+    to run over every legend entry, tick label and title in a figure."""
+    if not isinstance(text, str) or not text:
+        return text
+    for sep in (" · ", " - ", "\n", ": "):
+        head, found, tail = text.partition(sep)
+        if found:
+            break
+    else:
+        head, tail = text, ""
+    if split_run_name(head)[0] in DISPLAY_NAME and head not in DISPLAY_NAME.values():
+        return display_name(head) + (sep + tail if tail else "")
+    return text
+
+
+def _display_names_everywhere(fig) -> None:
+    """Rewrite run names to display names in every legend, tick label and
+    title of `fig` (figure legends included). Seaborn's hue legends and
+    categorical axes carry the raw `config` column, so this is applied once,
+    at save time, rather than at each of the many call sites."""
+    legends = list(fig.legends) + [a.get_legend() for a in fig.axes]
+    for lg in legends:
+        if lg is None:
+            continue
+        for t in lg.get_texts():
+            t.set_text(display_text(t.get_text()))
+        if lg.get_title() is not None and lg.get_title().get_text() == "config":
+            lg.set_title("")
+    for a in fig.axes:
+        a.set_title(display_text(a.get_title()))
+        a.set_xlabel(display_text(a.get_xlabel())); a.set_ylabel(display_text(a.get_ylabel()))
+        for axis in (a.xaxis, a.yaxis):
+            labs = axis.get_ticklabels()
+            if any(split_run_name(t.get_text())[0] in DISPLAY_NAME and t.get_text()
+                   for t in labs):
+                axis.set_ticks(axis.get_ticklocs()[:len(labs)],
+                               [display_text(t.get_text()) for t in labs])
+    if fig._suptitle is not None:
+        fig._suptitle.set_text(display_text(fig._suptitle.get_text()))
+    for t in fig.texts:
+        t.set_text(display_text(t.get_text()))
+
+
+def save(fig, path, *args, **kwargs):
+    """plotting_utils.save, after rewriting run names to display names
+    everywhere in the figure (see _display_names_everywhere)."""
+    _display_names_everywhere(fig)
+    return _pu_save(fig, path, *args, **kwargs)
 
 
 def _schedule_of(cfg: str) -> str:
@@ -347,6 +406,18 @@ def cycle_only(data: pd.DataFrame) -> pd.DataFrame:
     if data is None or data.empty or "config" not in data.columns:
         return data
     keep = data["config"].astype(str).map(_schedule_of) == "cycle"
+    if "branch" in data.columns:
+        # the savings probe branches are appended to a cycle run but are not
+        # cycle blocks: they have their own figure (see sac.PROBE_ROLES)
+        keep &= data["branch"].isna() | (data["branch"].astype(str).str.strip() == "")
+    return data[keep].copy()
+
+
+def probe_rows(data: pd.DataFrame) -> pd.DataFrame:
+    """The savings probe branches alone (sac.PROBE_ROLES), with `branch` set."""
+    if data is None or data.empty or "branch" not in data.columns:
+        return data.iloc[0:0] if data is not None else data
+    keep = data["branch"].notna() & (data["branch"].astype(str).str.strip() != "")
     return data[keep].copy()
 
 
@@ -610,6 +681,15 @@ def estimate_criterion_crossing_episode(
     25, so no crossing is reported earlier than that. A block already at
     criterion when it starts reports the first episode where the mean can be
     computed, not episode 0.
+
+    The criterion is REACHED FROM BELOW for every metric here (success and
+    return both improve upward), so the crossing is the first smoothed point
+    at or above the target. Until 2026-10-07 the direction was guessed from
+    the trace's endpoints, and a block that started above criterion and
+    drifted slightly down (1.0 -> 0.9) was taken to approach it from above,
+    searched for a downward crossing, found none and was reported as never
+    reached -- the savings probes' revisit and novel-rotation branches, and
+    66 of 7272 cycle visits in the 100-seed runs, were mis-scored that way.
     """
     valid_idx = ~np.isnan(values)
     x = np.asarray(episodes[valid_idx], dtype=float)
@@ -631,8 +711,7 @@ def estimate_criterion_crossing_episode(
     if len(y) == 0:
         return np.nan
 
-    increasing = y[-1] >= y[0]
-    crossings = np.where(y >= target)[0] if increasing else np.where(y <= target)[0]
+    crossings = np.where(y >= target)[0]
 
     if len(crossings) == 0:
         return x.max()
@@ -1403,6 +1482,118 @@ def plot_metric_traces_by_phase_visit(data: pd.DataFrame, metrics: list, output_
         output_path = os.path.join(output_dir, f"traces_by_phase_visit_{metric}")
         save(plt.gcf(), output_path, close=False)
         plt.close(fig)
+        print(f"Saved {output_path}")
+
+
+def context_title(label: str) -> str:
+    """A context label as a two-line panel title, family over parameter:
+    'rot -60' -> 'rotation\n−60°', 'curl -13' -> 'curl\nk = −13',
+    'drift 0' -> 'drift\n0°'. Unknown labels are returned as given."""
+    parts = label.split()
+    if len(parts) != 2:
+        return label
+    kind, val = parts
+    val = val.replace("-", "−")                      # a proper minus sign
+    if kind == "rot":
+        return f"rotation\n{val}°"
+    if kind == "curl":
+        return f"curl\nk = {val}"
+    if kind == "drift":
+        return f"drift\n{val}°"
+    return label
+
+
+VISIT_LINESTYLES = ["-", "--", ":"]        # first, second, third visit of a context
+
+
+def plot_metric_traces_by_context(data: pd.DataFrame, metrics: list, output_dir: str,
+                                  criterion_fraction: float = 0.8,
+                                  smooth_window: int = TRACE_SMOOTH_WINDOW):
+    """traces_by_phase_visit folded: one panel per (model, context) with the
+    context's VISITS overlaid, in line style (first solid, second dashed,
+    third dotted) -- file traces_by_context_<metric>. Models down, contexts
+    across. The by-visit figure is kept beside it; this is the view that
+    puts savings in one panel (user, 2026-10-07).
+
+    Line: across-seed median of the smoothed trace, re-zeroed at block onset;
+    band: +-1 s.d. across seeds for every visit, at low alpha so the three
+    overlap legibly (user, 2026-10-07: the revisits' spread matters too). Dotted horizontal: the criterion;
+    markers along it: median reported crossing per visit, in the visit's
+    style. Cycle-schedule runs only (cycle_only).
+    """
+    data = cycle_only(data)
+    if data.empty:
+        print("No cycle-schedule runs; skipping traces_by_context_*")
+        return
+    configs = get_config_order(data)
+    targets = global_criterion_targets(data, metrics, criterion_fraction)
+    crossings = build_criterion_crossing_phase_table(data, metrics, criterion_fraction=criterion_fraction)
+    # contexts in the order they are first met; visits of each in run order
+    first = data.groupby("label")["phase"].min().sort_values()
+    contexts = first.index.tolist()
+    visits_of = {c: (data[data.label == c].groupby("phase_occurrence")["phase"].min()
+                     .sort_values().index.tolist()) for c in contexts}
+    n_visit = max(len(v) for v in visits_of.values())
+    styles = VISIT_LINESTYLES + ["-."] * max(0, n_visit - len(VISIT_LINESTYLES))
+
+    for metric in metrics:
+        if metric not in data.columns:
+            continue
+        target = targets.get(metric, np.nan)
+        fig, axes = plt.subplots(len(configs), len(contexts),
+                                 figsize=figsize("double", height=1.15 * len(configs) + 0.6),
+                                 sharex=True, sharey=True, squeeze=False, layout="constrained")
+        for row, config in enumerate(configs):
+            color = CONFIG_COLORS.get(config, "gray")
+            for col, ctx in enumerate(contexts):
+                ax = axes[row][col]
+                for k, visit in enumerate(visits_of[ctx]):
+                    block = data[(data["config"] == config) & (data["phase_occurrence"] == visit)]
+                    if block.empty:
+                        continue
+                    band = median_seed_band(block, metric, None, smooth_window)
+                    ax.fill_between(band.index, band["median"] - band["std"],
+                                    band["median"] + band["std"], color=color, alpha=0.12, lw=0)
+                    ax.plot(band.index, band["median"], styles[k], color=color, lw=1.0)
+                    # where the PLOTTED curve crosses (criterion_summary's convention),
+                    # later visits in a lighter tint of the model colour
+                    x_cross = _curve_crossing(band, target) if np.isfinite(target) else np.nan
+                    if np.isfinite(x_cross):
+                        ax.plot(x_cross, target, **CROSSING_MARKER,
+                                color=_lighten(color, 0.3 * k),
+                                transform=crossing_transform(ax, fig))
+                if np.isfinite(target):
+                    ax.axhline(target, color=INK, ls=":", lw=0.6)
+                if row == 0:
+                    ax.set_title(context_title(ctx))
+                if col == 0:
+                    ax.set_ylabel(f"{display_name(config, wrap=True)}\n{metric}")
+                else:
+                    ax.tick_params(labelleft=False)
+        # one shared x label for the figure rather than six identical ones
+        fig.supxlabel("episodes since switch")
+        if metric == "success":
+            # a rate: the bands run past [0, 1] but the quantity cannot
+            axes[0][0].set_ylim(0, 1)
+        handles = [Line2D([], [], color=INK, ls=styles[k], lw=1.0, label=f"visit {k + 1}")
+                   for k in range(n_visit)]
+        handles.append(Line2D([], [], color=INK, ls=":", lw=0.6, label="criterion"))
+        fig.legend(handles=handles, loc="outside upper center", ncol=len(handles))
+        offset_spines(fig)
+        label_panels(fig, axes[:, 0])          # one letter per model row
+        caption = (
+            f"{metric.title()} traces by context, each context's visits overlaid: "
+            f"models down, contexts across (in order of first exposure). Line: "
+            f"across-seed median of the {smooth_window}-episode mean, re-zeroed at "
+            f"the block onset; first visit solid, second dashed, third dotted; bands: "
+            f"+-1 s.d. across seeds for each visit. Dotted horizontal: the "
+            f"criterion {target:.3g} ({criterion_fraction:g} of the global maximum); "
+            f"markers above the panel: where each plotted curve first crosses the criterion "
+            f"(none if it never does), in a lighter tint of the model colour for later "
+            f"visits. The by-visit figure "
+            f"(traces_by_phase_visit_{metric}) shows the same traces panel by panel.")
+        output_path = os.path.join(output_dir, f"traces_by_context_{metric}")
+        save(fig, output_path, caption=caption)
         print(f"Saved {output_path}")
 
 
@@ -2234,7 +2425,7 @@ def _model_style(cfg):
 
 
 def _model_label(cfg):
-    return f"{base_config(cfg)} · {'no replay' if _replay_off(cfg) else 'replay'}"
+    return f"{display_name(base_config(cfg))} · {'no replay' if _replay_off(cfg) else 'replay'}"
 
 
 def _after_channel_probes(cfg, run_dir):
@@ -2628,12 +2819,12 @@ def _paired_bars(ax, runs, values, keys, ylabel, title, reference=None,
                      mean_kw=dict(mfc="white", mec=col) if j else None,
                      ci_kw=dict(ls="--") if _replay_off(cfg) else None)
         ticks.append(x + 0.2); x += 1.4
-        tlabels.append(base_config(cfg) if one_variant else _model_label(cfg).replace(" · ", "\n"))
+        tlabels.append(display_name(cfg) if one_variant else _model_label(cfg).replace(" · ", "\n"))
     for y in refs:
         ax.axhline(y, **_REF_KW)
     ax.set_xticks(ticks); ax.set_xlim(-0.5, x - 1.4 + 0.9)
     # model names are long (cb_only_end_to_end): slant them so they don't collide
-    ax.set_xticklabels(tlabels, rotation=30, ha="right", rotation_mode="anchor")
+    ax.set_xticklabels(tlabels, rotation=40, ha="right", rotation_mode="anchor")
     if ylim is not None:
         ax.set_ylim(*ylim)
     ax.set_ylabel(ylabel); ax.set_title(title)
@@ -2923,8 +3114,8 @@ def plot_recovery_comparison(data: pd.DataFrame, output_dir: str, smooth_window:
         if _replay_off(er_cfg):
             colour = _lighten(colour, 0.45)
 
-        for frame, ls, label in ((sr, "--", f"{_pair_key(sr_cfg)} · spontaneous"),
-                                 (er, "-", f"{_pair_key(er_cfg)} · evoked")):
+        for frame, ls, label in ((sr, "--", f"{display_name(sr_cfg)} · spontaneous"),
+                                 (er, "-", f"{display_name(er_cfg)} · evoked")):
             m, se = _mean_sem(frame, "k", "sm")
             axA.plot(m.index, m.values, ls, color=colour, lw=1.7, label=label)
             axA.fill_between(m.index, (m - se).values, (m + se).values,
@@ -2944,7 +3135,7 @@ def plot_recovery_comparison(data: pd.DataFrame, output_dir: str, smooth_window:
         # paired within seed, on the reaches both runs have
         both, windows = recovery_divergence(sr, er, n_pre, evoke_window, close_reaches)
         m, se = _mean_sem(both, "k", "d_sm")
-        axB.plot(m.index, m.values, color=colour, lw=1.7, label=_pair_key(er_cfg))
+        axB.plot(m.index, m.values, color=colour, lw=1.7, label=display_name(er_cfg))
         axB.fill_between(m.index, (m - se).values, (m + se).values,
                          color=colour, alpha=0.15, lw=0)
         divergence[er_cfg] = windows       # C draws "early" / "late"; "pre" is the control
@@ -3514,11 +3705,14 @@ def plot_channel_decomposition(data: pd.DataFrame, output_dir: str,
     if "phase" in ch.columns and ch.phase.nunique() > 1:
         evoke = int(ch[ch.phase == sorted(ch.phase.unique())[0]].k.max()) + .5
 
-    fig = plt.figure(figsize=(14.5, 7.4))
-    gs = fig.add_gridspec(2, 3, hspace=.42, wspace=.26)
+    # Paper layout: double-column width, constrained layout, type from the
+    # style, panel letters, one figure legend outside, prose in the caption.
+    fig = plt.figure(figsize=figsize("double", height=4.6), layout="constrained")
+    gs = fig.add_gridspec(2, 3)
     A = fig.add_subplot(gs[0, 0]); B = fig.add_subplot(gs[0, 1])
     C = fig.add_subplot(gs[0, 2]); D = fig.add_subplot(gs[1, 0])
     E = fig.add_subplot(gs[1, 1:])
+    small = plt.rcParams["xtick.labelsize"]
 
     rank = {pm: 0, sac.PRIOR_SRC_NULL: 1, pp: 2}
     M = np.full((len(seeds), kmax + 1), np.nan)
@@ -3528,102 +3722,108 @@ def plot_channel_decomposition(data: pd.DataFrame, output_dir: str,
     A.imshow(M, aspect="auto", interpolation="nearest", vmin=0, vmax=2,
              cmap=ListedColormap([col[pm], col[sac.PRIOR_SRC_NULL], col[pp]]))
     if evoke is not None:
-        A.axvline(evoke, color="k", lw=1.1, ls="--")
-    A.set_xlabel("Channel Reach"); A.set_ylabel("run")
+        A.axvline(evoke, color=INK, lw=0.8, ls="--")
+    A.set_xlabel("channel reach"); A.set_ylabel("run")
+    A.set_title("memory expressed")
 
     marks = [m for m in k_marks if m <= kmax]
     for j, kk in enumerate(marks):
         w = ch[ch.k == kk]
         if w.empty:
             continue
-        B.scatter(j + np.linspace(-.22, .22, len(w)), w["index"], s=15, lw=0,
+        B.scatter(j + np.linspace(-.22, .22, len(w)), w["index"], s=6, lw=0,
                   c=[col.get(v, "#cccccc") for v in w.prior_src], zorder=3)
         m = w["index"].mean()
-        B.hlines(m, j - .34, j + .34, color="k", lw=2.2, zorder=4)
+        B.hlines(m, j - .34, j + .34, color=INK, lw=1.6, zorder=4)
         B.annotate(f"{np.mean(np.abs(w['index'] - m) <= tol) * 100:.0f}%",
-                   (j, 1.42), ha="center", fontsize=8)
+                   (j, 1.42), ha="center", va="bottom", fontsize=small)
     for c in codes:
-        B.axhline(L[c], color=col[c], ls=":", lw=1.0, zorder=1)
+        B.axhline(L[c], color=col[c], ls=":", lw=0.8, zorder=1)
     B.set_xticks(range(len(marks))); B.set_xticklabels([f"k={m}" for m in marks])
     B.set_ylim(-1.5, 1.6); B.set_ylabel("adaptation index")
-    # under the axes, not inside it: this panel is a dense scatter and an
-    # inline legend covers the very cluster the panel is about
-    B.legend(handles=[Line2D([], [], color="k", lw=2.2, label="mean"),
-                      Line2D([], [], color="k", lw=1.0, ls=":", label="$\\hat{L}(c)$"),
-                      Line2D([], [], color="none",
-                             label=f"%  within ±{tol:g} of the mean")],
-             frameon=False, fontsize=7.5, loc="upper center", ncol=3,
-             bbox_to_anchor=(0.5, -0.09), handlelength=1.4)
+    B.set_title(f"runs within ±{tol:g} of the mean")
+    B.legend(handles=[Line2D([], [], color=INK, lw=1.6, label="mean"),
+                      Line2D([], [], color=INK, lw=0.8, ls=":", label="$\\hat{L}(c)$")],
+             loc="lower right", ncol=2)
 
     for c in W:
-        C.plot(k, W[c], color=col[c], lw=2)
+        C.plot(k, W[c], color=col[c], lw=1.4)
     shares = experience_proportions(d)
     for c, key in ((pp, "pplus"), (pm, "pminus"), (sac.PRIOR_SRC_NULL, "base")):
         if shares.get(key) is not None:
-            C.axhline(shares[key], color=col[c], ls=":", lw=1)
+            C.axhline(shares[key], color=col[c], ls=":", lw=0.8)
     if evoke is not None:
-        C.axvline(evoke, color="k", lw=1.1, ls="--")
-    C.set_ylim(0, 1); C.set_xlabel("Channel Reach"); C.set_ylabel("P(dealt this memory)")
-    C.set_title(f"$(1-h)^k$, $h$={hazard:g}",
-                fontsize=9.5)
-    C.legend(handles=[Line2D([], [], color="k", lw=1.0, ls=":", label="bank share")],
-             frameon=False, fontsize=7.5, loc="center right", handlelength=1.4)
+        C.axvline(evoke, color=INK, lw=0.8, ls="--")
+    C.set_ylim(0, 1); C.set_xlabel("channel reach"); C.set_ylabel("P(dealt this memory)")
+    C.set_title(f"deal weights, $(1-h)^k$, $h$ = {hazard:g}")
+    C.legend(handles=[Line2D([], [], color=INK, lw=0.8, ls=":", label="bank share")],
+             loc="center right")
 
     for i, c in enumerate((pm, sac.PRIOR_SRC_NULL, pp)):
         if c not in levels:
             continue
         per = ch[ch.prior_src == c].groupby("seed")["index"].mean()
-        D.scatter(i + np.linspace(-.18, .18, len(per)), per, s=16, lw=0,
+        D.scatter(i + np.linspace(-.18, .18, len(per)), per, s=6, lw=0,
                   color=col[c], zorder=3)
-        D.hlines(levels[c]["level"], i - .3, i + .3, color="k", lw=2, zorder=4)
-        D.annotate(f"{levels[c]['level']:+.2f}\n±{levels[c]['sd_between_seeds']:.2f}\n"
-                   f"{levels[c]['n_seeds']} runs", (i, 1.45), ha="center", fontsize=7.5)
+        D.hlines(levels[c]["level"], i - .3, i + .3, color=INK, lw=1.6, zorder=4)
+        D.annotate(f"{levels[c]['level']:+.2f} ± {levels[c]['sd_between_seeds']:.2f}\n"
+                   f"{levels[c]['n_seeds']} runs", (i, 1.45), ha="center", va="bottom",
+                   fontsize=small)
     D.set_xticks(range(3)); D.set_xticklabels([name[c] for c in (pm, sac.PRIOR_SRC_NULL, pp)])
     D.set_ylim(-1.6, 2.0); D.set_ylabel("adaptation index")
-    D.set_title("$\\hat{L}(c)$",
-                fontsize=9.5)
+    D.set_title("levels $\\hat{L}(c)$")
 
     emp = ch.groupby("k")["index"].mean().reindex(k)
-    E.plot(k, emp.values, color="#b9bdc4", lw=1.2, label="seed mean (sampled deal)")
+    E.plot(k, emp.values, color=MUTED, lw=1.0, label="seed mean (sampled deal)")
     # the band is the spread of PER-SEED Rao-Blackwell curves: the deal is
     # integrated out of each one, so what is left between them is policy
     per_seed = rb_per_seed_curves(data[data.config == cfg], cfg, run_dir)
+    n_rb = None
     if per_seed is not None:
         _k, curves, pseeds, n_full = per_seed
+        n_rb = len(pseeds)
         m, sd = curves.mean(0), curves.std(0)
-        E.fill_between(_k, m - sd, m + sd, color="k", alpha=.13, lw=0,
-                       label=f"±1 sd across {len(pseeds)} runs")
-    E.plot(k, mu, color="k", lw=2.2, label="Rao–Blackwell", zorder=5)
+        E.fill_between(_k, m - sd, m + sd, color=INK, alpha=.12, lw=0,
+                       label=f"±1 sd across {n_rb} runs")
+    E.plot(k, mu, color=INK, lw=1.6, label="Rao–Blackwell", zorder=5)
     if evoke is not None:
-        E.axvline(evoke, color="k", lw=1.1, ls="--")
-    E.set_xlabel("Channel Reach"); E.set_ylabel("adaptation index")
-    E.set_title("$\\mu(k)=\\sum_c w_c(k)\\,\\hat{L}(c)$",
-                fontsize=9.5)
-    E.legend(frameon=False, fontsize=8, loc="lower right")
+        E.axvline(evoke, color=INK, lw=0.8, ls="--")
+    E.set_xlabel("channel reach"); E.set_ylabel("adaptation index")
+    E.set_title("$\\mu(k)=\\sum_c w_c(k)\\,\\hat{L}(c)$")
+    E.legend(loc="lower right")
 
     for a in (B, C, D, E):
         offset_spines(a)
-    fig.tight_layout()
-    # ONE legend for the figure. The panel titles say what each panel shows;
-    # what the marks MEAN belongs here, not in a title -- a title that has to
-    # explain its own line styles is doing a legend's job badly.
-    # SHARED ENCODINGS ONLY. The memory colours carry the same meaning in A,
-    # B, C and D, and the evoke rule in A, C and E, so those belong to the
-    # figure. Everything used by ONE panel stays with that panel: the mean bar
-    # (B), the bank share (C), the estimator and its band (E). A black heavy
-    # mark in particular does NOT generalise -- it is the population mean in
-    # B, the level in D, the estimator in E -- so it must never be hoisted
-    # here under one vague label.
+    # ONE legend for the figure, for the encodings SHARED across panels: the
+    # memory colours (A-D) and the evoke rule (A, C, E). Anything one panel
+    # uses alone stays with that panel.
     handles = [Patch(facecolor=col[c], label=name[c])
                for c in (pp, sac.PRIOR_SRC_NULL, pm)]
     if evoke is not None:
-        handles.append(Line2D([], [], color="k", lw=1.1, ls="--", label="evoking reach"))
-    fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False,
-               fontsize=8.5, bbox_to_anchor=(0.5, -0.035))
-    fig.text(0.005, 1.0, f"{_model_label(cfg)} · {schedule.replace('_', ' ')}",
-             ha="left", va="top", fontsize=10)
+        handles.append(Line2D([], [], color=INK, lw=0.8, ls="--", label="evoking reach"))
+    fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
+    label_panels(fig, [A, B, C, D, E])
+    sched = schedule.replace("_", " ")
+    caption = (
+        f"The channel as a mixture of memories, {display_name(cfg)} under {sched} "
+        f"(run {cfg}). What shifts over the channel is the relative weight of a "
+        f"discrete set of clusters whose locations do not move. (a) The memory "
+        f"each run expresses on each channel reach (P+, null, P−): blocks, not "
+        f"drift. (b) The population at reaches k = {', '.join(map(str, marks))} "
+        f"against the cluster levels (dotted); the heavy bar is the population "
+        f"mean, which sits in the gap, and the percentage is how few runs fall "
+        f"within ±{tol:g} of it. (c) The deal weights, exact: the hazard "
+        f"h = {hazard:g} is the one the run used and the bank shares (dotted) are "
+        f"counted off the blocks. (d) The levels each memory expresses, one dot "
+        f"per run, with mean ± SD across runs and the number of runs. (e) The "
+        f"Rao–Blackwell estimate, weights times levels, against the seed mean of "
+        f"the sampled deal"
+        + (f"; band ±1 SD across {n_rb} per-run estimates" if n_rb else "") + "."
+        + (" Under evoked recovery the deal restarts at the evoking reach (dashed), "
+           "a P+ reach that writes P+ into every carry, so (c) shows a discontinuity "
+           "rather than one smooth decay." if evoke is not None else ""))
     path = os.path.join(output_dir, f"channel_decomposition_{schedule}")
-    save(fig, path)
+    save(fig, path, caption=caption)
 
 
 RB_SUBDIR = "rao_blackwell"
@@ -4085,7 +4285,7 @@ def plot_context_belief(data: pd.DataFrame, output_dir: str, smooth_window: int 
         ax.set_xlim(-1, len(one))
         ax.set_ylim(-0.02, 1.02)
         ax.set_xlabel("reach")
-        ax.set_title(f"{_pair_key(er_cfg)}\nfrom the {source}", fontsize=10)
+        ax.set_title(f"{display_name(er_cfg)}\nfrom the {source}")
         offset_spines(ax)
         if col == 0:
             ax.set_ylabel("belief in the context")
@@ -4434,7 +4634,1053 @@ def plot_paradigm_overview(data: pd.DataFrame, output_dir: str, smooth_window: i
     print(f"Saved {path}")
 
 
+# ── the savings probes and the cycle-length sweep (2026-10-07) ─────────────
+#
+# sac.PROBE_ROLES: a null-field washout after the cycle, then three learning
+# blocks branched from the end of the washout (run name _pr), the same ids in
+# every cycle length. Scores per seed, in early-block performance (positive =
+# a benefit):
+#   retrieval = revisit - novel same-family   context-specific memory: the novel
+#                                         rotation is the same magnitude and
+#                                         distance from the washed-out policy,
+#                                         never experienced
+#   transfer  = novel same-family - novel family     family-level transfer
+# The hypothesis: the Full Circuit shows both; and retrieval falls with the
+# number of contexts in the cycle for a single stored policy while staying
+# flat for a retrieval system (plot_cycle_length).
+ROLE_TINT = 0.22          # each later role this much further toward white (revisit = the hue)
+
+
+def retrieval_defined(cfg: str) -> bool:
+    """Whether the probe retrieval score means retrieval in this cell: only
+    when the cycle trained a CONFLICTING rotation beside the revisited one.
+
+    Retrieval, in the sense the paper needs, is a context-specific solution
+    that survives while a conflicting context is learned -- INTERFERENCE is
+    the test (user, 2026-10-07). After rot -60 and rot +30 a single policy
+    sits nearer the +60 solution than the -60 one (frozen battery at the
+    fork: Motor Cortex -60 at 0.38, novel +60 at 0.79), so its novel member
+    beats its revisit; a model that stores contexts apart keeps -60 (COIN
+    1.00 vs 0.50). Without the conflicting rotation (the two-family pair, the
+    triple) the comparison cannot tell "stored separately" from "still
+    parked nearby": a null-field washout does not neutralise the policy
+    there (every model left it aiming ~+30, success being insensitive to
+    that), and the revisit's advantage was single-policy residue. Those
+    cells read TRANSFER (novel member vs novel family) instead."""
+    _, phase_set, _ = cycle_cell(cfg)
+    ids = sac.phase_ids_for(phase_set)
+    return sum(1 for c in ids if T.FAMILY[c] == 0) >= 2
+
+
+def transfer_defined(cfg: str) -> bool:
+    """Transfer (a novel rotation vs the novel family) is read where the cell
+    offers an INTERIOR rotation (pair_wide: -30/-90 trained, the midpoint -60
+    probed -- interpolation between the anchors, 2026-10-08) or trains a
+    single rotation (the mixed pair: the mirror, extrapolation). Not in the
+    rotation pair -60/+30: its mirror +60 sits 30 degrees from the trained
+    +30, near-transfer rather than family-level transfer (user, 2026-10-07)."""
+    roles = cell_roles(cfg)
+    return "interior" in roles or not retrieval_defined(cfg)
+
+
+PROBE_SUBDIR = "probes"   # the probe and cycle-length figures live under <plots>/probes/ (user, 2026-10-07)
+PROBE_LABEL = {"revisit": "revisit", "novel_family_member": "novel member",
+               "interior": "interior", "novel_family": "novel family"}
+PROBE_SHORT = {"revisit": "revisit", "novel_family_member": "novel\nmember",
+               "interior": "interior", "novel_family": "novel\nfamily"}
+# the novel rotation the TRANSFER score compares with the novel family, in
+# order of preference: the interior midpoint (interpolation, the wide-pair
+# cell) where it exists, else the mirror (extrapolation, the mixed-pair cell)
+TRANSFER_ROTATION = ("interior", "novel_family_member")
+
+
+def cell_roles(cfg: str) -> tuple:
+    """The probe roles that apply in a run's cell (sac.probe_roles_for_cell
+    under that cell's context set), restored to the module default after."""
+    _, phase_set, _ = cycle_cell(cfg)
+    try:
+        sac.apply_phase_set(phase_set)
+        return sac.probe_roles_for_cell()
+    finally:
+        sac.apply_phase_set(sac.DEFAULT_PHASE_SET)
+
+
+def transfer_rotation(roles) -> str:
+    for r in TRANSFER_ROTATION:
+        if r in roles:
+            return r
+    return None
+
+
+def cycle_cell(cfg: str):
+    """(N, phase set, episodes per block) of a cycle run, from its name: the
+    context set via sac.PHASE_SET_SUFFIX and the _ep<N> infix. A plain run is
+    (6, 'mixed', sac.N_PHASE_EP)."""
+    infix = split_run_name(cfg)[1]
+    phase_set = sac.DEFAULT_PHASE_SET
+    for ps, suf in sorted(sac.PHASE_SET_SUFFIX.items(), key=lambda kv: -len(kv[1])):
+        if suf and re.search(re.escape(suf) + r"(?=_|$)", infix):
+            phase_set = ps
+            break
+    m = re.search(r"_ep([0-9]+)(?=_|$)", infix)
+    ep = int(m.group(1)) if m else sac.N_PHASE_EP
+    return len(sac.phase_ids_for(phase_set)), phase_set, ep
+
+
+def cell_tag(cfg: str) -> str:
+    """'n6', 'n2rot', 'n2mix', 'n3', 'n2rot_ep300': the cycle cell a run is in."""
+    n, ps, ep = cycle_cell(cfg)
+    base = (sac.PHASE_SET_SUFFIX.get(ps) or "").lstrip("_") or f"n{n}"
+    if not base.startswith("n"):
+        base = f"n{n}{base}"
+    return base + (f"_ep{ep}" if ep != sac.N_PHASE_EP else "")
+
+
+def probe_crossings(data: pd.DataFrame, metrics: list, criterion_fraction: float = 0.8,
+                    smooth_window: int = TRACE_SMOOTH_WINDOW) -> pd.DataFrame:
+    """Episodes to criterion inside each probe branch, per (config, seed,
+    branch, metric). The criterion is the cycle figures' one: a fraction of
+    the best value seen over the CYCLE rows of every run in the same cell, so
+    probe and cycle crossings are read against one line. Censored = never
+    reached (reported at the block's last episode)."""
+    pr = probe_rows(data)
+    pr = pr[pr["branch"].isin(sac.PROBE_ROLES)] if pr is not None and not pr.empty else pr
+    if pr is None or pr.empty:
+        return pd.DataFrame(columns=["config", "seed", "branch", "metric", "criterion_target",
+                                     "criterion_episode", "censored", "n_ep"])
+    cyc = cycle_only(data)
+    cells = {cfg: cell_tag(cfg) for cfg in pr["config"].unique()}
+    targets_by_cell = {}
+    for tag in set(cells.values()):
+        in_cell = cyc[cyc["config"].map(lambda c: cell_tag(c) == tag)]
+        targets_by_cell[tag] = global_criterion_targets(in_cell if not in_cell.empty else pr,
+                                                         metrics, criterion_fraction)
+    rows = []
+    for (cfg, seed, branch), g in pr.groupby(["config", "seed", "branch"]):
+        g = g.sort_values("ep")
+        episodes = np.arange(len(g), dtype=float)
+        for metric in metrics:
+            if metric not in g.columns:
+                continue
+            target = targets_by_cell[cells[cfg]].get(metric, np.nan)
+            ce = estimate_criterion_crossing_episode(episodes, g[metric].to_numpy(dtype=float),
+                                                     target=target, smooth_window=smooth_window)
+            rows.append({"config": cfg, "seed": seed, "branch": branch, "metric": metric,
+                         "criterion_target": target, "criterion_episode": ce,
+                         "censored": bool(np.isfinite(ce) and ce >= episodes.max() - 1e-9),
+                         "n_ep": len(g)})
+    return pd.DataFrame(rows)
+
+
+PROBE_EARLY_EPISODES = 10      # the "early" window: mean metric over a block's first episodes
+
+
+def early_block_mean(block: pd.DataFrame, metric: str, n: int = PROBE_EARLY_EPISODES) -> float:
+    """Mean of `metric` over the first `n` episodes of one block (one seed)."""
+    v = block.sort_values("ep")[metric].to_numpy(dtype=float)[:n]
+    return float(np.nanmean(v)) if len(v) else np.nan
+
+
+def probe_early(data: pd.DataFrame, metrics: list, n: int = PROBE_EARLY_EPISODES) -> pd.DataFrame:
+    """Early-block performance per (config, seed, branch, metric): the mean
+    over the branch's first `n` episodes.
+
+    WHY A SECOND MEASURE. Episodes to criterion is read off a
+    TRACE_SMOOTH_WINDOW-episode moving average, so no crossing can be earlier
+    than about that window; a branch that starts ABOVE criterion -- every
+    model's revisit and novel rotations in the pilot -- sits at that floor
+    and the retrieval score is zero by construction. The early mean has no
+    floor and is the quantity the savings paradigm's jump already uses."""
+    pr = probe_rows(data)
+    pr = pr[pr["branch"].isin(sac.PROBE_ROLES)] if pr is not None and not pr.empty else pr
+    rows = []
+    if pr is None or pr.empty:
+        return pd.DataFrame(columns=["config", "seed", "branch", "metric", "early"])
+    for (cfg, seed, branch), g in pr.groupby(["config", "seed", "branch"]):
+        for metric in metrics:
+            if metric in g.columns:
+                rows.append({"config": cfg, "seed": seed, "branch": branch, "metric": metric,
+                             "early": early_block_mean(g, metric, n)})
+    return pd.DataFrame(rows)
+
+
+def revisit_levels(data: pd.DataFrame, metrics: list, n: int = PROBE_EARLY_EPISODES) -> pd.DataFrame:
+    """Per (config, seed, metric), the revisited context's own reference
+    levels from the CYCLE: `naive` = mean over the first `n` episodes of its
+    first visit (what the agent does before it has learned the context) and
+    `trained` = mean over the last `n` episodes of its last visit (what it
+    had reached). Retrieval is scored between them (probe_scores)."""
+    pr = probe_rows(data)
+    rows = []
+    if pr is None or pr.empty:
+        return pd.DataFrame(columns=["config", "seed", "metric", "naive", "trained"])
+    cyc = cycle_only(data)
+    for cfg, g in pr[pr.branch == "revisit"].groupby("config"):
+        label = g["label"].iloc[0].replace("probe ", "", 1)
+        blocks = cyc[(cyc.config == cfg) & (cyc.label == label)]
+        if blocks.empty:
+            continue
+        first, last = blocks.occurrence.min(), blocks.occurrence.max()
+        for seed, b in blocks.groupby("seed"):
+            v1 = b[b.occurrence == first].sort_values("ep")
+            vL = b[b.occurrence == last].sort_values("ep")
+            for metric in metrics:
+                if metric in b.columns:
+                    rows.append({"config": cfg, "seed": seed, "metric": metric,
+                                 "naive": float(np.nanmean(v1[metric].to_numpy(float)[:n])),
+                                 "trained": float(np.nanmean(vL[metric].to_numpy(float)[-n:]))})
+    return pd.DataFrame(rows)
+
+
+def transfer_ideal_aim(cfg: str):
+    """(ideal first-action angle in degrees, role) for a run's transfer
+    rotation: the aim that cancels it, -theta (sac logs the signed angle from
+    the goal direction to the action; under rot +45 a knowing agent aims
+    ~-45). (nan, None) where the cell has no transfer rotation."""
+    roles = cell_roles(cfg)
+    t_rot = transfer_rotation(roles)
+    if t_rot is None:
+        return np.nan, None
+    _, phase_set, _ = cycle_cell(cfg)
+    try:
+        sac.apply_phase_set(phase_set)
+        cid = sac.probe_context(t_rot)
+    finally:
+        sac.apply_phase_set(sac.DEFAULT_PHASE_SET)
+    return -float(T.C_PARAM[cid]), t_rot
+
+
+def transfer_aim(data: pd.DataFrame, n: int = PROBE_EARLY_EPISODES,
+                 parked_window: int = PROBE_EARLY_EPISODES) -> pd.DataFrame:
+    """TRANSFER AS FEEDFORWARD COMPENSATION (user, 2026-10-08). Per (config,
+    seed): `aim` = the mean first-action angle over the transfer rotation's
+    first `n` episodes; `parked` = the same over the last `parked_window`
+    episodes of the washout the branch forked from (without a washout, of the
+    last cycle block), where the policy sat before the probe; `ideal` = the
+    angle that cancels the rotation; compensation = aim / ideal, the fraction
+    of the rotation the first action already cancels (1 = aimed as the
+    rotation demands, 0 = straight at the goal), with `parked_frac` =
+    parked / ideal reported beside it so the residue a model carried into
+    the probe is visible rather than divided out (a per-seed (aim − parked) /
+    (ideal − parked) ratio blew up where a seed parked near the ideal:
+    Motor Cortex + Cerebellum keeps a ~40-degree aim in the null field). Why
+    aim and not success: after a washout
+    every policy is parked within the controller's ~30-degree tolerance of
+    the interior rotation, so success is at ceiling for a context-blind
+    policy too (wide pair, 5 seeds: Motor Cortex 0.90 in its first ten
+    episodes); the first action does not saturate, and feedforward is what
+    the structure claim is about."""
+    pr = probe_rows(data)
+    cols = ["config", "seed", "branch", "aim", "parked", "ideal", "compensation", "parked_frac"]
+    if pr is None or pr.empty or "first_angle" not in pr.columns:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    cyc = cycle_only(data)
+    for cfg, g in pr.groupby("config"):
+        ideal, t_rot = transfer_ideal_aim(cfg)
+        if t_rot is None:
+            continue
+        wash = pr[(pr.config == cfg) & (pr.branch == sac.PROBE_WASHOUT)]
+        for seed, b in g[g.branch == t_rot].groupby("seed"):
+            aim = early_block_mean(b, "first_angle", n)
+            w = wash[wash.seed == seed].sort_values("ep")
+            if w.empty:
+                c = cyc[(cyc.config == cfg) & (cyc.seed == seed)]
+                w = c[c.phase == c.phase.max()].sort_values("ep") if len(c) else w
+            v = w["first_angle"].to_numpy(float)
+            parked = float(np.nanmean(v[-parked_window:])) if len(v) else np.nan
+            rows.append({"config": cfg, "seed": seed, "branch": t_rot, "aim": aim,
+                         "parked": parked, "ideal": ideal, "compensation": aim / ideal,
+                         "parked_frac": parked / ideal})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def probe_scores(crossings: pd.DataFrame, early: pd.DataFrame = None,
+                 levels: pd.DataFrame = None, aim: pd.DataFrame = None) -> pd.DataFrame:
+    """Per (config, seed, metric), the retrieval and transfer scores:
+
+      retrieval  = PROTECTION FROM INTERFERENCE (user, 2026-10-07): where the
+                   revisited context's early-block performance after the
+                   interfering rotation and the washout sits between its own
+                   naive level (first visit, early) and its trained level
+                   (last visit, late) -- (revisit - naive) / (trained - naive).
+                   1 = fully protected, 0 = back to naive; negative = below
+                   naive. Needs `levels` (revisit_levels); nan without them.
+      transfer   = FEEDFORWARD COMPENSATION at the novel rotation (user,
+                   2026-10-08; transfer_aim): first-reach aim / ideal aim, the
+                   same for every metric row; transfer_parked = the parked
+                   aim / ideal, the residue the probe started from. The novel
+                   rotation is the interior midpoint where the cell has one
+                   (interpolation), else the mirror
+      transfer_vs_family  the earlier score, novel rotation − novel family in
+                   the early-block metric (positive = the family helped); kept
+                   for the record, at ceiling on success after a washout
+      retrieval_ep / transfer_ep  the episodes-to-criterion versions of the
+                   old novel-vs-revisit contrasts, kept for the crossing row
+
+    The early-block pair is the one to read (see probe_early)."""
+    rows = []
+    early = early if early is not None else pd.DataFrame(columns=["config", "seed", "branch", "metric", "early"])
+    roles_of = {}
+    for (cfg, seed, metric), g in crossings.groupby(["config", "seed", "metric"]):
+        by = g.set_index("branch")["criterion_episode"]
+        roles = roles_of.setdefault(cfg, cell_roles(cfg))
+        if not all(r in by.index for r in roles):
+            continue
+        t_rot = transfer_rotation(roles)
+        novel_rot = float(by[t_rot]) if t_rot else np.nan
+        row = {"config": cfg, "seed": seed, "metric": metric,
+               "retrieval_ep": novel_rot - float(by["revisit"]),
+               "transfer_ep": float(by["novel_family"]) - novel_rot,
+               "censored": bool(g["censored"].any()),
+               "retrieval": np.nan, "transfer": np.nan, "transfer_parked": np.nan,
+               "transfer_vs_family": np.nan}
+        if aim is not None and len(aim):
+            am = aim[(aim.config == cfg) & (aim.seed == seed)]
+            if len(am):
+                row["transfer"] = float(am["compensation"].iloc[0])
+                row["transfer_parked"] = float(am["parked_frac"].iloc[0])
+        e = early[(early.config == cfg) & (early.seed == seed) & (early.metric == metric)]
+        if len(e) and all(r in set(e.branch) for r in roles):
+            eb = e.set_index("branch")["early"]
+            if t_rot:
+                row["transfer_vs_family"] = float(eb[t_rot]) - float(eb["novel_family"])
+            if levels is not None and len(levels):
+                lv = levels[(levels.config == cfg) & (levels.seed == seed) & (levels.metric == metric)]
+                if len(lv):
+                    naive, trained = float(lv["naive"].iloc[0]), float(lv["trained"].iloc[0])
+                    if np.isfinite(naive) and np.isfinite(trained) and abs(trained - naive) > 1e-9:
+                        row["retrieval"] = (float(eb["revisit"]) - naive) / (trained - naive)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["config", "seed", "metric", "retrieval_ep", "transfer_ep",
+                                       "censored", "retrieval", "transfer", "transfer_parked",
+                                       "transfer_vs_family"])
+
+
+def plot_savings_probes(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                        criterion_fraction: float = 0.8,
+                        smooth_window: int = TRACE_SMOOTH_WINDOW,
+                        early_episodes: int = PROBE_EARLY_EPISODES):
+    """The savings probes (sac.PROBE_ROLES), one figure per cycle cell and
+    metric -- file probes/savings_probes_<metric>_<cell>. Models across.
+
+      row 1  the four branches' learning curves overlaid (across-seed median
+             of the smoothed trace, +-1 s.d.), line style by role, the
+             criterion dotted, median crossing marked per role
+      row 2  episodes to criterion per role, one dot per seed (hollow:
+             never reached), median and IQR -- floored at the smoothing
+             window, see probe_early
+      row 3  early-block performance per role: the mean over the first
+             `early_episodes` episodes, one dot per seed
+      row 4  the two scores per seed from row 3: retrieval = revisit -
+             novel same-family member; transfer = novel same-family - novel family
+    """
+    metrics = METRICS if metrics is None else metrics
+    pr = probe_rows(data)
+    if pr is None or pr.empty:
+        print("No probe branches in the data; skipping savings_probes_*")
+        return
+    crossings = probe_crossings(data, metrics, criterion_fraction, smooth_window)
+    early = probe_early(data, metrics, early_episodes)
+    scores = probe_scores(crossings, early, revisit_levels(data, metrics, early_episodes),
+                          transfer_aim(data, early_episodes))
+    cells = sorted({cell_tag(c) for c in pr["config"].unique()})
+    for tag in cells:
+        configs = [c for c in get_config_order(pr) if cell_tag(c) == tag]
+        # a run from an earlier probe design lacks a role: skip the cell and say so
+        have = {c: set(pr[pr.config == c]["branch"].unique()) for c in configs}
+        complete = [c for c in configs if set(cell_roles(c)) <= have[c]]
+        if len(complete) < len(configs):
+            print(f"  savings_probes {tag}: skipping "
+                  f"{[c for c in configs if c not in complete]} -- not every role of "
+                  f"{cell_roles(configs[0])} is present (an earlier probe design?)")
+        configs = complete
+        if not configs:
+            continue
+        roles = cell_roles(configs[0])
+        for metric in metrics:
+            if metric not in pr.columns:
+                continue
+            tgt = crossings[(crossings.metric == metric) & crossings.config.isin(configs)]["criterion_target"]
+            target = float(tgt.iloc[0]) if len(tgt) else np.nan
+            # One column per model throughout. The role is carried by TINT, not
+            # line style: the model's colour for the revisit, then lighter for
+            # the three novel roles -- the same tints the swarm rows use, so a
+            # role reads the same in every row (user, 2026-10-07: four line
+            # styles on one panel could not be told apart). No bands.
+            fig, axes = plt.subplots(4, len(configs), squeeze=False,
+                                     figsize=figsize("double", height=7.2), layout="constrained")
+            top = list(axes[0])
+            for a in top[1:]:
+                a.sharey(top[0])
+            axes = axes[1:]
+            for col, cfg in enumerate(configs):
+                color = CONFIG_COLORS.get(base_config(cfg), CONFIG_COLORS.get(cfg, "gray"))
+                ax = top[col]
+                for k, role in enumerate(roles):
+                    block = pr[(pr.config == cfg) & (pr.branch == role)]
+                    if block.empty:
+                        continue
+                    tint = _lighten(color, ROLE_TINT * k)
+                    band = median_seed_band(block, metric, None, smooth_window)
+                    ax.plot(band.index, band["median"], color=tint, lw=1.1, zorder=3 - 0.5 * k)
+                    # the marker sits where the PLOTTED curve crosses the line (the
+                    # median of the per-seed crossings is a different number and
+                    # belongs to the swarm below) -- the criterion_summary convention
+                    x_cross = _curve_crossing(band, target) if np.isfinite(target) else np.nan
+                    if np.isfinite(x_cross):
+                        ax.plot(x_cross, target, **CROSSING_MARKER, color=tint,
+                                transform=crossing_transform(ax, fig))
+                if np.isfinite(target):
+                    ax.axhline(target, color=INK, ls=":", lw=0.6)
+                ax.set_title(display_name(cfg, wrap=True))
+                ax.set_xlabel("episodes since switch")
+                if col == 0:
+                    ax.set_ylabel(f"{metric} ({smooth_window}-episode mean)")
+                else:
+                    ax.tick_params(labelleft=False)
+            for col, cfg in enumerate(configs):
+                # the BASE preset's colour: one model keeps one hue across cells
+                color = CONFIG_COLORS.get(base_config(cfg), CONFIG_COLORS.get(cfg, "gray"))
+                axX, axE, axS = axes[0][col], axes[1][col], axes[2][col]
+                if col:
+                    for r_ in range(3):
+                        axes[r_][col].sharey(axes[r_][0])
+                # row 2: crossings per role
+                cx = crossings[(crossings.config == cfg) & (crossings.metric == metric)]
+                groups = [cx[cx.branch == r]["criterion_episode"].to_numpy() for r in roles]
+                hollow = [cx[cx.branch == r]["censored"].to_numpy() for r in roles]
+                swarm_ci(axX, groups, colors=[_lighten(color, ROLE_TINT * k) for k in range(len(roles))],
+                         labels=[PROBE_SHORT[r] for r in roles], stat="median",
+                         hollow=hollow, jitter=0.18)
+                n_ep = int(cx["n_ep"].max()) if len(cx) else 0
+                axX.set_ylim(0, n_ep if n_ep else None)
+                # row 3: early-block performance per role
+                ea = early[(early.config == cfg) & (early.metric == metric)]
+                swarm_ci(axE, [ea[ea.branch == r]["early"].to_numpy() for r in roles],
+                         colors=[_lighten(color, ROLE_TINT * k) for k in range(len(roles))],
+                         labels=[PROBE_SHORT[r] for r in roles], jitter=0.18)
+                if np.isfinite(target):
+                    axE.axhline(target, color=INK, ls=":", lw=0.6)
+                # row 4: the scores, from the early-block performance. Retrieval
+                # only where it means retrieval, i.e. where an interfering
+                # rotation was trained (retrieval_defined); the slot is kept so
+                # the panels line up across cells
+                sc = scores[(scores.config == cfg) & (scores.metric == metric)]
+                note = dict(xytext=(0, 4), textcoords="offset points", ha="center", va="bottom",
+                            color=MUTED, fontsize=plt.rcParams["xtick.labelsize"])
+                last_col = col == len(configs) - 1
+                if retrieval_defined(cfg):
+                    swarm_ci(axS, [sc["retrieval"].to_numpy()], colors=[color], labels=["retrieval"],
+                             x=[0.0], jitter=0.18)
+                else:
+                    axS.annotate("n/a: no\ninterfering\nrotation", (0, 0), **note)
+                if transfer_defined(cfg):
+                    swarm_ci(axS, [sc["transfer"].to_numpy()], colors=[_lighten(color, 0.4)],
+                             labels=["transfer"], x=[1.0], jitter=0.18)
+                else:
+                    axS.annotate("n/a: a second\nrotation inflates\ntransfer", (1, 0), **note)
+                # both are ratios on one scale: 1 = trained level / ideal aim,
+                # 0 = naive level / parked aim
+                chance_line(axS, 1, "trained · ideal" if last_col else None)
+                chance_line(axS, 0, "naive · straight" if last_col else None, above=False)
+                axS.set_xticks([0, 1], ["retrieval", "transfer"]); axS.set_xlim(-0.6, 1.6)
+                if col == 0:
+                    axX.set_ylabel("episodes to criterion")
+                    axE.set_ylabel(f"{metric}, first {early_episodes} episodes")
+                    axS.set_ylabel("protection · compensation")
+                else:
+                    for a in (axX, axE, axS):
+                        a.tick_params(labelleft=False)
+            if metric == "success":
+                top[0].set_ylim(0, 1); axes[1][0].set_ylim(0, 1)
+            # the roles as tints of ink: darkest = revisit, lightest = novel family
+            handles = [Line2D([], [], color=_lighten(INK, ROLE_TINT * k), lw=1.6, label=PROBE_LABEL[r])
+                       for k, r in enumerate(roles)]
+            handles.append(Line2D([], [], color=INK, ls=":", lw=0.6, label="criterion"))
+            fig.legend(handles=handles, loc="outside upper center", ncol=len(handles))
+            offset_spines(fig)
+            label_panels(fig, [top[0]] + list(axes[:, 0]))
+            n, ps, ep = cycle_cell(configs[0])
+            caption = (
+                f"The savings probes after a cycle of {n} contexts ({ps}, {ep} episodes per "
+                f"block), {metric}. After the cycle a {n_ep}-episode washout block in the "
+                f"unperturbed plant, then three learning blocks of {n_ep} episodes branch from "
+                f"the end-of-washout state of each run (identical agent, buffer, observer and "
+                f"rng), one per role: revisit of the cycle's first context (rot -60), a novel "
+                f"member of the same family, its mirror image "
+                f"(rot +60: the same magnitude and distance from the washed-out policy, never "
+                f"experienced), and a novel family (reflection across 45°). One column per "
+                f"model; the role is the tint, the model's colour for the revisit and lighter "
+                f"for each novel role. Top: across-seed median of the {smooth_window}-episode "
+                f"mean; dotted horizontal: the criterion {target:.3g} ({criterion_fraction:g} "
+                f"of the best cycle value in this cell); markers: where each plotted curve "
+                f"first crosses it (none if it never does). "
+                f"Second row: episodes to criterion per role, one dot per seed, hollow where "
+                f"never reached (reported at the block end), median and IQR; no crossing can be "
+                f"earlier than the smoothing window, so a branch that starts above criterion "
+                f"sits at that floor. Third row: early-block performance, the mean {metric} "
+                f"over the block's first {early_episodes} episodes, per role, mean and 95% CI "
+                f"over seeds. Bottom, per seed: retrieval is PROTECTION FROM INTERFERENCE, "
+                f"where the revisit's early-block {metric} sits between the revisited context's "
+                f"own naive level (its first cycle visit, first {early_episodes} episodes) and "
+                f"its trained level (its last cycle visit, last {early_episodes} episodes): "
+                f"(revisit − naive) / (trained − naive), 1 = the trained solution survived the "
+                f"interfering rotation and the washout, 0 = back to naive; transfer = the novel "
+                f"member minus the novel family in early-block {metric}, positive means the "
+                f"family helped.")
+            if not all(retrieval_defined(c) for c in configs):
+                caption += (
+                    " Retrieval is not shown in this cell: no conflicting rotation was trained, so "
+                    "a revisit advantage cannot be told from a single policy still parked near the "
+                    "revisited context (the washout leaves every model aiming about +30°); "
+                    "retrieval is read as survival of interference, in the cells that train a "
+                    "second rotation. This cell reads transfer: novel member against novel family.")
+            else:
+                caption += (
+                    " Transfer is not shown in this cell: the trained rot +30 lies 30° from the "
+                    "novel member, whose head start is near-transfer from that rotation rather "
+                    "than family-level transfer; transfer is read from the cells that train one "
+                    "rotation. This cell reads retrieval as survival of interference: the revisit "
+                    "against its novel member after the conflicting rotation was learned.")
+            os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+            path = os.path.join(output_dir, PROBE_SUBDIR, f"savings_probes_{metric}_{tag}")
+            save(fig, path, caption=caption)
+            print(f"Saved {path}")
+
+
+def _probe_traces(ax, pr, cfg, metric, color, crossings, target, smooth_window, fig, roles=None):
+    """One model's probe branches on `ax`: median trace per role in the role's
+    tint, the criterion, and where each plotted curve crosses it."""
+    roles = cell_roles(cfg) if roles is None else roles
+    for k, role in enumerate(roles):
+        block = pr[(pr.config == cfg) & (pr.branch == role)]
+        if block.empty:
+            continue
+        tint = _lighten(color, ROLE_TINT * k)
+        band = median_seed_band(block, metric, None, smooth_window)
+        ax.plot(band.index, band["median"], color=tint, lw=1.1, zorder=3 - 0.5 * k)
+        x_cross = _curve_crossing(band, target) if np.isfinite(target) else np.nan
+        if np.isfinite(x_cross):
+            ax.plot(x_cross, target, **CROSSING_MARKER, color=tint,
+                    transform=crossing_transform(ax, fig))
+    if np.isfinite(target):
+        ax.axhline(target, color=INK, ls=":", lw=0.6)
+
+
+def _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_episodes):
+    """One model's protection comparison on `ax`: the revisited context's FIRST
+    cycle visit (naive learning, lightest tint), its revisit after the
+    interfering rotation and the washout (the model's colour), and its
+    trained level (the last cycle visit's last `early_episodes` episodes,
+    dotted). Protection is where the revisit's start sits between the naive
+    curve and the trained line -- what the score panel quantifies."""
+    rev = pr[(pr.config == cfg) & (pr.branch == "revisit")]
+    if rev.empty:
+        return
+    label = rev["label"].iloc[0].replace("probe ", "", 1)
+    cyc = cycle_only(data)
+    blocks = cyc[(cyc.config == cfg) & (cyc.label == label)]
+    early_mean = lambda g: g.groupby("seed")[metric].apply(
+        lambda v: float(np.nanmean(v.sort_index().to_numpy(float)[:early_episodes]))).mean()
+    naive = trained = np.nan
+    if not blocks.empty:
+        first = blocks[blocks.occurrence == blocks.occurrence.min()].sort_values("ep")
+        band = median_seed_band(first, metric, None, smooth_window)
+        ax.plot(band.index, band["median"], color=_lighten(color, 2 * ROLE_TINT), lw=1.1, zorder=2)
+        naive = early_mean(first)
+        last = blocks[blocks.occurrence == blocks.occurrence.max()].sort_values("ep")
+        trained = last.groupby("seed")[metric].apply(
+            lambda v: float(np.nanmean(v.to_numpy(float)[-early_episodes:]))).mean()
+        if np.isfinite(trained):
+            ax.axhline(trained, color=color, ls=":", lw=0.8, zorder=1)
+    band = median_seed_band(rev, metric, None, smooth_window)
+    ax.plot(band.index, band["median"], color=color, lw=1.1, zorder=3)
+    # the score, drawn: from the naive level, a thin bar up to the trained
+    # level (what there was to lose) and a thick one up to the revisit's
+    # early level (what survived); protection = thick / thin. Both at the
+    # revisit's start, in the early window, so they sit where the score is read.
+    post = early_mean(rev.sort_values("ep"))
+    if np.isfinite(naive) and np.isfinite(trained) and np.isfinite(post):
+        x0 = early_episodes / 2
+        ax.plot([x0 - 1.5, x0 - 1.5], [naive, trained], color=INK, lw=1.2, solid_capstyle="butt", zorder=4)
+        ax.plot([x0 + 1.5, x0 + 1.5], [naive, post], color=color, lw=2.4, solid_capstyle="butt", zorder=4)
+        ax.plot([x0 - 3, x0 + 3], [naive, naive], color=INK, lw=0.6, zorder=4)
+
+
+# the models the paper's probe figure shows (user, 2026-10-08): the open-set
+# COIN is a control and gets its own figure beside the fixed-set one
+PROBE_MAIN_MODELS = ("baseline", "cb_only_end_to_end", "main", "coin")
+PROBE_COIN_MODELS = ("main", "coin", "coin_open")     # the Full Circuit too, so its gap is read against both
+
+
+def plot_savings_probes_coin(data: pd.DataFrame, output_dir: str, metrics: list = None, **kw):
+    """The probe figure for COIN against COIN (open set), with the Full
+    Circuit beside them so its gap to COIN can be read against either
+    version (user, 2026-10-08): the same panels as plot_savings_probes_combined
+    -- file probes/savings_probes_coin_<metric>. The open-set model is the control
+    that the fixed hypothesis set does not drive the result (sac.OpenObserver:
+    contexts are instantiated when a novel hypothesis wins, each learning its
+    own plant model; the null-field washout and the reflection become
+    contexts of their own, the interior rotation does not)."""
+    note = ("COIN (open set) is COIN with its novel-context process: no fixed hypothesis set, "
+            "a context instantiated whenever a novel hypothesis best explains the plant, each "
+            "learning its own plant model; the washout and the reflection become contexts of "
+            "their own, the interior rotation is explained by the trained ones. A control that "
+            "the fixed hypothesis set handed to COIN does not drive the comparison; the Full "
+            "Circuit is shown beside both so its gap can be read against either.")
+    kw.setdefault("stem", "savings_probes_coin")
+    plot_savings_probes_combined(data, output_dir, metrics, models=PROBE_COIN_MODELS, note=note, **kw)
+
+
+def probe_block_lengths(data: pd.DataFrame) -> list:
+    """The non-default block lengths (_ep<N>) among the probe runs, sorted."""
+    pr = probe_rows(data)
+    if pr is None or pr.empty:
+        return []
+    lengths = set()
+    for c in pr["config"].unique():
+        _, _, ep = cycle_cell(c)
+        if ep != sac.N_PHASE_EP:
+            lengths.add(int(ep))
+    return sorted(lengths)
+
+
+def plot_savings_probes_all(data: pd.DataFrame, output_dir: str, metrics: list = None, **kw):
+    """The probe figure for the default block length AND one per non-default
+    length present (user, 2026-10-08: the sub-criterion cells, run with
+    --phase-episodes 50, get their own figures): the same cells with the
+    _ep<N> suffix, files probes/savings_probes_ep<N>_<metric>. Also the
+    COIN-vs-open-set comparison for each (plot_savings_probes_coin_all)."""
+    plot_savings_probes_combined(data, output_dir, metrics, **kw)
+    for n in probe_block_lengths(data):
+        plot_savings_probes_combined(data, output_dir, metrics, retrieval_cell=f"n2rot_ep{n}",
+                                     transfer_cell=f"n2wide_ep{n}", stem=f"savings_probes_ep{n}", **kw)
+    # the COIN comparison belongs to the same selection (user, 2026-10-08)
+    plot_savings_probes_coin_all(data, output_dir, metrics, **kw)
+
+
+def plot_savings_probes_coin_all(data: pd.DataFrame, output_dir: str, metrics: list = None, **kw):
+    """plot_savings_probes_coin for every block length present."""
+    plot_savings_probes_coin(data, output_dir, metrics, **kw)
+    for n in probe_block_lengths(data):
+        plot_savings_probes_coin(data, output_dir, metrics, retrieval_cell=f"n2rot_ep{n}",
+                                 transfer_cell=f"n2wide_ep{n}", stem=f"savings_probes_coin_ep{n}", **kw)
+
+
+def _compensation_traces(ax, pr, cfg, color, smooth_window, early_episodes, aim):
+    """One model's transfer comparison on `ax`: the first-action aim along
+    the novel rotation's branch (the model's colour), the ideal compensation
+    (dotted) and the parked aim it started from (thin line), with the score
+    drawn as in _protection_traces: from the parked level a thin bar up to
+    the ideal (what there was to compensate) and a thick one up to the first
+    `early_episodes` episodes' aim. The score is the first reaches' aim as a
+    fraction of the ideal; the parked level is shown beside it."""
+    t_rot = transfer_rotation(cell_roles(cfg))
+    br = pr[(pr.config == cfg) & (pr.branch == t_rot)] if t_rot else pr.iloc[0:0]
+    if br.empty or "first_angle" not in br.columns:
+        return
+    band = median_seed_band(br, "first_angle", None, smooth_window)
+    ax.plot(band.index, band["median"], color=color, lw=1.1, zorder=3)
+    a = aim[aim.config == cfg]
+    if a.empty:
+        return
+    ideal, parked, first = float(a["ideal"].iloc[0]), float(a["parked"].mean()), float(a["aim"].mean())
+    ax.axhline(ideal, color=color, ls=":", lw=0.8, zorder=1)
+    if np.isfinite(parked) and np.isfinite(first):
+        x0 = early_episodes / 2
+        ax.plot([x0 - 1.5, x0 - 1.5], [parked, ideal], color=INK, lw=1.2, solid_capstyle="butt", zorder=4)
+        ax.plot([x0 + 1.5, x0 + 1.5], [parked, first], color=color, lw=2.4, solid_capstyle="butt", zorder=4)
+        ax.plot([x0 - 3, x0 + 3], [parked, parked], color=INK, lw=0.6, zorder=4)
+
+
+def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                                 criterion_fraction: float = 0.8,
+                                 smooth_window: int = TRACE_SMOOTH_WINDOW,
+                                 early_episodes: int = PROBE_EARLY_EPISODES,
+                                 retrieval_cell: str = "n2rot", transfer_cell: str = "n2wide",
+                                 models: tuple = None, stem: str = "savings_probes",
+                                 note: str = ""):
+    """THE PROBE FIGURE: the two cells that answer the two questions, in one
+    figure -- file probes/savings_probes_<metric> (user, 2026-10-07; the
+    per-cell four-row figures, savings_probes_<metric>_<cell>, remain as the
+    detailed view). Models across.
+
+      a  interference cell (the rotation pair, rot -60 then rot +30): per
+         model, the revisit of rot -60 after the interfering rotation and the
+         washout against the same context's first cycle visit (naive) and
+         its trained level -- the comparison protection scores
+      b  transfer cell (the wide pair, rot -30 and rot -90, washout): per
+         model, the first-action aim along the interior rotation's branch
+         against the ideal compensation and the parked aim it started from
+      c  retrieval = protection from interference (from a), per model
+      d  transfer = feedforward compensation at the interior (from b), per
+         model (user, 2026-10-08: success is at ceiling there for every model)
+
+    `models` are the base presets shown, in config order: the paper's four
+    (PROBE_MAIN_MODELS) by default; plot_savings_probes_coin draws the same
+    figure for coin against coin_open (user, 2026-10-08: the open-set COIN
+    is a control and gets its own figure). `stem` names the file, `note`
+    is appended to the caption.
+    """
+    models_wanted = PROBE_MAIN_MODELS if models is None else tuple(models)
+    metrics = METRICS if metrics is None else metrics
+    pr = probe_rows(data)
+    if pr is None or pr.empty:
+        print("No probe branches in the data; skipping savings_probes")
+        return
+    cfgs = {c for c in pr["config"].unique() if set(cell_roles(c)) <= set(pr[pr.config == c]["branch"])}
+    by_cell = {tag: [c for c in get_config_order(pr) if c in cfgs and cell_tag(c) == tag]
+               for tag in (retrieval_cell, transfer_cell)}
+    if not any(by_cell.values()):
+        print(f"No complete probe runs in cells {retrieval_cell} / {transfer_cell}; skipping savings_probes")
+        return
+    models = []
+    for c in get_config_order(pr):
+        if c in cfgs and cell_tag(c) in by_cell and base_config(c) in models_wanted \
+                and base_config(c) not in models:
+            models.append(base_config(c))
+    if not models:
+        print(f"None of {models_wanted} has complete probe runs; skipping {stem}")
+        return
+    of = {(tag, base_config(c)): c for tag in by_cell for c in by_cell[tag]}
+    crossings = probe_crossings(data, metrics, criterion_fraction, smooth_window)
+    early = probe_early(data, metrics, early_episodes)
+    scores = probe_scores(crossings, early, revisit_levels(data, metrics, early_episodes),
+                          transfer_aim(data, early_episodes))
+    # the block length of THIS figure's cells (not of every probe run loaded:
+    # the 150-episode cells sit beside the _ep50 ones). Short blocks (the
+    # sub-criterion cells): a 25-episode window would hide half of each
+    # trace, so the window shrinks to a fifth of the block
+    own = crossings[crossings.config.isin(sum(by_cell.values(), []))]
+    n_ep = int(own["n_ep"].max()) if len(own) else 0
+    if n_ep:
+        smooth_window = min(smooth_window, max(5, n_ep // 5))
+    def head(tag, what):
+        cfg = next(iter(by_cell[tag]), None)
+        if cfg is None:
+            return what
+        n, ps, ep = cycle_cell(cfg)
+        trained = [T.C_LABEL[c] for c in sac.phase_ids_for(ps)]
+        wash = "" if "_nowash" in split_run_name(cfg)[1] else ", washout"
+        return f"{what}: {' then '.join(trained)} trained{wash}"
+    heads = {retrieval_cell: head(retrieval_cell, "interference cell"),
+             transfer_cell: head(transfer_cell, "transfer cell")}
+    t_roles = cell_roles(by_cell[transfer_cell][0]) if by_cell[transfer_cell] else ()
+    aim = transfer_aim(data, early_episodes)
+    t_rot = transfer_rotation(t_roles)
+    t_label = PROBE_LABEL.get(t_rot, "novel rotation")
+    if by_cell[transfer_cell]:
+        t_ideal, _ = transfer_ideal_aim(by_cell[transfer_cell][0])
+        t_label += f" (rot {-t_ideal:+.0f})"
+
+    for metric in metrics:
+        if metric not in pr.columns:
+            continue
+        fig = plt.figure(figsize=figsize("double" if len(models) > 3 else "onehalf", height=6.6),
+                         layout="constrained")
+        # a thin legend strip above each trace row (user, 2026-10-07: each row's
+        # legend on top of its own panels), then the score panel
+        gs = fig.add_gridspec(5, len(models), height_ratios=[0.1, 1.0, 0.1, 1.0, 1.15])
+        row_of = {0: 1, 1: 3}
+        legend_handles = {
+            retrieval_cell: [Line2D([], [], color=INK, lw=1.6, label="revisit, after interference"),
+                             Line2D([], [], color=_lighten(INK, 2 * ROLE_TINT), lw=1.6, label="first visit (naive)"),
+                             Line2D([], [], color=INK, ls=":", lw=0.8, label="trained level"),
+                             Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="naive → trained"),
+                             Line2D([], [], color=INK, lw=2.4, marker="|", ms=8, mew=2.4, ls="",
+                                    label="naive → revisit (protection = ratio)")],
+            transfer_cell: [Line2D([], [], color=INK, lw=1.6, label="first-action aim"),
+                            Line2D([], [], color=INK, ls=":", lw=0.8, label="ideal compensation"),
+                            Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="parked → ideal"),
+                            Line2D([], [], color=INK, lw=2.4, marker="|", ms=8, mew=2.4, ls="",
+                                   label="parked → first reaches")]}
+        first_axes = []
+        for r_, tag in enumerate((retrieval_cell, transfer_cell)):
+            strip = fig.add_subplot(gs[row_of[r_] - 1, :]); strip.axis("off")
+            # no title: which cell each row is (its trained contexts, the
+            # washout) is in the caption (user, 2026-10-08)
+            strip.legend(handles=legend_handles[tag], loc="center", ncol=len(legend_handles[tag]),
+                         borderaxespad=0, handlelength=1.6)
+            tr_axes = [fig.add_subplot(gs[row_of[r_], col]) for col in range(len(models))]
+            for a in tr_axes[1:]:
+                a.sharey(tr_axes[0])
+            first_axes.append(tr_axes[0])
+            cell_cfgs = by_cell[tag]
+            tgt = crossings[(crossings.metric == metric) & crossings.config.isin(cell_cfgs)]["criterion_target"]
+            target = float(tgt.iloc[0]) if len(tgt) else np.nan
+            for col, base in enumerate(models):
+                ax = tr_axes[col]
+                cfg = of.get((tag, base))
+                color = CONFIG_COLORS.get(base, "gray")
+                if cfg is None:
+                    ax.text(0.5, 0.5, "not run", ha="center", va="center", color=MUTED,
+                            transform=ax.transAxes)
+                elif r_ == 0:
+                    _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_episodes)
+                else:
+                    _compensation_traces(ax, pr, cfg, color, smooth_window, early_episodes, aim)
+                ax.set_title(display_name(base, wrap=True) if r_ == 0 else "")
+                ax.set_xlabel("Episodes since switch")
+                if col == 0:
+                    ax.set_ylabel(f"{metric.capitalize()} ({smooth_window}-episode mean)" if r_ == 0
+                                  else f"First-action aim (°, {smooth_window}-episode mean)")
+                else:
+                    ax.tick_params(labelleft=False)
+            if metric == "success" and r_ == 0:
+                tr_axes[0].set_ylim(0, 1)            # pin BEFORE trimming the spines
+            for a in tr_axes:
+                offset_spines(a)
+
+        # c: both scores in their own units, one pair per model: protection on
+        # the left axis (0 = naive, 1 = fully protected), transfer on the right
+        # (a success-rate difference). Raw, not z-scored (user, 2026-10-07): a
+        # z-score's zero is the average over whichever models are plotted and
+        # its scale pools seed noise with model differences.
+        # c, d: the two scores side by side, each on its own axis (user,
+        # 2026-10-07, after trying a twin axis: two panels, with the reference
+        # lines). Raw units, not z-scores.
+        gs_sc = gs[4, :].subgridspec(1, 2, wspace=0.12)
+        axS, axT = fig.add_subplot(gs_sc[0, 0]), fig.add_subplot(gs_sc[0, 1])
+        per = {}
+        for score, tag in (("retrieval", retrieval_cell), ("transfer", transfer_cell),
+                           ("transfer_parked", transfer_cell)):
+            per[score] = {}
+            for base in models:
+                cfg = of.get((tag, base))
+                sc = scores[(scores.config == cfg) & (scores.metric == metric)] if cfg else pd.DataFrame()
+                per[score][base] = sc[score].to_numpy(float) if len(sc) else np.array([np.nan])
+        cols = [CONFIG_COLORS.get(b, "gray") for b in models]
+        labels = [display_name(b, wrap=True) for b in models]
+        swarm_ci(axS, [per["retrieval"][b] for b in models], colors=cols, labels=labels, jitter=0.12)
+        r_all = np.concatenate(list(per["retrieval"].values()))
+        lo = min(-0.1, np.nanmin(r_all) - 0.05) if np.isfinite(np.nanmin(r_all)) else -0.1
+        axS.set_ylim(lo, 1.1)
+        chance_line(axS, 1, "Trained", x=0.0)
+        chance_line(axS, 0, "Naive", x=0.0, above=False)
+        for t in axS.texts:
+            t.set_ha("left")
+        axS.set_ylabel("Protection")
+        axS.set_title("Retrieval")
+        swarm_ci(axT, [per["transfer"][b] for b in models], colors=cols, labels=labels, jitter=0.12,
+                 mean_kw=dict(mfc="white"))
+        # the parked level per model (the residue the probe started from), a
+        # muted tick to the left of the swarm: the gap from it to the mean is
+        # what the probe's first reaches added
+        labelled = False
+        for i, b in enumerate(models):
+            pk = per["transfer_parked"][b]
+            if np.isfinite(np.nanmean(pk)):
+                axT.plot([i - 0.3], [np.nanmean(pk)], marker="_", ms=9, mew=1.4, color=MUTED, ls="", zorder=2)
+                if not labelled:        # the first tick names them all, as panel c's lines are named
+                    axT.annotate("parked", (i - 0.3, np.nanmean(pk)), xytext=(0, -3), textcoords="offset points",
+                                 ha="center", va="top", color=MUTED, fontsize=plt.rcParams["xtick.labelsize"])
+                    labelled = True
+        t_all = np.concatenate(list(per["transfer"].values()) + list(per["transfer_parked"].values()))
+        lo = min(-0.1, np.nanmin(t_all) - 0.05) if np.isfinite(np.nanmin(t_all)) else -0.1
+        axT.set_ylim(lo, max(1.1, np.nanmax(t_all) + 0.05) if np.isfinite(np.nanmax(t_all)) else 1.1)
+        chance_line(axT, 1, "Ideal", x=0.0)
+        chance_line(axT, 0, "Straight at the goal", x=0.0, above=False)
+        for t in axT.texts:
+            t.set_ha("left")
+        axT.set_ylabel("Fractional compensation")
+        axT.set_title("Transfer")
+        for a in (axS, axT):
+            offset_spines(a)
+            a.spines["bottom"].set_visible(False)
+            # a bracket under each model, as the grouped bar/box figures have
+            bracket_xticks(a, half_width=0.32, positions=list(range(len(models))), labels=labels)
+
+        label_panels(fig, first_axes + [axS, axT])
+        caption = (
+            f"The savings probes, {metric}. After each cycle a {n_ep}-episode washout in the "
+            f"unperturbed plant, then learning blocks of {n_ep} episodes branch from the "
+            f"end-of-washout state (identical agent, buffer, observer and rng): a revisit, a "
+            f"novel rotation and a novel family (reflection across 45°); across-seed medians of "
+            f"the {smooth_window}-episode mean. (a) Interference cell: {heads[retrieval_cell]}. "
+            f"Per model, the revisit of the first context after the conflicting rotation and "
+            f"the washout (the model's colour) against the same context's first cycle visit "
+            f"(naive learning, lightest tint) and its trained level (dotted: the last cycle "
+            f"visit's last {early_episodes} episodes); a protected memory starts at the trained "
+            f"line, an overwritten one on the naive curve. The two bars at the revisit's start "
+            f"draw the score: from the naive level, the thin bar rises to the trained level and "
+            f"the thick one to the revisit's first {early_episodes} episodes; protection is "
+            f"their ratio. (b) Transfer cell: {heads[transfer_cell]}; the {t_label} branch is "
+            f"the midpoint of the trained anchors, so learning it is interpolation. Per model, "
+            f"the first-action aim along that branch -- the signed angle from the goal "
+            f"direction to the first action, the feedforward compensation -- against the ideal "
+            f"(dotted: the aim that cancels the rotation) and the parked aim the policy left the "
+            f"washout with (the thin baseline). The bars draw the comparison as in (a): thin "
+            f"from parked to ideal, thick from parked to the branch's first {early_episodes} "
+            f"episodes. Success is not used here: after a washout "
+            f"every policy sits within the controller's feedback tolerance of the interior "
+            f"rotation and succeeds at once, context or not. (c) Retrieval as protection from "
+            f"interference in (a), per seed: (revisit − naive) / (trained − naive) in "
+            f"early-block {metric} (first {early_episodes} episodes); 1 = the trained solution "
+            f"survived the conflicting rotation and the washout, 0 = back to naive. (d) Transfer "
+            f"in (b), per seed: the first {early_episodes} reaches' aim as a fraction of the "
+            f"ideal; 1 = aimed as the rotation demands, 0 = straight at the goal. The muted tick "
+            f"left of each swarm is the model's parked aim on the same scale, the residue it "
+            f"carried out of the washout; what the probe added is the gap from the tick to the "
+            f"mean. Mean and 95% CI over seeds in (c) and (d). The novel "
+            f"rotation is novel to the learner but lies in the frozen circuit's pretraining "
+            f"table; the reflection is novel to both." + (f" {note}" if note else ""))
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"{stem}_{metric}")
+        save(fig, path, caption=caption)
+        print(f"Saved {path}")
+
+
+def _ci95(v):
+    v = np.asarray(v, float); v = v[np.isfinite(v)]
+    if len(v) < 2:
+        return (float(v.mean()) if len(v) else np.nan), np.nan
+    return float(v.mean()), float(1.96 * v.std(ddof=1) / np.sqrt(len(v)))
+
+
+def plot_cycle_length(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                      criterion_fraction: float = 0.8,
+                      smooth_window: int = TRACE_SMOOTH_WINDOW,
+                      early_episodes: int = PROBE_EARLY_EPISODES):
+    """Savings against the number of contexts in the cycle -- file
+    probes/cycle_length_<metric>. Per model, mean +- 95% CI over seeds at each N.
+
+      a  within-cycle savings on the common first context (rot -60): the
+         early-block metric (first `early_episodes` episodes) on its second
+         visit minus its first
+      b  retrieval = protection from interference (probe_scores), from the
+         cells that train a CONFLICTING rotation (retrieval_defined): the
+         two-rotation pair at N = 2 and the full set
+      c  transfer score from the probes, early-block, from the cells that
+         train ONE rotation (transfer_defined): the two-family pair at
+         N = 2 and the triple
+
+    The line joins the standard cells (two rotations, one per family, the
+    full set at the default block length); the two-family pair at N = 2 is a
+    hollow marker and a gap-matched cell (longer blocks) a square. A single
+    stored policy predicts (a) and (b) falling with N; a retrieval system
+    predicts them flat.
+    """
+    metrics = METRICS if metrics is None else metrics
+    cyc = cycle_only(data)
+    if cyc is None or cyc.empty:
+        return
+    cells = {cfg: cycle_cell(cfg) for cfg in cyc["config"].unique()}
+    if len({c[0] for c in cells.values()}) < 2:
+        print("One cycle length only; skipping cycle_length_*")
+        return
+    first_label = T.C_LABEL[sac.phase_ids_for("mixed")[0]]
+    # early-block performance of the common first context on each cycle visit
+    vis_rows = []
+    for (cfg, seed, occ), g in cyc[cyc.label == first_label].groupby(["config", "seed", "occurrence"]):
+        for metric in metrics:
+            if metric in g.columns:
+                vis_rows.append({"config": cfg, "seed": seed, "occurrence": occ, "metric": metric,
+                                 "early": early_block_mean(g, metric, early_episodes)})
+    visits = pd.DataFrame(vis_rows)
+    crossings = probe_crossings(data, metrics, criterion_fraction, smooth_window)
+    scores = probe_scores(crossings, probe_early(data, metrics, early_episodes),
+                          revisit_levels(data, metrics, early_episodes),
+                          transfer_aim(data, early_episodes))
+    bases = []
+    for cfg in get_config_order(cyc):
+        if base_config(cfg) not in bases:
+            bases.append(base_config(cfg))
+    # the STANDARD block length is the one most cells use (the production
+    # default, or a cut-down one in a development dataset); a cell at another
+    # length is the gap-matched variant
+    std_ep = pd.Series([c[2] for c in cells.values()]).mode().iloc[0]
+    dodge = {b: (i - (len(bases) - 1) / 2) * 0.08 for i, b in enumerate(bases)}
+    for metric in metrics:
+        fig, axes = plt.subplots(1, 3, figsize=figsize("double", height=2.4), layout="constrained")
+        for base in bases:
+            color = CONFIG_COLORS.get(base, "gray")
+            cfgs = [c for c in cells if base_config(c) == base and _schedule_of(c) == "cycle"]
+            pts = {"a": {}, "b": {}, "c": {}}          # (n, kind) -> (mean, ci)
+            for cfg in cfgs:
+                n, ps, ep = cells[cfg]
+                kind = ("ep" if ep != std_ep else "mix" if ps == "pair_mixed" else "std")
+                # retrieval from the cells with an interfering rotation, transfer
+                # from the cells without one; each panel's cells are its standard
+                # points, so no hollow marker is needed in (b) or (c)
+                r_kind = ("ep" if ep != std_ep else "std") if retrieval_defined(cfg) else None
+                t_kind = ("ep" if ep != std_ep else "std") if transfer_defined(cfg) else None
+                v = visits[(visits.config == cfg) & (visits.metric == metric)]
+                if not v.empty:
+                    w = v.pivot_table(index="seed", columns="occurrence", values="early")
+                    if {0, 1} <= set(w.columns):
+                        pts["a"][(n, kind)] = _ci95(w[1] - w[0])
+                sc = scores[(scores.config == cfg) & (scores.metric == metric)]
+                if not sc.empty:
+                    if r_kind is not None:
+                        pts["b"][(n, r_kind)] = _ci95(sc["retrieval"])
+                    if t_kind is not None:
+                        pts["c"][(n, t_kind)] = _ci95(sc["transfer"])
+            dx = dodge[base]
+            for ax, key in zip(axes, ("a", "b", "c")):
+                std = sorted((n, m, e) for (n, k), (m, e) in pts[key].items() if k == "std")
+                if std:
+                    ax.errorbar([p[0] + dx for p in std], [p[1] for p in std], [p[2] for p in std],
+                                fmt="o-", color=color, lw=1.2, ms=4, capsize=0)
+                for (n, k), (m, e) in pts[key].items():
+                    if k == "mix":
+                        # the style zeroes marker edges, so a hollow marker needs its own
+                        ax.errorbar(n + dx + 0.2, m, e, fmt="o", color=color, mfc="white", mec=color,
+                                    mew=0.8, ms=4, capsize=0)
+                    elif k == "ep":
+                        ax.errorbar(n + dx - 0.2, m, e, fmt="s", color=color, ms=4, capsize=0)
+        ns = sorted({c[0] for c in cells.values()})
+        for ax, title, ylab in zip(axes, (f"within-cycle savings, {first_label}", "retrieval (probes)",
+                                          "transfer (probes)"),
+                                   (f"visit 2 − visit 1, early {metric}", "protection from interference",
+                                    "feedforward compensation at the novel rotation")):
+            chance_line(ax, 0)
+            ax.set_xticks(ns); ax.set_xlabel("contexts in the cycle")
+            ax.set_title(title); ax.set_ylabel(ylab)
+        handles = [Line2D([], [], color=CONFIG_COLORS.get(b, "gray"), marker="o", ls="-", lw=1.2, ms=4,
+                          label=display_name(b)) for b in bases]
+        handles += [Line2D([], [], color=INK, marker="o", mfc="white", mec=INK, mew=0.8, ls="", ms=4,
+                           label="two families at N = 2"),
+                    Line2D([], [], color=INK, marker="s", ls="", ms=4,
+                           label=f"other block length (gap-matched; standard {std_ep})")]
+        fig.legend(handles=handles, loc="outside lower center", ncol=min(len(handles), 6))
+        offset_spines(fig)
+        label_panels(fig)
+        caption = (
+            f"Savings against the number of contexts in the cycle, in early-block {metric} "
+            f"(the mean over a block's first {early_episodes} episodes); mean +- 95% CI over "
+            f"seeds. (a) Within-cycle savings on {first_label}, the first context of every cell: "
+            f"its second visit minus its first. (b, c) The probe scores (see savings_probes), "
+            f"after a null-field washout: retrieval = protection from interference, (revisit − "
+            f"naive) / (trained − naive) in early-block {metric}, the revisited context's own "
+            f"first-visit and last-visit levels being the references, 1 = fully protected, 0 = "
+            f"back to naive; transfer = feedforward compensation at the novel rotation, the "
+            f"first reaches' aim as a fraction of the ideal, 1 = aimed as the rotation demands, "
+            f"0 = straight at the goal. Retrieval is read from the cells that train a conflicting "
+            f"rotation (the two-rotation pair and the full set); where none was trained there "
+            f"is no interference to be protected from. Transfer is read "
+            f"from the cells that train one rotation (the two-family pair and the triple): "
+            f"with a second rotation 30° from the novel member, its head start is "
+            f"near-transfer, not family-level transfer. The "
+            f"family helped. "
+            f"Lines join the standard "
+            f"cells (two rotations; one per family; the full set) at {std_ep} episodes per "
+            f"block, models dodged slightly on x; the hollow marker at N = 2 is the two-family "
+            f"pair (rotation + curl), the square a cell at another block length, matching the "
+            f"full set's gap between visits. A single stored policy predicts (a) and (b) falling with N; a retrieval "
+            f"system predicts them flat.")
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"cycle_length_{metric}")
+        save(fig, path, caption=caption)
+        print(f"Saved {path}")
+
+
 SELECTABLE = {
+    "traces_by_context": lambda data, out: plot_metric_traces_by_context(data, METRICS, out),
+    "savings_probes": plot_savings_probes_all,
+    "savings_probes_coin": plot_savings_probes_coin_all,
+    "savings_probes_cells": plot_savings_probes,
+    "cycle_length": plot_cycle_length,
     "paradigm_overview": plot_paradigm_overview,
     "channel_comparison": plot_channel_schedule_comparison,
     "rb_variants": plot_rb_variants,
@@ -4497,6 +5743,7 @@ def main(only=None, cfg=None):
     # plot_curve_parameters(fit_data, METRICS, PLOT_OUTPUT_DIR)
     plot_metric_traces(data, METRICS, PLOT_OUTPUT_DIR)
     plot_metric_traces_by_phase_visit(data, METRICS, PLOT_OUTPUT_DIR)
+    plot_metric_traces_by_context(data, METRICS, PLOT_OUTPUT_DIR)
     plot_criterion_crossing(data, METRICS, PLOT_OUTPUT_DIR)
     plot_criterion_crossing_by_phase_occurrence(data, METRICS, PLOT_OUTPUT_DIR)
     plot_criterion_summary(data, PLOT_OUTPUT_DIR)
@@ -4509,6 +5756,9 @@ def main(only=None, cfg=None):
     plot_context_belief(data, PLOT_OUTPUT_DIR)
     plot_savings_washout(data, PLOT_OUTPUT_DIR)
     plot_paradigm_overview(data, PLOT_OUTPUT_DIR)
+    plot_savings_probes_combined(data, PLOT_OUTPUT_DIR)
+    plot_savings_probes(data, PLOT_OUTPUT_DIR)
+    plot_cycle_length(data, PLOT_OUTPUT_DIR)
     # the bank-deal pair: why the channel mean is a mixture average, and the
     # estimator that integrates the deal out. No-ops without a `carry` run.
     plot_channel_decompositions(data, PLOT_OUTPUT_DIR)

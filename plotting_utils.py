@@ -254,15 +254,29 @@ def _trim_one(a, axis, s, horizontal, extend):
     auto = a.get_autoscalex_on() if horizontal else a.get_autoscaley_on()
     margin = a.margins()[0 if horizontal else 1]
     ticks = None
+
+    def data_interval():
+        # the UNION over axes that share this axis: a shared axis must enclose
+        # every sibling's data, not just this panel's (a row of swarms with
+        # sharey otherwise clipped the panels whose values exceed the first's)
+        import numpy as np
+        group = (a.get_shared_x_axes() if horizontal else a.get_shared_y_axes())
+        sibs = list(group.get_siblings(a)) or [a]
+        ivs = [sorted((s_.xaxis if horizontal else s_.yaxis).get_data_interval()) for s_ in sibs]
+        ivs = [iv for iv in ivs if np.all(np.isfinite(iv)) and iv[1] >= iv[0]]
+        if not ivs:
+            return sorted(axis.get_data_interval())
+        return min(iv[0] for iv in ivs), max(iv[1] for iv in ivs)
+
     if extend and auto:
-        dlo, dhi = sorted(axis.get_data_interval())
+        dlo, dhi = data_interval()
         ticks = _choose_ticks(axis, dlo, dhi, enclose=True)
         if ticks is not None:
             pad = margin * (ticks[-1] - ticks[0])
             set_lim(ticks[0] - pad, ticks[-1] + pad)
     if ticks is None:
         lo, hi = sorted(axis.get_view_interval())
-        dlo, dhi = sorted(axis.get_data_interval())
+        dlo, dhi = data_interval()
         dlo, dhi = max(dlo, lo), min(dhi, hi)          # the data on show
         ticks = _choose_ticks(axis, lo, hi, enclose=False, data=(dlo, dhi))
         if ticks is not None:
@@ -368,9 +382,30 @@ def bracket_xticks(ax: Union[plt.Axes, plt.Figure, None] = None, half_width: flo
 
 
 def label_panels(fig: plt.Figure, axes=None, x: float = -0.12, y: float = 1.05,
-                 size: float = 9, weight: str = "bold", start: str = "a") -> None:
-    """Letter each axes (a, b, c, ...) in the top-left, Nature style."""
+                 size: float = 9, weight: str = "bold", start: str = "a",
+                 align: bool = False) -> None:
+    """Letter each axes (a, b, c, ...) in the top-left, Nature style.
+
+    `align=True` puts every letter on ONE figure x, the left edge of the
+    leftmost axes (after a layout pass) minus the usual offset, so a wide
+    panel whose long y label pushes its axes box right does not carry its
+    letter with it (the probe figure's score panel under four trace columns).
+    The y stays per axes."""
     axes = list(fig.axes if axes is None else axes)
+    if align and axes:
+        # Letters first at their usual per-axes spot (so the layout reserves
+        # room for them), then after a layout pass moved to one common x: the
+        # left edge of the leftmost axes minus that axes' usual offset. Each
+        # letter stays in its own axes' coordinates.
+        texts = [a.text(x, y, chr(ord(start) + i), transform=a.transAxes, size=size,
+                        weight=weight, ha="right", va="bottom") for i, a in enumerate(axes)]
+        fig.canvas.draw()
+        pos = [a.get_position() for a in axes]
+        lead = min(range(len(axes)), key=lambda i: pos[i].x0)
+        common = pos[lead].x0 + x * pos[lead].width          # figure fraction
+        for a, p_, t in zip(axes, pos, texts):
+            t.set_x((common - p_.x0) / p_.width)
+        return
     for i, a in enumerate(axes):
         a.text(x, y, chr(ord(start) + i), transform=a.transAxes, size=size,
                weight=weight, ha="right", va="bottom")

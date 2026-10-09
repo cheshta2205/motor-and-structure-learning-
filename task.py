@@ -302,6 +302,8 @@ def context_affine(c):
         return I, (np.float32(param) * rot_mat(np.pi / 2)).astype(np.float32), z
     if kind == LINEAR_KIND:                           # a general action transform
         return LINEAR_MATS[int(c)], Z, z
+    if kind == REFLECTION_KIND:                       # the retired family, as a probe
+        return refl_mat(np.deg2rad(param)), Z, z
     return I, Z, (DRIFT_VEL * unit(param)).astype(np.float32)     # drift
 
 
@@ -415,6 +417,28 @@ def wide_rotation_ids():
 LINEAR_KIND = 3
 LINEAR_ID_BASE = 10_000
 LINEAR_MATS = {}
+
+# THE REFLECTION FAMILY, as registered contexts (2026-10-07). Retired from the
+# table (see refl_mat), it is the one force law that is norm-preserving like a
+# rotation yet belongs to no trained family -- which makes it the NOVEL-FAMILY
+# probe of the savings experiment: how fast is a context learned when neither
+# it nor any relative has been met. Registered like the off-table rotations
+# (rotation_id), under its own kind and id base; N_CONTEXTS is unchanged.
+REFLECTION_KIND = 4
+REFL_ID_BASE = 20_000
+
+
+def reflection_id(phi_deg):
+    """The context id of the reflection across the axis at `phi_deg`,
+    registering it if needed. Idempotent; M(phi) = M(phi + 180), so the
+    axis is taken modulo 180."""
+    phi = float(phi_deg) % 180.0
+    c = REFL_ID_BASE + int(round(phi * 10.0))
+    if c not in FAMILY:
+        FAMILY[c] = REFLECTION_KIND
+        C_PARAM[c] = phi
+        C_LABEL[c] = f"refl {phi:g}"
+    return c
 RANDOM_LINEAR_SEED = 2026
 
 

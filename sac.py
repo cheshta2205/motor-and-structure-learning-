@@ -36,6 +36,7 @@ would silently diverge from the training distribution right at a wall.
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import time
@@ -493,7 +494,7 @@ DEFAULT_COUNT_PRIOR = 1.0
 NOCPRIOR_SUFFIX = "_nocprior"    # the run-name tag for turning it back off
 
 
-ORACLE_SOURCES = ("given", "bayes", "cb")
+ORACLE_SOURCES = ("given", "bayes", "cb", "open")
 
 
 class _ContextPosterior:
@@ -515,6 +516,7 @@ class _ContextPosterior:
         # own right. Appended LAST so the phase indices are unchanged, with the
         # ZERO code -- what the given oracle emits outside a context
         # (oracle_code(None)) -- so a null-certain code sits at the origin.
+        self.always_counts = False
         self.null_context = bool(null_context)
         if self.null_context:
             self.ids.append(None)
@@ -619,6 +621,8 @@ def observer_angle(observer) -> float:
     for p, cid in zip(post, observer.ids):
         if cid is None:
             mass += p
+        elif isinstance(cid, str):            # the open observer's own labels
+            continue
         elif T.FAMILY[int(cid)] == 0:
             mass += p
             tot += p * float(T.C_PARAM[int(cid)])
@@ -759,6 +763,203 @@ class CBObserver(_ContextPosterior):
         return -0.5 * np.sum(r ** 2, axis=1)
 
 
+# ── The OPEN-SET observer: COIN with its novel-context process ────────────
+#
+# (2026-10-08, user.) `coin` is a posterior over a FIXED hypothesis set -- the
+# trained contexts, plus the identity plant when observer_has_null says so.
+# Heald, Lengyel & Wolpert's COIN has no such set: a Dirichlet-process prior
+# lets a "novel context" hypothesis compete on every trial, and when it wins
+# a new context is instantiated with its own state. So a null-field washout,
+# a never-seen rotation and a reflection each become a context of their own,
+# and there is no single null hypothesis but as many as the data call for.
+#
+# This observer is that, on our plant. Each known context j owns a Bayesian
+# linear model of the force law, y = Theta_j x + eps with
+#   x = [a, v_prev, 1] (5), y = dv MASS/DT + DAMPING v_prev (2),
+#   eps ~ N(0, (CMD_NOISE |a|)^2 I)        -- the BayesObserver's noise --
+# so Theta = [A, B, w MASS/DT] is exactly the plant. Rows share the Gaussian
+# posterior (precision Lambda_j, Lambda_j m_j = eta_j), updated by each step
+# weighted by the context's responsibility, so a context learns from the
+# steps it owns. The NOVEL hypothesis is the prior: mean the identity plant
+# (the null field), per-coefficient variance the table's spread of plants
+# (`open_prior_scales`). Likelihoods are the full Gaussian predictives,
+# normaliser included: a context whose model is sharp and wrong loses to the
+# broad novel one, which is what makes a switch to something new detectable.
+# Transitions are the sticky step with a CRP jump: known j in proportion to
+# its visit count, novel in proportion to OPEN_CRP_ALPHA. When the novel
+# hypothesis is the most likely explanation of a step it is instantiated:
+# its mass moves to a new context whose model starts at the prior, with the
+# next unit-norm code from a fixed pool (same GP draw as the given oracle's
+# codes). The novel slot's own code is the origin, the "no context" code.
+# Instantiation waits for the novel hypothesis to lead on OPEN_SPAWN_DWELL
+# consecutive evidence steps: COIN's particle filter spawns in some particles
+# and resamples the spurious ones away when a known context explains the next
+# trials better; a deterministic argmax has no such back-off, and one step
+# where a young, slightly-off model trails the broad prior would otherwise
+# split a context in two. Caps at OPEN_MAX_CONTEXTS. Plants are stationary in the task, so there is
+# no state drift (COIN's retention/process noise); a context's model only
+# sharpens. Run it as the preset `coin_open`; the `coin` preset is unchanged.
+OPEN_CRP_ALPHA = 1.0            # the novel hypothesis's pseudo-count at a jump
+OPEN_COUNT_FLOOR = 0.05         # a known context's weight before its first visit
+OPEN_MAX_CONTEXTS = 12
+OPEN_SPAWN_DWELL = 3            # evidence steps the novel hypothesis must lead before it is instantiated
+OPEN_PRIOR_FLOOR = 1e-3         # a coefficient's prior variance is at least this
+OPEN_CODE_SEED_OFFSET = 777     # the code pool's draw (ORACLE_EMBED_SEED_BASE + this)
+OPEN_NOVEL = "novel"            # the novel slot's id; known contexts are "open<i>"
+
+
+def open_prior_scales() -> np.ndarray:
+    """The prior variance of each of the five plant coefficients, pooled over
+    the table contexts and the null field: A's entries around the identity,
+    B's around zero, the drift (force units) around zero. The analogue of
+    COIN's stationary prior over context states."""
+    thetas = []
+    for c in list(range(T.N_CONTEXTS)) + [None]:
+        A, B, w = T.context_affine(c)
+        thetas.append(np.hstack([np.asarray(A, np.float64), np.asarray(B, np.float64),
+                                 np.asarray(w, np.float64).reshape(2, 1) * (T.MASS / T.DT)]))
+    th = np.stack(thetas) - np.hstack([np.eye(2), np.zeros((2, 3))])    # (C, 2, 5)
+    var_a = float(np.mean(th[:, :, :2] ** 2))
+    var_b = float(np.mean(th[:, :, 2:4] ** 2))
+    var_d = float(np.mean(th[:, :, 4] ** 2))
+    return np.maximum(np.array([var_a, var_a, var_b, var_b, var_d]), OPEN_PRIOR_FLOOR)
+
+
+class _PlantModel:
+    """One context's Gaussian posterior over Theta (5 -> 2), rows sharing the
+    precision. eta = Lambda m."""
+
+    def __init__(self, lam0, eta0):
+        self.lam = np.array(lam0, dtype=np.float64, copy=True)
+        self.eta = np.array(eta0, dtype=np.float64, copy=True)
+
+    def loglik(self, x, y, s2):
+        lam_inv_x = np.linalg.solve(self.lam, x)
+        mu = self.eta.T @ lam_inv_x                          # (2,) = m^T x
+        var = s2 + float(x @ lam_inv_x)
+        return float(-0.5 * np.sum((y - mu) ** 2) / var - np.log(2.0 * np.pi * var))
+
+    def observe(self, x, y, s2, weight=1.0):
+        self.lam += weight * np.outer(x, x) / s2
+        self.eta += weight * np.outer(x, y) / s2
+
+    @property
+    def theta(self):
+        """The posterior-mean plant, (2, 5) = [A, B, d]."""
+        return np.linalg.solve(self.lam, self.eta).T
+
+
+class OpenObserver(_ContextPosterior):
+    """COIN with the novel-context process (see the comment above). `embed`
+    only sets the code width; the codes come from the pool."""
+    always_counts = True        # its CRP needs the visit counts whatever count_prior says
+
+    def __init__(self, embed, hazard=BAYES_SWITCH_HAZARD, cmd_noise=None,
+                 alpha=OPEN_CRP_ALPHA, max_contexts=OPEN_MAX_CONTEXTS, code_seed=0):
+        dim = int(np.asarray(embed).shape[1])
+        self.alpha = float(alpha)
+        self.max_contexts = int(max_contexts)
+        self.sigma = float(T.CMD_NOISE if cmd_noise is None else cmd_noise)
+        scales = open_prior_scales()
+        self.lam0 = np.diag(1.0 / scales)
+        self.m0 = np.hstack([np.eye(2), np.zeros((2, 3))]).T           # (5, 2): the identity plant
+        self.eta0 = self.lam0 @ self.m0
+        self.pool = gp_code(np.eye(self.max_contexts), dim,
+                            ORACLE_EMBED_SEED_BASE + OPEN_CODE_SEED_OFFSET + int(code_seed))
+        self.contexts = []
+        self.hazard = float(hazard)
+        self.count_prior = 0.0
+        self.novel_lead = 0         # consecutive evidence steps with the novel slot as MAP
+        self._rebuild()
+        self.reset()
+
+    def _rebuild(self):
+        n = len(self.contexts)
+        self.ids = [f"open{i}" for i in range(n)] + [OPEN_NOVEL]
+        self.embed = np.vstack([self.pool[:n], np.zeros((1, self.pool.shape[1]), np.float32)]).astype(np.float32)
+        self.K = n + 1
+        counts = getattr(self, "counts", np.zeros(0))
+        self.counts = np.concatenate([counts[:n], np.zeros(self.K - min(n, len(counts)))])[:self.K]
+
+    @property
+    def n_contexts(self) -> int:
+        return len(self.contexts)
+
+    @property
+    def map_slot(self) -> int:
+        return int(np.argmax(self.log_p))
+
+    def _clone(self):
+        import copy
+        return copy.deepcopy(self)
+
+    def fresh(self):
+        c = self._clone()
+        c.reset()
+        c.novel_lead = 0
+        return c
+
+    def snapshot(self):
+        return self._clone()
+
+    def _predict(self) -> np.ndarray:
+        n = len(self.contexts)
+        w = np.append(self.counts[:n] + OPEN_COUNT_FLOOR,
+                      self.alpha if n < self.max_contexts else 0.0)
+        q = w / w.sum()
+        p = (1.0 - self.hazard) * self.posterior + self.hazard * q
+        return np.log(np.maximum(p, 1e-300))
+
+    def _features(self, a, vel_prev, vel_new):
+        vel_prev = np.asarray(vel_prev, dtype=np.float64)
+        vel_new = np.asarray(vel_new, dtype=np.float64)
+        x = np.concatenate([a, vel_prev, [1.0]])
+        y = (vel_new - vel_prev) * (T.MASS / T.DT) + T.DAMPING * vel_prev
+        s2 = (self.sigma * np.linalg.norm(a)) ** 2
+        return x, y, s2
+
+    def _novel_loglik(self, x, y, s2):
+        mu = self.m0.T @ x
+        var = s2 + float(x @ np.linalg.solve(self.lam0, x))
+        return float(-0.5 * np.sum((y - mu) ** 2) / var - np.log(2.0 * np.pi * var))
+
+    def loglik(self, a, vel_prev, vel_new, s_prev=None, s_next=None):
+        x, y, s2 = self._features(np.asarray(a, dtype=np.float64), vel_prev, vel_new)
+        return np.array([m.loglik(x, y, s2) for m in self.contexts] + [self._novel_loglik(x, y, s2)])
+
+    def _spawn(self):
+        """Instantiate the novel hypothesis: a new context at the prior, the
+        novel slot's mass moved onto it, the novel slot emptied (the CRP jump
+        refills it at the next step)."""
+        self.contexts.append(_PlantModel(self.lam0, self.eta0))
+        log_novel = self.log_p[-1]
+        self._rebuild()
+        self.log_p = np.concatenate([self.log_p[:-1], [log_novel, np.log(1e-300)]])
+        self.log_p -= np.logaddexp.reduce(self.log_p)
+
+    def update(self, action, vel_prev, vel_new, wall_impulse=0.0, *,
+               s_prev=None, s_next=None, evidence=True):
+        log_prior = self._predict()
+        a = np.asarray(action, dtype=np.float64)
+        if not (evidence and self.evidence_usable(a, vel_new, wall_impulse)):
+            self._condition(log_prior, None)
+            return
+        x, y, s2 = self._features(a, vel_prev, vel_new)
+        ll = np.array([m.loglik(x, y, s2) for m in self.contexts] + [self._novel_loglik(x, y, s2)])
+        self._condition(log_prior, ll)
+        if self.map_slot == self.K - 1 and len(self.contexts) < self.max_contexts:
+            self.novel_lead += 1
+            if self.novel_lead >= OPEN_SPAWN_DWELL:
+                self._spawn()
+                self.novel_lead = 0
+        else:
+            self.novel_lead = 0
+        post = self.posterior
+        for w, m in zip(post, self.contexts):
+            if w > 1e-6:
+                m.observe(x, y, s2, w)
+
+
 def observer_has_null(config) -> bool:
     """Whether the config's inferred oracle carries the null-field hypothesis:
     AblationConfig.observer_null_context when set, else yes under the COIN
@@ -768,6 +969,15 @@ def observer_has_null(config) -> bool:
     if explicit is not None:
         return bool(explicit)
     schedule = getattr(config, "schedule", DEFAULT_SCHEDULE)
+    if (getattr(config, "probe", None) and getattr(config, "probe_washout", True)
+            and getattr(config, "oracle_source", "given") == "bayes"):
+        # 2026-10-08 (user): the savings probes' washout should elicit the
+        # null hypothesis in COIN -- the null field becomes a context of its
+        # own, as under the paradigm schedules -- not be absorbed by a trained
+        # hypothesis. The CB observer cannot carry it (CBObserver raises), so
+        # the Full Circuit's probe runs are as before. Probe runs made before
+        # this date (the 25-seed _n2rot / _n2mix COIN runs) lack it.
+        return True
     # only where the schedule's baseline IS the null field (P0 blocks);
     # savings-washout runs on a trained baseline and needs no such hypothesis,
     # and a zero-shot run is a cycle run plus a test: its observer is the
@@ -779,6 +989,8 @@ def make_observer(config: AblationConfig, oracle_embed, device="cpu"):
     """The inferred oracle the config asks for, or None for the given one."""
     if not config.use_oracle or config.oracle_source == "given":
         return None
+    if config.oracle_source == "open":
+        return OpenObserver(oracle_embed)
     null = observer_has_null(config)
     if config.oracle_source == "bayes":
         return BayesObserver(oracle_embed, null_context=null)
@@ -1028,11 +1240,36 @@ _PHASE_FAMILY = {f"{name}s": name for name in T.FAM_NAMES}
 # (+-30, +-90), for the zero-shot experiment's wider-gap variant; paired with
 # the circuit fitted on model.WIDE_TRAIN_SET. Suffix _rotw.
 WIDE_PHASE_SET = "rotations_wide"
-PHASE_SETS = ("mixed",) + tuple(_PHASE_FAMILY) + (WIDE_PHASE_SET,)
+# CYCLE-LENGTH SUBSETS of the mixed set (2026-10-07): the savings-mechanism
+# experiment varies how many contexts a cycle holds. A single stored policy
+# (the baseline) should lose its revisit advantage as more contexts intervene
+# and overwrite it; a retrieval system should hold it. Each subset is given as
+# (family index, member index) into the mixed set's per-family pair, so it
+# tracks the table rather than naming ids. Two pairs: the same family (two
+# rotations, where the second context's first visit can draw on the first)
+# and two families (no within-family transfer possible) -- the composition
+# contrast at N = 2. Suffixes _n2rot / _n2mix / _n3; the full set is N = 6.
+CYCLE_SUBSETS = {
+    "pair_rotations": ((0, 0), (0, 1)),
+    "pair_mixed": ((0, 0), (1, 0)),
+    "triple": ((0, 0), (1, 0), (2, 0)),
+}
+# "pair_wide" (2026-10-08, user): the TRANSFER cell of the savings probes
+# tests the STRUCTURE claim as INTERPOLATION. Train rot -30 then rot -90 (a
+# 60 degree gap, the zero-shot sweep's anchors), wash out, then probe the
+# midpoint -60: a table rotation the frozen circuit was pretrained on but the
+# agent never trained, 30 degrees from both anchors. At this gap a policy
+# averaged between the anchors' solutions is not a -60 solution; a point on
+# the axis between them is. (Replaced a -60/+60 pair whose interior +-30 was
+# at ceiling from a washed-out policy.)
+WIDE_PAIR_ANGLES = (-30.0, -90.0)
+CYCLE_SUBSET_SUFFIX = {"pair_rotations": "_n2rot", "pair_mixed": "_n2mix", "triple": "_n3",
+                       "pair_wide": "_n2wide"}
+PHASE_SETS = ("mixed",) + tuple(_PHASE_FAMILY) + (WIDE_PHASE_SET,) + tuple(CYCLE_SUBSETS) + ("pair_wide",)
 # run-name suffix per set: "" for the default, the family's short name else
 _SHORT = {"rotation": "rot", "reflection": "refl", "curl": "curl", "drift": "drift"}
 PHASE_SET_SUFFIX = {"mixed": "", **{s: f"_{_SHORT.get(name, name)}" for s, name in _PHASE_FAMILY.items()},
-                    WIDE_PHASE_SET: "_rotw"}
+                    WIDE_PHASE_SET: "_rotw", **CYCLE_SUBSET_SUFFIX}
 DEFAULT_PHASE_SET = "mixed"
 
 
@@ -1043,6 +1280,12 @@ def phase_ids_for(phase_set: str) -> list:
         return _phase_ids()
     if phase_set == WIDE_PHASE_SET:
         return T.wide_rotation_ids()
+    if phase_set in CYCLE_SUBSETS:
+        per = 2
+        mixed = _phase_ids(per)                  # family-major: [f0m0, f0m1, f1m0, ...]
+        return [mixed[f * per + m] for f, m in CYCLE_SUBSETS[phase_set]]
+    if phase_set == "pair_wide":
+        return [T.rotation_id(a) for a in WIDE_PAIR_ANGLES]
     fam = T.FAM_NAMES.index(_PHASE_FAMILY[phase_set])
     return [c for c in range(T.N_CONTEXTS) if T.FAMILY[c] == fam]
 
@@ -1112,6 +1355,137 @@ DEFAULT_SCHEDULE = "cycle"
 # EFFORT_WEIGHT, the null-field clear) were paradigm-only until 2026-09-23
 # and are now every schedule's defaults, on AblationConfig itself.
 PARADIGM_SCHEDULES = ("spontaneous_recovery", "evoked_recovery", "savings_washout")
+
+# ── THE SAVINGS PROBES (2026-10-07) ──────────────────────────────────────
+#
+# The user's hypothesis: the Full Circuit shows savings because it does BOTH
+# context-specific retrieval (COIN's mechanism) and family-level transfer (what
+# a single stored policy does). A revisit's speed mixes the two with general
+# competence and with carry-over from whatever block came last, so the cycle
+# is followed by
+#
+#   a WASHOUT   one block of the usual length in the null field (F = a),
+#               logged with branch "washout". It removes the carry-over term
+#               and gives every cycle length the same state to probe from --
+#               the savings-washout paradigm's structure, extended to novel
+#               contexts;
+#
+# and then three PROBE BLOCKS, each a learning block of the usual length run
+# as a separate BRANCH from the end-of-washout state (run_sac snapshots the
+# agent, buffer, observer, bank, carry and rng at the fork and restores them
+# before each branch), so they start from an identical state at identical
+# experience and none contaminates another:
+#
+#   revisit        the cycle's first context again (rot -60)
+#   novel_family_member
+#                  a novel member of the same family -- its mirror image,
+#                  rot +60: the same magnitude, the same distance from the
+#                  washed-out policy, never experienced; the matched control
+#                  for retrieval
+#   novel_family   a reflection (task.reflection_id): no trained relative
+#
+#   revisit - novel same-family        = context-specific retrieval
+#   novel_family_member - novel_family   = family-level transfer
+#
+# Novel means novel to the RL agent: the frozen circuit was fitted on the
+# table, which holds +60 -- part of the hypothesis (transfer through
+# pretrained structure), not a flaw; the reflection is novel to it too. The
+# probe contexts are the same ids in every context set (none of the cycle
+# subsets holds +60; probe_context refuses one that does), so the probes are
+# comparable across the cycle-length sweep. Run name _pr; rows carry `branch`.
+PROBE_KIND = "probe"                        # curve["kind"] of a washout / probe reach
+PROBE_SUFFIX = "_pr"
+PROBE_ROLES = ("revisit", "novel_family_member", "interior", "novel_family")
+PROBE_WASHOUT = "washout"                   # the washout rows' `branch`
+PROBE_REFLECTION_AXIS = 45.0
+
+
+def _trained_rotation_angles():
+    return sorted(float(T.C_PARAM[c]) for c in PHASE_CONTEXT_IDS if T.FAMILY[c] == 0)
+
+
+def probe_context(role):
+    """The context id a probe role is run in under the module's context set,
+    or None where the role does not apply to this cell (three roles apply in
+    every cell):
+
+      revisit              the cycle's first context (must be a rotation)
+      interior             the MIDPOINT of the trained rotations when it is an
+                           untrained table rotation (pair_wide: -30/-90 -> -60);
+                           interpolation between the anchors
+      novel_family_member  the first context's mirror image, where the cell
+                           has no interior (and the mirror is not trained);
+                           extrapolation from the trained rotation(s)
+      novel_family         a reflection (task.reflection_id)
+    """
+    first = PHASE_CONTEXT_IDS[0]
+    if role == "revisit":
+        return first
+    if T.FAMILY[first] != 0 and role in ("novel_family_member", "interior"):
+        raise ValueError(f"the rotation probes need a rotation as the cycle's first context, "
+                         f"not {T.C_LABEL[first]!r}")
+    if role == "interior":
+        trained = _trained_rotation_angles()
+        if len(trained) < 2:
+            return None
+        mid = 0.5 * (trained[0] + trained[-1])
+        if not any(np.isclose(mid, a) for a in T.ROT_ANGLES) or any(np.isclose(mid, a) for a in trained):
+            return None
+        return T.rotation_id(mid)
+    if role == "novel_family_member":
+        if probe_context("interior") is not None:
+            return None
+        cid = T.rotation_id(-float(T.C_PARAM[first]))
+        return None if cid in PHASE_CONTEXT_IDS else cid
+    if role == "novel_family":
+        cid = T.reflection_id(PROBE_REFLECTION_AXIS)
+        if cid in PHASE_CONTEXT_IDS:
+            raise ValueError(f"the reflection probe {T.C_LABEL[cid]!r} is in the context set")
+        return cid
+    raise KeyError(f"unknown probe role {role!r}; expected one of {PROBE_ROLES}")
+
+
+def probe_roles_for_cell():
+    """The PROBE_ROLES that apply under the module's context set, in order:
+    always three (revisit, one novel rotation, the reflection). A set that
+    leaves no novel rotation to probe (all four table rotations trained: the
+    mirror is trained and the midpoint 0 is no context) is refused."""
+    roles = tuple(r for r in PROBE_ROLES if probe_context(r) is not None)
+    if not any(r in roles for r in ("interior", "novel_family_member")):
+        raise ValueError(f"no novel rotation left to probe under {[T.C_LABEL[c] for c in PHASE_CONTEXT_IDS]}: "
+                         f"the mirror is trained and the midpoint is not a table rotation")
+    return roles
+
+
+def probe_blocks(cycle_blocks, n_phase_ep, washout=True):
+    """The (optional) washout and the probe branches appended to a cycle. The
+    washout is a logged null-field block (`washout` True, no branch); the
+    branches are one learning block per applicable role (probe_roles_for_cell),
+    all at the same phase_idx (they are parallel, not sequential) and each
+    tagged `branch`. `occurrence` counts the context's cycle visits, so the
+    revisit labels as its (phase_reps+1)-th visit and a novel context as its
+    first. A context outside the set has family_idx None: the given oracle
+    sees the zero code there, as in the zero-shot few-shot block. Without the
+    washout the branches fork from the last cycle block itself."""
+    logged = [b for b in cycle_blocks if b["log"]]
+    phase_idx = 1 + max(b["phase_idx"] for b in cycle_blocks)
+    out = []
+    if washout:
+        out.append({"context_id": None, "label": PROBE_WASHOUT, "n_ep": int(n_phase_ep), "log": True,
+                    "phase_idx": phase_idx, "occurrence": 0, "family_idx": None, "learn": True,
+                    "channel": False, "kind": PROBE_KIND, "param": float("nan"), "washout": True})
+        phase_idx += 1
+    for role in probe_roles_for_cell():
+        cid = probe_context(role)
+        out.append({"context_id": cid, "label": f"probe {T.C_LABEL[cid]}", "n_ep": int(n_phase_ep),
+                    "log": True, "phase_idx": phase_idx,
+                    "occurrence": sum(1 for b in logged if b["context_id"] == cid),
+                    "family_idx": (PHASE_CONTEXT_IDS.index(cid) if cid in PHASE_CONTEXT_IDS else None),
+                    "learn": True, "channel": False, "kind": PROBE_KIND,
+                    "param": float(T.C_PARAM[cid]), "branch": role})
+    return out
+
+
 SCHEDULE_SUFFIX = {"cycle": "", "spontaneous_recovery": "_sr", "evoked_recovery": "_er",
                    "savings_washout": "_savw", "zero_shot": "_zs"}
 
@@ -1335,7 +1709,7 @@ def zero_shot_blocks(n_phase_ep, phase_reps, warmup_episodes, block_ep=None, *,
 
 
 def schedule_blocks(schedule, n_phase_ep, phase_reps, warmup_episodes, block_ep=None,
-                    *, seed=0, zs_learn_angle=ZS_LEARN_ANGLE):
+                    *, seed=0, zs_learn_angle=ZS_LEARN_ANGLE, probe=None, probe_washout=True):
     """The blocks run_sac runs, in order. Each carries context_id (None = null
     field), label, n_ep, log, phase_idx, occurrence, family_idx (row of the
     oracle embed; None for the null field), learn and channel. "cycle"
@@ -1343,6 +1717,8 @@ def schedule_blocks(schedule, n_phase_ep, phase_reps, warmup_episodes, block_ep=
     and `zs_learn_angle` are read by "zero_shot" alone (zero_shot_blocks)."""
     if schedule not in SCHEDULES:
         raise KeyError(f"unknown schedule {schedule!r}; expected one of {SCHEDULES}")
+    if probe and schedule != "cycle":
+        raise ValueError(f"the savings probes extend the cycle only, not {schedule!r}")
     if schedule == "zero_shot":
         return zero_shot_blocks(n_phase_ep, phase_reps, warmup_episodes, block_ep,
                                 seed=seed, learn_angle=zs_learn_angle)
@@ -1359,6 +1735,8 @@ def schedule_blocks(schedule, n_phase_ep, phase_reps, warmup_episodes, block_ep=
                            "log": True, "phase_idx": phase_idx,
                            "occurrence": phase_idx // N_PHASE_FAMILIES,
                            "family_idx": family_idx, "learn": True, "channel": False})
+        if probe:
+            blocks += probe_blocks(blocks, n_phase_ep, washout=probe_washout)
         return blocks
 
     ep = {**COIN_BLOCK_EP, **(block_ep or {})}
@@ -1636,6 +2014,20 @@ class AblationConfig:
     zs_probe_ep: Optional[int] = None
     """Frozen reaches per test angle in the zero_shot schedule's sweep; None
     is ZS_PROBE_EP (16). Run name: _p<N>. See ZS_PROBE_EP for why 32."""
+    probe: Optional[str] = None
+    """"savings": append the washout and the probe branches to the cycle
+    (PROBE_ROLES, probe_blocks; run name _pr). Cycle schedule only. None: no
+    probes, and every existing run is unchanged."""
+    probe_washout: bool = True
+    """Whether the probe branches fork from a null-field washout block (the
+    default, both cells) or from the last cycle block itself (an option
+    kept from 2026-10-08, when a no-washout transfer cell was considered;
+    the parked policy then enters the probes). Run name _nowash."""
+    phase_episodes: Optional[int] = None
+    """Episodes per cycle block when not the default N_PHASE_EP; run name
+    _ep<N>. Exists so a non-default block length cannot write into the
+    default's run directory. The cycle-length experiment's gap-matched cell
+    (two contexts at 300 episodes against four at 150) is the first use."""
     zs_max_steps: Optional[int] = None
     """The horizon of the zero_shot schedule's TEST blocks (the frozen sweep
     and the few-shot block), in steps; None is the run's MAX_STEPS. The cycle
@@ -3684,6 +4076,8 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     # probes -- reads the module's set at call time (see PHASE_SETS), and a
     # spawned worker arrives here with the module at its import default.
     apply_phase_set(config.phase_set)
+    if getattr(config, "phase_episodes", None):
+        n_phase_ep = int(config.phase_episodes)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
@@ -3774,6 +4168,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # field (nan without an observer, when the pair is not in the context
         # set, or -- for the null -- when the observer has no null hypothesis)
         "channel", "prior_src", "belief_pplus", "belief_pminus", "belief_base",
+        "open_n_contexts", "open_map",      # the open-set observer: contexts held, MAP slot
         # the same three roles read off z rather than a posterior, for the
         # runs with no observer: softmax over the phase contexts of the
         # reciprocal distance from the reach's mean z to each centroid
@@ -3801,6 +4196,9 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # the reach's horizon (steps allowed) and, for a centre-out reach,
         # the target's index on the ring (-1 for a free reach)
         "budget", "target",
+        # the savings probes (PROBE_ROLES): which branch the reach belongs
+        # to; "" for every cycle reach
+        "branch",
     )}
 
     probes = []
@@ -3818,7 +4216,9 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     if getattr(config, "zs_probe_ep", None):
         block_ep.setdefault("zs_probe", int(config.zs_probe_ep))
     blocks = schedule_blocks(config.schedule, n_phase_ep, phase_reps, warmup_episodes,
-                             block_ep, seed=seed, zs_learn_angle=config.zs_learn_angle)
+                             block_ep, seed=seed, zs_learn_angle=config.zs_learn_angle,
+                             probe=getattr(config, "probe", None),
+                             probe_washout=getattr(config, "probe_washout", True))
     # EC's start-of-reach prior (see ExperienceBank); None means the zero state
     if config.ec_prior not in EC_PRIORS:
         raise KeyError(f"unknown ec_prior {config.ec_prior!r}; expected one of {EC_PRIORS}")
@@ -3833,7 +4233,20 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
     # stored observation, replaced at reach end with the end-of-reach z
     ec_slice = slice(spec.base, spec.base + spec.ec)
 
+    # the savings probes branch from the end of the cycle: the state there,
+    # taken at the first probe block and restored before every later one
+    fork = None
+    fork_prev = None            # the block every branch follows (the washout)
+
     for block_idx, block in enumerate(blocks):
+        if block.get("branch") is not None:
+            if fork is None:
+                fork = fork_state(trainer, ec, cb, eccb_trainer, replay_buffer, bank, observer,
+                                  oracle_noise, carry_h, carry_src, rng, global_step, global_ep)
+                fork_prev = blocks[block_idx - 1] if block_idx else None
+            else:
+                (replay_buffer, bank, observer, oracle_noise, carry_h, carry_src,
+                 global_step, global_ep) = restore_fork(fork, trainer, ec, cb, eccb_trainer, rng)
         context_id = block["context_id"]
         family_idx = block["family_idx"]
         occurrence = block["occurrence"]
@@ -3879,7 +4292,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         # between the warmup ("null field") and P0 (NULL_LABEL); the channel
         # is also context None but writes nothing and must NOT clear -- under
         # evoked recovery the P+ memory it is followed by lives in that buffer.
-        prev = blocks[block_idx - 1] if block_idx else None
+        prev = fork_prev if block.get("branch") is not None else (blocks[block_idx - 1] if block_idx else None)
         if (log_block and block["context_id"] is not None and prev is not None
                 and prev["context_id"] is None and not prev.get("channel", False)
                 and not config.clear_buffer_on_switch):
@@ -3980,8 +4393,17 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
 
                 obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
                 # random actions only while LEARNING has not started; a channel
-                # block reads the policy out whatever the buffer holds
-                if learn and (global_step < learning_starts or len(replay_buffer) < batch_size):
+                # block reads the policy out whatever the buffer holds.
+                # NOT on a savings-probe branch (2026-10-07): the buffer is
+                # cleared at the fork (leaving the null-field washout), and the
+                # refill condition below would make every branch's first ~9
+                # reaches uniform random actions regardless of what the agent
+                # remembers -- which erased the early-window measure in the
+                # pilot. A branch acts from its trained policy from reach 1;
+                # updates resume once a batch has accumulated, as elsewhere.
+                on_branch = block.get("branch") is not None
+                if learn and not on_branch and (global_step < learning_starts
+                                                or len(replay_buffer) < batch_size):
                     action_np = rng.uniform(-1.0, 1.0, size=ACTION_DIM).astype(np.float32)
                 else:
                     with torch.no_grad():
@@ -4168,7 +4590,8 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                 if config.ec_prior in ("carry", "carry_mean"):
                     carry_h, carry_src = h_settled.clone(), (PRIOR_SRC_NULL if context_id is None
                                                              else int(context_id))
-                if observer is not None and log_block and observer.count_prior > 0.0 and write:
+                if (observer is not None and log_block and write
+                        and (observer.count_prior > 0.0 or getattr(observer, "always_counts", False))):
                     observer.note_visit()
             if pending and z_last is not None:
                 z_end = ec_channel(z_last, config, ec_offset, ec_std)
@@ -4233,6 +4656,9 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             curve["belief_pplus"].append(bp)
             curve["belief_pminus"].append(bm)
             curve["belief_base"].append(bn)
+            is_open = isinstance(observer, OpenObserver)
+            curve["open_n_contexts"].append(float(observer.n_contexts) if is_open else float("nan"))
+            curve["open_map"].append(float(observer.map_slot) if is_open else float("nan"))
             # the same three roles read off z instead of a posterior, for the
             # runs that have no observer (z_centroid_belief). Its own columns,
             # not the ones above: they are different quantities and a figure
@@ -4272,6 +4698,8 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
             curve["z0"].append(z0)
             curve["budget"].append(int(block_max_steps))
             curve["target"].append(int(target))
+            curve["branch"].append(block.get("branch")
+                                   or (PROBE_WASHOUT if block.get("washout") else ""))
             pfa = pfa_pp = pfa_pm = pfa_null = float("nan")
             if config.schedule in PARADIGM_SCHEDULES:
                 ro = eval_center_out(trainer, ec, cb, config, context_id, family_idx,
@@ -4339,6 +4767,14 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                 and block["context_id"] not in PHASE_CONTEXT_IDS):
             eval_specs.append((T.C_LABEL[block["context_id"]], block["context_id"],
                                block["context_id"], True))
+        # a probe run also evaluates the novel probe contexts after EVERY block:
+        # the zero-shot level on the novel rotation and the reflection, frozen and
+        # side-effect free, before any relearning (user, 2026-10-07)
+        if getattr(config, "probe", None):
+            for role in probe_roles_for_cell():
+                cid = probe_context(role)
+                if cid not in PHASE_CONTEXT_IDS and cid != block["context_id"]:
+                    eval_specs.append((T.C_LABEL[cid], cid, cid, False))
         if not do_probe:
             eval_specs = []
 
@@ -4396,6 +4832,7 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
                                      # fixed seed for exactly that reason
                                      oracle_noise=None)
             probe.update({"battery_seed": EVAL_BATTERY_SEED + block_idx,
+                          "branch": block.get("branch") or (PROBE_WASHOUT if block.get("washout") else ""),
                           "phase": phase_idx, "occurrence": occurrence, "label": label,
                           "context_id": block["context_id"], "eval_label": eval_label,
                           "eval_context_id": eval_cid, "is_current": is_current})
@@ -4407,11 +4844,64 @@ def run_sac(seed, config: AblationConfig, *, n_phase_ep=N_PHASE_EP, phase_reps=P
         if summary:
             print("  probes | " + " | ".join(summary), flush=True)
 
+    if fork is not None:
+        # the saved agent is the END-OF-CYCLE one, not the last branch's
+        restore_fork(fork, trainer, ec, cb, eccb_trainer, rng)
     if agent_path is not None:
         save_agent(agent_path, trainer, config, spec, cb_proj, oracle_embed, seed,
                    ec_offset=ec_offset)
 
     return curve, probes
+
+
+def _optimizers_of(obj):
+    return [v for v in vars(obj).values() if isinstance(v, torch.optim.Optimizer)] if obj is not None else []
+
+
+def fork_state(trainer, ec, cb, eccb_trainer, replay_buffer, bank, observer, oracle_noise,
+               carry_h, carry_src, rng, global_step, global_ep):
+    """Everything a training run mutates, copied, so run_sac can restart
+    several probe branches from one state (see PROBE_ROLES). Networks and
+    optimisers as state dicts (restored IN PLACE, so the loop's references
+    stay valid); the buffer, bank, observer and noise as deep copies that
+    restore_fork copies again, so a branch never hands its mutations on."""
+    sd = lambda m: copy.deepcopy(m.state_dict()) if m is not None else None
+    return {
+        "nets": {k: sd(getattr(trainer, k)) for k in ("actor", "qf1", "qf2", "qf1_target", "qf2_target")},
+        "opts": [sd(o) for o in _optimizers_of(trainer)],
+        "log_alpha": (trainer.log_alpha.detach().clone() if trainer.log_alpha is not None else None),
+        "ec": sd(ec), "cb": sd(cb), "eccb_opts": [sd(o) for o in _optimizers_of(eccb_trainer)],
+        "objs": copy.deepcopy((replay_buffer, bank, observer, oracle_noise)),
+        "carry_h": (carry_h.detach().clone() if carry_h is not None else None),
+        "carry_src": carry_src,
+        "rng": copy.deepcopy(rng.bit_generator.state), "torch_rng": torch.get_rng_state(),
+        "global_step": global_step, "global_ep": global_ep,
+    }
+
+
+def restore_fork(state, trainer, ec, cb, eccb_trainer, rng):
+    """Put a fork_state back. Returns the rebindable locals in the order
+    run_sac unpacks them: replay_buffer, bank, observer, oracle_noise,
+    carry_h, carry_src, global_step, global_ep."""
+    for k, v in state["nets"].items():
+        getattr(trainer, k).load_state_dict(v)
+    for o, v in zip(_optimizers_of(trainer), state["opts"]):
+        o.load_state_dict(v)
+    if state["log_alpha"] is not None:
+        with torch.no_grad():
+            trainer.log_alpha.copy_(state["log_alpha"])
+    if ec is not None and state["ec"] is not None:
+        ec.load_state_dict(state["ec"])
+    if cb is not None and state["cb"] is not None:
+        cb.load_state_dict(state["cb"])
+    for o, v in zip(_optimizers_of(eccb_trainer), state["eccb_opts"]):
+        o.load_state_dict(v)
+    replay_buffer, bank, observer, oracle_noise = copy.deepcopy(state["objs"])
+    carry_h = state["carry_h"].clone() if state["carry_h"] is not None else None
+    rng.bit_generator.state = copy.deepcopy(state["rng"])
+    torch.set_rng_state(state["torch_rng"])
+    return (replay_buffer, bank, observer, oracle_noise, carry_h, state["carry_src"],
+            state["global_step"], state["global_ep"])
 
 
 def run_one_seed(config: AblationConfig, seed: int, *, make_figures=True, **run_kwargs):
@@ -4604,6 +5094,12 @@ def _parse_args(argv=None):
                          help="checkpoint seed to load for the frozen configs")
     parser.add_argument("--phase-episodes", type=int, default=N_PHASE_EP)
     parser.add_argument("--phase-reps", type=int, default=PHASE_REPS)
+    parser.add_argument("--probe", action="store_true",
+                         help="append the washout and the savings probe branches to the "
+                              "cycle (sac.PROBE_ROLES); run name gets _pr")
+    parser.add_argument("--no-probe-washout", dest="probe_washout", action="store_false", default=None,
+                         help="with --probe: fork the branches from the last cycle block, no "
+                              "washout (the transfer cell); run name gets _nowash")
     parser.add_argument("--workers", type=int, default=None,
                          help="parallel processes over seeds (default: cpu_count-1; 1 = serial)")
     parser.add_argument("--clear-buffer", action="store_true",
@@ -4710,7 +5206,8 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
                        phase_set=None, train_contexts=None, schedule=None,
                        ec_prior=None, relabel_z: bool = False,
                        count_prior=None, zs_learn_angle=None, zs_max_steps=None,
-                       zs_probe_ep=None) -> dict:
+                       zs_probe_ep=None, phase_episodes=None, probe: bool = False,
+                       probe_washout=None) -> dict:
     """Turn a preset dict into the variant the CLI asked for, renaming it.
 
     Every knob renames the run because the run directory is config.name:
@@ -4851,6 +5348,29 @@ def apply_cli_variants(cfg: dict, *, clear_buffer: bool = False,
         tag = PHASE_SET_SUFFIX[phase_set]
         if tag and tag not in cfg["name"]:
             cfg["name"] = _with_infix(cfg["name"], tag)
+    # the block length, right after the context set: both are task knobs.
+    # The default is a no-op so every existing name is unchanged.
+    if phase_episodes is not None and int(phase_episodes) != N_PHASE_EP \
+            and int(phase_episodes) != cfg.get("phase_episodes"):
+        if int(phase_episodes) < 1:
+            raise ValueError(f"--phase-episodes must be positive, got {phase_episodes}")
+        cfg["phase_episodes"] = int(phase_episodes)
+        tag = f"_ep{int(phase_episodes)}"
+        if tag not in cfg["name"]:
+            cfg["name"] = _with_infix(cfg["name"], tag)
+    # the savings probes, after the task knobs: a cycle-only extension
+    if probe and not cfg.get("probe"):
+        if (schedule or cfg.get("schedule", DEFAULT_SCHEDULE)) != "cycle":
+            raise ValueError("--probe extends the cycle schedule only")
+        cfg["probe"] = "savings"
+        if PROBE_SUFFIX not in cfg["name"]:
+            cfg["name"] = _with_infix(cfg["name"], PROBE_SUFFIX)
+    if probe_washout is not None and not probe_washout and cfg.get("probe_washout", True):
+        if not (probe or cfg.get("probe")):
+            raise ValueError("--no-probe-washout needs --probe")
+        cfg["probe_washout"] = False
+        if "_nowash" not in cfg["name"]:
+            cfg["name"] = _with_infix(cfg["name"], "_nowash")
     # the COIN-paradigm knobs, after the task knob and before the buffer ones:
     # main_rot_sr_prior_relabel_clearbuf
     if schedule is not None and schedule != cfg.get("schedule", DEFAULT_SCHEDULE):
@@ -4969,7 +5489,10 @@ def config_from_cli(args) -> AblationConfig:
                              count_prior=getattr(args, "count_prior", None),
                              zs_learn_angle=getattr(args, "zs_learn_angle", None),
                              zs_max_steps=getattr(args, "zs_max_steps", None),
-                             zs_probe_ep=getattr(args, "zs_probe_ep", None))
+                             zs_probe_ep=getattr(args, "zs_probe_ep", None),
+                             phase_episodes=getattr(args, "phase_episodes", None),
+                             probe=getattr(args, "probe", False),
+                             probe_washout=getattr(args, "probe_washout", None))
     return AblationConfig(**cfg)
 
 
