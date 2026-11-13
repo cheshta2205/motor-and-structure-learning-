@@ -7,3 +7,4 @@ seaborn
 scipy
 statannotations
 pytest
+plotting_tools @ git+https://github.com/eaamematsro/PlottingTools.git@v0.2.0

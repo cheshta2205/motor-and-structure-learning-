@@ -223,3 +223,6 @@ that set uninformative.
 
 python 3.10+, torch, numpy, matplotlib, scikit-learn, pandas, seaborn, scipy,
 statannotations (`pip install -r requirements.txt`).  `pytest` for the suite.
+The figure style (`plotting_utils`, `compose_schema`, `extend_palette`) comes
+from PlottingTools (github.com/eaamematsro/PlottingTools): `pip install -e
+/path/to/PlottingTools` in every env that draws figures (`dual` and `bcoin`).
