@@ -3,7 +3,7 @@ make_ablations_plot.py -- cross-config ablation analysis.
 
 Ported from the reference repo's script of the same name. This is the
 "plotting scripts from the previous iteration": Hill-curve learning-curve
-fits, episodes-to-criterion analysis with Wilcoxon+Holm annotation, and
+fits, episodes-to-criterion analysis with Mann-Whitney+Holm annotation, and
 learning-curve/parameter-distribution plots across the six sac.py configs.
 sac_figures.py's plot_seed is the per-run diagnostic view; this file is the
 cross-config comparison, reading the aggregated_results.csv sac.main writes
@@ -44,7 +44,8 @@ from scipy.optimize import curve_fit
 from statannotations.Annotator import Annotator
 
 from plotting_utils import (offset_spines, bracket_xticks, use_paper_style, swarm_ci,
-                            chance_line, plot_band, figsize, label_panels, INK, MUTED, SHADE)
+                            chance_line, plot_band, figsize, label_panels, write_slot, INK, MUTED,
+                            SHADE)
 from plotting_utils import save as _pu_save
 import sac
 import task as T
@@ -903,31 +904,24 @@ def report_criterion_trace_consistency(data: pd.DataFrame, metrics: list, output
     return table
 
 
-def testable_pairs(facet_data: pd.DataFrame, pairs: list, min_pairs: int = 2) -> list:
-    """Drop comparisons a paired Wilcoxon can't actually take.
+def testable_pairs(facet_data: pd.DataFrame, pairs: list, min_n: int = 2) -> list:
+    """Drop comparisons the unpaired test can't take: each side needs at
+    least `min_n` values, and the two sides together must not be one
+    constant (two configs that both saturate at the block's end because
+    neither reached criterion). scipy would raise, costing the whole figure,
+    so the untestable comparison is skipped and the plot still drawn.
 
-    scipy discards zero-difference pairs before testing, so a comparison needs
-    at least `min_pairs` seeds whose criterion episodes actually DIFFER. Two
-    things trigger that in practice: too few seeds per config (n=1 leaves
-    nothing to pair), and two configs that both saturate at the same criterion
-    episode because neither reached the threshold in that phase. Either way
-    scipy raises, which would otherwise cost the whole figure -- so skip the
-    untestable comparison and still draw the plot.
-    """
+    UNPAIRED since 2026-10-14 (user): a seed number does not give two models
+    the same reaches -- the goal draws share the run generator with the
+    command noise and the random actions, so the streams diverge after the
+    first episode -- so there is nothing to pair seeds on."""
     keep = []
     for (occ_a, cfg_a), (occ_b, cfg_b) in pairs:
         a = facet_data[(facet_data["occurrence"] == occ_a) & (facet_data["config"] == cfg_a)]
         b = facet_data[(facet_data["occurrence"] == occ_b) & (facet_data["config"] == cfg_b)]
-
-        if "seed" in facet_data.columns:
-            merged = a.merge(b, on="seed", suffixes=("_a", "_b"))
-            diffs = (merged["criterion_episode_a"] - merged["criterion_episode_b"]).to_numpy()
-        else:
-            n = min(len(a), len(b))
-            diffs = (a["criterion_episode"].to_numpy()[:n]
-                     - b["criterion_episode"].to_numpy()[:n])
-
-        if np.count_nonzero(diffs) >= min_pairs:
+        va, vb = a["criterion_episode"].to_numpy(float), b["criterion_episode"].to_numpy(float)
+        va, vb = va[np.isfinite(va)], vb[np.isfinite(vb)]
+        if len(va) >= min_n and len(vb) >= min_n and np.ptp(np.concatenate([va, vb])) > 0:
             keep.append(((occ_a, cfg_a), (occ_b, cfg_b)))
     return keep
 
@@ -961,7 +955,7 @@ def _criterion_swarm(ax, df: pd.DataFrame, occurrence_order, config_order, ymax:
     NEVER reached criterion -- reported at the block's last episode, `ymax`
     -- as open circles, so a pile at the ceiling reads as censoring rather
     than as late crossings (they still count in the median and IQR, which
-    is what the Wilcoxon test sees). Groups are dodged the way seaborn dodges
+    is what the test sees). Groups are dodged the way seaborn dodges
     hue levels in a `width`-wide slot, which is also how statannotations
     locates them (its default `plot="boxplot"` convention), so the brackets
     land over the right swarms."""
@@ -1009,8 +1003,10 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
 
     The swarm shows every seed x context block; the TESTS are at the seed
     level (user, 2026-09-24): each seed's crossings are averaged over its
-    contexts and the Wilcoxon signed-rank pairs seeds, since one seed's
-    blocks are not independent. Holm over the figure's comparisons."""
+    contexts and those seed means compared with an UNPAIRED Mann-Whitney U,
+    since one seed's blocks are not independent and a seed number does not
+    match reaches across models (2026-10-14; see testable_pairs). Holm over
+    the figure's comparisons."""
     data = cycle_only(data)
     if data.empty:
         print("No cycle-schedule runs; skipping criterion_crossing_*")
@@ -1074,7 +1070,7 @@ def plot_criterion_crossing(data: pd.DataFrame, metrics: list, output_dir: str, 
                 hue="config", order=occurrence_order, hue_order=config_order,
             )
             annot.configure(
-                test="Wilcoxon", text_format="star", comparisons_correction="holm",
+                test="Mann-Whitney", text_format="star", comparisons_correction="holm",
                 correction_format='replace', verbose=False, loc="outside",
             )
             annot.apply_and_annotate()
@@ -1103,8 +1099,9 @@ def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: lis
     """Plot episode-to-criterion estimates separated by phase occurrence.
 
     Cycle-schedule runs only (cycle_only). Within one context and one visit a
-    seed has exactly one block, so here the block-level Wilcoxon IS the
-    seed-level one and nothing needs aggregating."""
+    seed has exactly one block, so here the block-level test IS the
+    seed-level one and nothing needs aggregating; unpaired Mann-Whitney U
+    (see testable_pairs)."""
     data = cycle_only(data)
     if data.empty:
         print("No cycle-schedule runs; skipping criterion_crossing_by_phase_occurrence_*")
@@ -1158,7 +1155,7 @@ def plot_criterion_crossing_by_phase_occurrence(data: pd.DataFrame, metrics: lis
                     hue="config", order=occurrence_order, hue_order=config_order,
                 )
                 annot.configure(
-                    test="Wilcoxon", text_format="star", comparisons_correction="holm",
+                    test="Mann-Whitney", text_format="star", comparisons_correction="holm",
                     correction_format='replace', verbose=False, loc="outside",
                 )
                 annot.apply_and_annotate()
@@ -1322,7 +1319,17 @@ def median_seed_band(group: pd.DataFrame, metric: str, x_col: Optional[str] = No
         # ddof=1 is NaN for a single seed; a zero-width band is the honest
         # rendering of "one run, no spread to show".
         "std": band.std(axis=1).fillna(0.0),
+        # the middle half of the seeds, for an interquartile band
+        "q25": band.quantile(0.25, axis=1),
+        "q75": band.quantile(0.75, axis=1),
     }).sort_index()
+
+
+def _iqr(ax, band, color, zorder=1.5, alpha=0.18):
+    """Shade a median_seed_band's interquartile range across seeds."""
+    if {"q25", "q75"} <= set(band.columns) and len(band):
+        ax.fill_between(band.index, band["q25"], band["q75"], color=color, alpha=alpha, lw=0,
+                        zorder=zorder)
 
 
 def plot_metric_traces(data: pd.DataFrame, metrics: list, output_dir: str,
@@ -1683,16 +1690,18 @@ def _gap_brackets(ax, crossings: pd.DataFrame, configs: list, x_max: float,
                   base: str = "baseline"):
     """Pairwise tests against `base` drawn as VERTICAL brackets in the strip
     left of the first possible crossing (0 .. the smoothing window), which
-    the swarm cannot occupy. Wilcoxon signed-rank AT THE SEED LEVEL: each
-    seed's crossing episodes over its context blocks are averaged first and
-    the seeds are the pairs (user, 2026-09-24 -- the six blocks of one seed
-    are not independent, so pairing blocks overstated the evidence; this is
-    the unit the traces' CI uses too). Holm-corrected over the panel's
+    the swarm cannot occupy. AT THE SEED LEVEL: each seed's crossing
+    episodes over its context blocks are averaged first (user, 2026-09-24 --
+    the six blocks of one seed are not independent, so testing blocks
+    overstated the evidence; this is the unit the traces' CI uses too), and
+    the seed means are compared with an UNPAIRED Mann-Whitney U (user,
+    2026-10-14: seeds are not matched across models, see testable_pairs; it
+    was a seed-paired Wilcoxon before). Holm-corrected over the panel's
     comparisons; stars as in the standalone criterion figures. Brackets nest
     right-to-left by span so they never cross. `crossings` is this panel's
     slice of the crossing table; rows of `configs` are the swarm's y
     positions."""
-    from scipy.stats import wilcoxon
+    from scipy.stats import mannwhitneyu
     if base not in configs:
         return
     seed_level = crossings.groupby(["config", "seed"])["criterion_episode"].mean()
@@ -1702,10 +1711,11 @@ def _gap_brackets(ax, crossings: pd.DataFrame, configs: list, x_max: float,
     others = [c for c in configs if c != base]
     pvals = []
     for c in others:
-        both = pd.concat([keyed[base].rename("a"), keyed[c].rename("b")], axis=1).dropna()
+        a_, b_ = keyed[base].dropna().to_numpy(float), keyed[c].dropna().to_numpy(float)
         try:
-            pvals.append(float(wilcoxon(both["a"], both["b"]).pvalue) if len(both) >= 2 else np.nan)
-        except ValueError:                       # every pair identical
+            pvals.append(float(mannwhitneyu(a_, b_, alternative="two-sided").pvalue)
+                         if len(a_) >= 2 and len(b_) >= 2 else np.nan)
+        except ValueError:                       # both sides one constant
             pvals.append(np.nan)
     adj = _holm(pvals)
     fs = plt.rcParams["xtick.labelsize"]
@@ -1852,9 +1862,9 @@ def plot_criterion_summary(data: pd.DataFrame, output_dir: str, metrics: list = 
             f"seed x context block, median and IQR over the points; open circles are blocks "
             f"that never reached criterion, placed at the block's last episode. No crossing "
             f"is reported before episode {smooth_window}, the smoothing window; the brackets "
-            f"in that strip are Wilcoxon signed-rank tests against {display_name('baseline')}, "
-            f"one value per seed (its mean over the six contexts), {n_seeds} pairs, "
-            f"Holm-corrected within the panel.")
+            f"in that strip are two-sided Mann-Whitney U tests against "
+            f"{display_name('baseline')}, one value per seed (its mean over the six contexts), "
+            f"{n_seeds} seeds a model, unpaired, Holm-corrected within the panel.")
         offset_spines(fig)
         # letters follow reading order: down the column when stacked
         label_panels(fig, [a for pair in zip(top, bottom) for a in pair] if stacked
@@ -4895,6 +4905,10 @@ def transfer_aim(data: pd.DataFrame, n: int = PROBE_EARLY_EPISODES,
     return pd.DataFrame(rows, columns=cols)
 
 
+MIRROR_ROLE = "novel_family_member"     # the revisit's mirror image: the matched novel rotation
+NOVEL_TINT = 0.5                        # the novel rotation's trace: the model's colour, this much lighter
+
+
 def probe_scores(crossings: pd.DataFrame, early: pd.DataFrame = None,
                  levels: pd.DataFrame = None, aim: pd.DataFrame = None) -> pd.DataFrame:
     """Per (config, seed, metric), the retrieval and transfer scores:
@@ -4915,6 +4929,17 @@ def probe_scores(crossings: pd.DataFrame, early: pd.DataFrame = None,
       transfer_vs_family  the earlier score, novel rotation − novel family in
                    the early-block metric (positive = the family helped); kept
                    for the record, at ceiling on success after a washout
+      specificity  (revisit - mirror) / (trained - naive): how much better
+                   re-exposure starts than the revisit's never-trained mirror
+                   image, forked from the same state. NOT a retrieval score
+                   (tried and rejected as panel c, 2026-10-12): the mirror
+                   branch carries each model's TRANSFER, so the score falls as
+                   generalization rises -- in n2mix it ranked Motor Cortex
+                   0.82 > Full Circuit 0.50, because the Full Circuit and COIN
+                   start +60 at ~0.33 success against Motor Cortex's 0.17; in
+                   n2rot the mirror sits near ceiling for every model (+30 is
+                   its trained neighbour). Retrieval is protection; transfer
+                   is the n2wide interior. nan where the cell has no mirror
       retrieval_ep / transfer_ep  the episodes-to-criterion versions of the
                    old novel-vs-revisit contrasts, kept for the crossing row
 
@@ -4933,7 +4958,8 @@ def probe_scores(crossings: pd.DataFrame, early: pd.DataFrame = None,
                "retrieval_ep": novel_rot - float(by["revisit"]),
                "transfer_ep": float(by["novel_family"]) - novel_rot,
                "censored": bool(g["censored"].any()),
-               "retrieval": np.nan, "transfer": np.nan, "transfer_parked": np.nan,
+               "retrieval": np.nan, "specificity": np.nan,
+               "transfer": np.nan, "transfer_parked": np.nan,
                "transfer_vs_family": np.nan}
         if aim is not None and len(aim):
             am = aim[(aim.config == cfg) & (aim.seed == seed)]
@@ -4951,10 +4977,13 @@ def probe_scores(crossings: pd.DataFrame, early: pd.DataFrame = None,
                     naive, trained = float(lv["naive"].iloc[0]), float(lv["trained"].iloc[0])
                     if np.isfinite(naive) and np.isfinite(trained) and abs(trained - naive) > 1e-9:
                         row["retrieval"] = (float(eb["revisit"]) - naive) / (trained - naive)
+                        if MIRROR_ROLE in eb.index:
+                            row["specificity"] = ((float(eb["revisit"]) - float(eb[MIRROR_ROLE]))
+                                                  / (trained - naive))
         rows.append(row)
     return pd.DataFrame(rows, columns=["config", "seed", "metric", "retrieval_ep", "transfer_ep",
-                                       "censored", "retrieval", "transfer", "transfer_parked",
-                                       "transfer_vs_family"])
+                                       "censored", "retrieval", "specificity", "transfer",
+                                       "transfer_parked", "transfer_vs_family"])
 
 
 def plot_savings_probes(data: pd.DataFrame, output_dir: str, metrics: list = None,
@@ -5059,7 +5088,7 @@ def plot_savings_probes(data: pd.DataFrame, output_dir: str, metrics: list = Non
                 ea = early[(early.config == cfg) & (early.metric == metric)]
                 swarm_ci(axE, [ea[ea.branch == r]["early"].to_numpy() for r in roles],
                          colors=[_lighten(color, ROLE_TINT * k) for k in range(len(roles))],
-                         labels=[PROBE_SHORT[r] for r in roles], jitter=0.18)
+                         labels=[PROBE_SHORT[r] for r in roles], stat="median", jitter=0.18)
                 if np.isfinite(target):
                     axE.axhline(target, color=INK, ls=":", lw=0.6)
                 # row 4: the scores, from the early-block performance. Retrieval
@@ -5072,12 +5101,12 @@ def plot_savings_probes(data: pd.DataFrame, output_dir: str, metrics: list = Non
                 last_col = col == len(configs) - 1
                 if retrieval_defined(cfg):
                     swarm_ci(axS, [sc["retrieval"].to_numpy()], colors=[color], labels=["retrieval"],
-                             x=[0.0], jitter=0.18)
+                             x=[0.0], stat="median", jitter=0.18)
                 else:
                     axS.annotate("n/a: no\ninterfering\nrotation", (0, 0), **note)
                 if transfer_defined(cfg):
                     swarm_ci(axS, [sc["transfer"].to_numpy()], colors=[_lighten(color, 0.4)],
-                             labels=["transfer"], x=[1.0], jitter=0.18)
+                             labels=["transfer"], x=[1.0], stat="median", jitter=0.18)
                 else:
                     axS.annotate("n/a: a second\nrotation inflates\ntransfer", (1, 0), **note)
                 # both are ratios on one scale: 1 = trained level / ideal aim,
@@ -5187,7 +5216,8 @@ def _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_ep
     if not blocks.empty:
         first = blocks[blocks.occurrence == blocks.occurrence.min()].sort_values("ep")
         band = median_seed_band(first, metric, None, smooth_window)
-        ax.plot(band.index, band["median"], color=_lighten(color, 2 * ROLE_TINT), lw=1.1, zorder=2)
+        ax.plot(band.index, band["median"], color=MUTED, lw=1.1, zorder=2)
+        _iqr(ax, band, MUTED, zorder=1.2)
         naive = early_mean(first)
         last = blocks[blocks.occurrence == blocks.occurrence.max()].sort_values("ep")
         trained = last.groupby("seed")[metric].apply(
@@ -5196,6 +5226,18 @@ def _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_ep
             ax.axhline(trained, color=color, ls=":", lw=0.8, zorder=1)
     band = median_seed_band(rev, metric, None, smooth_window)
     ax.plot(band.index, band["median"], color=color, lw=1.1, zorder=3)
+    _iqr(ax, band, color, zorder=1.4)
+    # the NOVEL ROTATION (the revisit's mirror image), forked from the same
+    # end-of-washout state, dashed: shown beside the revisit, not scored
+    # against it -- retrieval is protection, and this branch's feedforward
+    # aim is the transfer panel (user, 2026-10-12)
+    mir = pr[(pr.config == cfg) & (pr.branch == MIRROR_ROLE)]
+    mir_post = np.nan
+    if not mir.empty:
+        band_m = median_seed_band(mir, metric, None, smooth_window)
+        ax.plot(band_m.index, band_m["median"], color=_lighten(color, NOVEL_TINT), lw=1.1, zorder=2.5)
+        _iqr(ax, band_m, _lighten(color, NOVEL_TINT), zorder=1.3)
+        mir_post = early_mean(mir.sort_values("ep"))
     # the score, drawn: from the naive level, a thin bar up to the trained
     # level (what there was to lose) and a thick one up to the revisit's
     # early level (what survived); protection = thick / thin. Both at the
@@ -5206,6 +5248,11 @@ def _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_ep
         ax.plot([x0 - 1.5, x0 - 1.5], [naive, trained], color=INK, lw=1.2, solid_capstyle="butt", zorder=4)
         ax.plot([x0 + 1.5, x0 + 1.5], [naive, post], color=color, lw=2.4, solid_capstyle="butt", zorder=4)
         ax.plot([x0 - 3, x0 + 3], [naive, naive], color=INK, lw=0.6, zorder=4)
+        # the novel rotation's early level, in its lighter tint (user, 2026-10-12)
+        if np.isfinite(mir_post):
+            ax.plot([x0 + 4.5, x0 + 4.5], [naive, mir_post], color=_lighten(color, NOVEL_TINT), lw=2.4,
+                    solid_capstyle="butt", zorder=4)
+            ax.plot([x0 - 3, x0 + 6], [naive, naive], color=INK, lw=0.6, zorder=4)
 
 
 # the models the paper's probe figure shows (user, 2026-10-08): the open-set
@@ -5226,7 +5273,8 @@ def plot_savings_probes_coin(data: pd.DataFrame, output_dir: str, metrics: list 
     note = ("COIN (open set) is COIN with its novel-context process: no fixed hypothesis set, "
             "a context instantiated whenever a novel hypothesis best explains the plant, each "
             "learning its own plant model; the washout and the reflection become contexts of "
-            "their own, the interior rotation is explained by the trained ones. A control that "
+            "their own, while a novel rotation 30 degrees from a trained one is explained by it. "
+            "A control that "
             "the fixed hypothesis set handed to COIN does not drive the comparison; the Full "
             "Circuit is shown beside both so its gap can be read against either.")
     kw.setdefault("stem", "savings_probes_coin")
@@ -5246,6 +5294,808 @@ def probe_block_lengths(data: pd.DataFrame) -> list:
     return sorted(lengths)
 
 
+OVERVIEW_PROBE_ORDER = ("baseline", "cb_only_end_to_end", "coin", "main")
+
+
+def paper_cycle_runs(data: pd.DataFrame, models=None) -> list:
+    """The six-context cycle runs of the paper's models: the default context
+    set, the default block length, no probes -- one run per model (baseline,
+    cb_only_end_to_end, main_carry, coin). The probe cells and other variants
+    are cycle-schedule runs too, so cycle_only alone lets them into a
+    criterion figure."""
+    models = PROBE_MAIN_MODELS if models is None else models
+    out = []
+    for c in get_config_order(cycle_only(data)):
+        base, infix, buf = split_run_name(c)
+        if base not in models or buf or sac.PROBE_SUFFIX in infix:
+            continue
+        n, ps, ep = cycle_cell(c)
+        if ps != sac.DEFAULT_PHASE_SET or ep != sac.N_PHASE_EP:
+            continue
+        if base not in [base_config(o) for o in out]:
+            out.append(c)
+    return out
+
+
+def plot_savings_overview(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                          criterion_fraction: float = 0.8,
+                          smooth_window: int = TRACE_SMOOTH_WINDOW,
+                          early_episodes: int = PROBE_EARLY_EPISODES,
+                          retrieval_cell: str = None, transfer_cell: str = None,
+                          layouts=("rows", "side", "schema", "main")):
+    """Savings and its two mechanisms in one figure (user, 2026-10-13): the
+    criterion summary's trace panels and the savings probes' trace rows.
+
+      a-c  criterion_summary's traces, one per previous-experience count, for
+           the paper's four models in the six-context cycle (paper_cycle_runs)
+      d    the interference cell: per model, the revisit after interference
+           against the context's naive first visit and its trained level
+           (_protection_traces)
+      e    the transfer cell: per model, the first-action aim along the
+           interior branch against the ideal and the parked aim
+           (_compensation_traces)
+
+    The probe rows follow plot_savings_probes_combined: the same cells by
+    default (read from its signature, so the two figures cannot drift apart),
+    the same legends and axis labels.
+
+    TWO LAYOUTS (user, 2026-10-13), both written by default:
+      "rows"  a-c across the top, the probe rows d and e below them
+              -> savings_overview_<metric>
+      "side"  the probe rows on the left, a-c stacked in a half-column on
+              the right -> savings_overview_side_<metric>
+      "schema" a 4-column grid: the model schematic's empty slot over
+              columns 0-1 of the top row, a-c side by side over columns 2-3,
+              the probe rows below, one model per column -> savings_overview_schema_<metric>.{svg,pdf,png}
+              plus <stem>_slot.json, the slot's position, which
+              compose_schema.py uses to drop the schematic SVG in.
+              Letters then run a (schema), b-d, e-f.
+    Row e's y axis tops out at zero (user, 2026-10-13): the change in aim
+    toward compensation is negative for this rotation."""
+    import inspect
+    pdef = inspect.signature(plot_savings_probes_combined).parameters
+    retrieval_cell = retrieval_cell or pdef["retrieval_cell"].default
+    transfer_cell = transfer_cell or pdef["transfer_cell"].default
+    one_cell = retrieval_cell == transfer_cell
+    metrics = METRICS if metrics is None else metrics
+    runs = paper_cycle_runs(data)
+    cyc = cycle_only(data)
+    cyc = cyc[cyc["config"].isin(runs)]
+    pr = probe_rows(data)
+    if not runs or pr is None or pr.empty:
+        print("No six-context runs or no probe runs; skipping savings_overview")
+        return
+    shared = get_shared_seeds(cyc, runs)
+    cyc = cyc[cyc["seed"].isin(shared)].copy()
+    targets = global_criterion_targets(cyc, metrics, criterion_fraction)
+    occ_order = sorted(pd.to_numeric(cyc["occurrence"], errors="coerce").dropna().unique().astype(int))
+    n_ep = int(cyc.groupby(["config", "seed", "phase_occurrence"]).size().max())
+    # the probe cells' runs, one per model
+    done = {c for c in pr["config"].unique() if set(cell_roles(c)) <= set(pr[pr.config == c]["branch"])}
+    of = {(tag, base_config(c)): c for c in done for tag in (retrieval_cell, transfer_cell)
+          if cell_tag(c) == tag}
+    # probe columns: the context-blind models, then COIN, then the Full Circuit
+    # (user, 2026-10-13)
+    models = [m for m in OVERVIEW_PROBE_ORDER if any(base_config(r) == m for r in runs)]
+    aim = transfer_aim(data, early_episodes)
+    t_cfg = next((of[(transfer_cell, m)] for m in models if (transfer_cell, m) in of), None)
+    t_label = PROBE_LABEL.get(transfer_rotation(cell_roles(t_cfg)), "novel rotation") if t_cfg else ""
+
+    for metric, layout in [(m, l) for m in metrics for l in layouts]:
+        target = targets.get(metric, np.nan)
+        if metric not in cyc.columns or not np.isfinite(target):
+            continue
+        side = layout == "side"
+        # "main" (user, 2026-10-23): the schema layout WITHOUT the schematic --
+        # the traces and the rank panel side by side in one top row, the probe
+        # rows below; letters a-d
+        no_slot = layout == "main"
+        with_schema = layout in ("schema", "main")
+        slot = None
+        if no_slot:
+            fig = plt.figure(figsize=figsize("double", height=6.0), layout="constrained")
+            outer = fig.add_gridspec(5, 1, height_ratios=[1.0, 0.07, 1.0, 0.07, 1.0])
+            top_gs = outer[0].subgridspec(2, 2, height_ratios=[0.1, 1.0], width_ratios=[1.0, 1.0])
+            fig.get_layout_engine().set(h_pad=0.01, hspace=0.0)
+            half = len(models) // 2
+            g_cr = top_gs[1, 0].subgridspec(1, len(occ_order))
+            spec_e = top_gs[1, 1]
+            g_pt = outer[2].subgridspec(1, len(models))
+            g_cp = outer[4].subgridspec(1, len(models))
+            strip_cells = (top_gs[0, 0], outer[1], outer[3])
+        elif with_schema:
+            # ONE 4-column grid for the whole figure (user, 2026-10-13), so the
+            # rows share column edges: row 1 is the schematic over columns 0-1
+            # and a-c side by side over columns 2-3; rows 2 and 3 are the probe
+            # rows, one model per column. Legend strips sit above each row.
+            # option 1 (user, 2026-10-14): the schematic spans TWO rows on
+            # the left; on the right the traces b-d sit above the rank-by-block
+            # panel e that summarises them; the probe rows f, g run below
+            # a-e compressed vertically (user, 2026-10-14): the top section is
+            # 1.5 probe rows tall, the figure shorter by the same amount, so
+            # the probe rows keep their size
+            fig = plt.figure(figsize=figsize("double", height=7.5), layout="constrained")
+            # the top section and the probe rows on SEPARATE grids: one shared
+            # 4-column grid imposed the rank panel's label margins on the probe
+            # columns and squeezed them (2026-10-14)
+            outer = fig.add_gridspec(5, 1, height_ratios=[1.5, 0.07, 1.0, 0.07, 1.0])
+            top_gs = outer[0].subgridspec(1, 2, width_ratios=[1.0, 1.0])
+            # b over c with little gap between them (user, 2026-10-14): the
+            # constrained layout ignores a sub-grid's hspace, so the figure's
+            # own vertical padding is tightened instead
+            right = top_gs[0, 1].subgridspec(3, 1, height_ratios=[0.07, 1.0, 1.0])
+            fig.get_layout_engine().set(h_pad=0.01, hspace=0.0)
+            half = len(models) // 2
+            slot = fig.add_subplot(top_gs[0, 0])
+            slot.axis("off")
+            g_cr = right[1].subgridspec(1, len(occ_order))
+            spec_e = right[2]                  # panel e: broken across the restarts
+            g_pt = outer[2].subgridspec(1, len(models))
+            g_cp = outer[4].subgridspec(1, len(models))
+            # the model legend centred over the savings panels it keys
+            # (user, 2026-10-13), the probe legends over their rows
+            strip_cells = (right[0], outer[1], outer[3])
+        elif side:
+            # probe rows on the left, a-c stacked in a half-column on the right;
+            # the model legend spans the top
+            fig = plt.figure(figsize=figsize("double", height=5.4), layout="constrained")
+            outer = fig.add_gridspec(2, 1, height_ratios=[0.07, 1.0])
+            body = outer[1].subgridspec(1, 2, width_ratios=[3.1, 1.0])
+            left = body[0, 0].subgridspec(4, 1, height_ratios=[0.08, 1.0, 0.08, 1.0])
+            g_cr = body[0, 1].subgridspec(len(occ_order), 1)
+            g_pt = left[1].subgridspec(1, len(models))
+            g_cp = left[3].subgridspec(1, len(models))
+            strip_cells = (outer[0], left[0], left[2])
+        else:
+            fig = plt.figure(figsize=figsize("double", height=7.4), layout="constrained")
+            outer = fig.add_gridspec(6, 1, height_ratios=[0.08, 1.0, 0.08, 1.0, 0.08, 1.0])
+            g_cr = outer[1].subgridspec(1, len(occ_order))
+            g_pt = outer[3].subgridspec(1, len(models))
+            g_cp = outer[5].subgridspec(1, len(models))
+            strip_cells = (outer[0], outer[2], outer[4])
+
+        # legend strips, one above each row
+        strips = [fig.add_subplot(c_) for c_ in strip_cells]
+        for st in strips:
+            st.axis("off")
+        # one colour per model throughout (user, 2026-10-13): the model's own,
+        # not its run's -- a suffixed run (main_carry) gets a shade otherwise
+        col_of = lambda c: CONFIG_COLORS.get(base_config(c), CONFIG_COLORS.get(c, "gray"))
+        cfg_handles = {display_name(base_config(c)): Patch(facecolor=col_of(c), edgecolor=INK,
+                                                          linewidth=.5)
+                       for c in sorted(runs, key=lambda c: OVERVIEW_PROBE_ORDER.index(base_config(c))
+                                       if base_config(c) in OVERVIEW_PROBE_ORDER else 99)}
+        strips[0].legend(cfg_handles.values(), cfg_handles.keys(), loc="center",
+                         ncol=2 if with_schema else len(runs), borderaxespad=0)
+        strips[1].legend(handles=[
+            Line2D([], [], color=INK, lw=1.6, label="Revisit"),
+            Line2D([], [], color=_lighten(INK, 0.78), lw=1.6, label="Novel rotation"),
+            Line2D([], [], color=MUTED, lw=1.6, label="First visit"),
+            Line2D([], [], color=INK, ls=":", lw=0.8, label="Trained level")],
+            loc="center", ncol=4, borderaxespad=0, handlelength=1.6)
+        strips[2].legend(handles=[
+            Line2D([], [], color=INK, lw=1.6, label="change in first-action aim"),
+            Line2D([], [], color=INK, ls=":", lw=0.8, label="ideal change"),
+            Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="zero → ideal"),
+            Line2D([], [], color=INK, lw=2.4, marker="|", ms=8, mew=2.4, ls="",
+                   label="change on first reaches")],
+            loc="center", ncol=4, borderaxespad=0, handlelength=1.6)
+
+        # a-c: the criterion traces
+        top = []
+        n_seeds = 0
+        for k, occ in enumerate(occ_order):
+            at = fig.add_subplot(g_cr[k, 0] if side else g_cr[0, k],
+                                 sharex=top[0] if top else None, sharey=top[0] if top else None)
+            blk = cyc[cyc["occurrence"] == occ]
+            for cfg in runs:
+                band = _pooled_visit_band(blk[blk["config"] == cfg], metric, smooth_window)
+                if band.empty:
+                    continue
+                n_seeds = max(n_seeds, int(band["n"].iloc[0]))
+                plot_band(at, band.index, band["median"], lo=band["lo"], hi=band["hi"],
+                          color=col_of(cfg), lw=1.0)
+                x_cross = _curve_crossing(band, target)
+                if np.isfinite(x_cross):
+                    at.plot(x_cross, target, **CROSSING_MARKER, color=col_of(cfg),
+                            transform=crossing_transform(at, fig))
+            # unlabelled at half width, where the label hits the curves; the
+            # caption defines the dotted line
+            chance_line(at, target, "Criterion" if (k == len(occ_order) - 1 and not with_schema)
+                        else None, color=INK, lw=0.7)
+            # schema layout: untitled (user, 2026-10-14) -- the caption says the
+            # three are previous experiences 0, 1, 2 left to right
+            if not with_schema:
+                at.set_title(f"Previous experiences: {occ}")
+            at.set_xlim(0, n_ep)
+            if side:
+                # stacked: one x label on the bottom panel, a y label on each
+                at.set_ylabel(metric.capitalize())
+                if k < len(occ_order) - 1:
+                    at.tick_params(labelbottom=False)
+                else:
+                    at.set_xlabel("Episodes since switch")
+            else:
+                # half width: one x label, under the middle panel
+                if not with_schema or k == len(occ_order) // 2:
+                    at.set_xlabel("Episodes since switch")
+                if k:
+                    at.tick_params(labelleft=False)
+            top.append(at)
+        if metric == "success":
+            top[0].set_ylim(0, 1.0)
+        if not side:
+            top[0].set_ylabel(metric.capitalize())
+        e_res, e_axes = None, None
+        if with_schema:
+            # e: who is ahead, block by block -- the same computation as the
+            # standalone block_success_by_block figure
+            e_runs = sorted(runs, key=lambda c: OVERVIEW_PROBE_ORDER.index(base_config(c))
+                            if base_config(c) in OVERVIEW_PROBE_ORDER else 99)
+            e_res = _rank_by_block(cyc, e_runs, metric, criterion_fraction)
+            e_axes = _draw_by_block(fig, spec_e, e_res, e_runs, col_of, titles=False)
+
+        # d, e: the probe rows
+        rows = []
+        for g, tag, draw in ((g_pt, retrieval_cell, "protection"), (g_cp, transfer_cell, "aim")):
+            axes = []
+            for col, base in enumerate(models):
+                # schema layout (user, 2026-10-14): f and g share each column's
+                # x axis, so only g carries the episode labels
+                share_x = rows[0][col] if (with_schema and draw == "aim" and rows) else None
+                ax = fig.add_subplot(g[0, col], sharey=axes[0] if axes else None, sharex=share_x)
+                cfg = of.get((tag, base))
+                color = CONFIG_COLORS.get(base, "gray")
+                if cfg is None:
+                    ax.text(0.5, 0.5, "not run", ha="center", va="center", color=MUTED,
+                            transform=ax.transAxes)
+                elif draw == "protection":
+                    _protection_traces(ax, data, pr, cfg, metric, color, smooth_window, early_episodes)
+                else:
+                    _compensation_traces(ax, pr, cfg, color, smooth_window, early_episodes, aim)
+                # no model titles in the schema layout: the colours name the
+                # circuits there (user, 2026-10-14)
+                ax.set_title(display_name(base, wrap=True)
+                             if (draw == "protection" and not with_schema) else "")
+                if with_schema and draw == "protection":
+                    ax.tick_params(labelbottom=False)
+                else:
+                    ax.set_xlabel("Episodes since switch")
+                if col == 0:
+                    ax.set_ylabel(metric.capitalize() if draw == "protection"
+                                  else "Change in first-action aim (°)")
+                else:
+                    ax.tick_params(labelleft=False)
+                axes.append(ax)
+            if draw == "protection" and metric == "success":
+                axes[0].set_ylim(0, 1)
+            if draw == "aim":
+                axes[0].set_ylim(top=0)          # user, 2026-10-13
+            rows.append(axes)
+
+        offset_spines(fig)
+        if no_slot:
+            label_panels(fig, [top[0], e_axes[0], rows[0][0], rows[1][0]])
+        elif slot is not None:
+            # ONE letter for the three trace panels, one series split by
+            # exposure (user, 2026-10-14): a schematic, b traces, c rank,
+            # d retrieval, e transfer
+            label_panels(fig, [slot, top[0], e_axes[0], rows[0][0], rows[1][0]])
+        else:
+            label_panels(fig, top + [rows[0][0], rows[1][0]])
+        heads = {}
+        for tag in (retrieval_cell, transfer_cell):
+            cfg = next((of[(tag, m)] for m in models if (tag, m) in of), None)
+            if cfg is not None:
+                n, ps, ep = cycle_cell(cfg)
+                heads[tag] = " then ".join(T.C_LABEL[c] for c in sac.phase_ids_for(ps))
+        cell_txt = (f"Both probe rows are one cell, {heads.get(retrieval_cell, retrieval_cell)} "
+                    f"trained, then a washout, with branches forked from its end: retrieval from "
+                    f"the revisit, transfer from the novel rotation. " if one_cell else
+                    f"Retrieval from the cell {heads.get(retrieval_cell, retrieval_cell)}, transfer "
+                    f"from {heads.get(transfer_cell, transfer_cell)}, each trained then washed out. ")
+        caption = (
+            f"Savings and its two mechanisms, {metric}. All traces are {smooth_window}-episode "
+            f"means. (a-c) {metric.capitalize()} against episodes since the context switch in "
+            f"the six-context cycle, by how many times the agent has met the context before; "
+            f"each seed's curve is the mean over its six contexts, line the median across "
+            f"{n_seeds} seeds, band the 95% bootstrap CI of that median. Dotted line is the "
+            f"criterion, {criterion_fraction:g} x the best value seen, and each marker where a "
+            f"model's median curve first reaches it. " + cell_txt +
+            f"Probe traces are medians across seeds, shaded over the interquartile range. "
+            f"(d) Retrieval: per model, the revisit of the first context after the conflicting "
+            f"rotation and the washout (the model's colour), the novel rotation forked from the "
+            f"same state (lighter), the context's first cycle visit (naive, grey) and its "
+            f"trained level (dotted). From the naive level the thin bar rises to the trained "
+            f"level and the thick ones to the revisit's and the novel rotation's first "
+            f"{early_episodes} episodes; protection is the revisit's bar over the thin one. "
+            f"(e) Transfer: per model, the change in first-action aim along the {t_label} "
+            f"branch from the aim each seed left the washout with, against the ideal change "
+            f"(dotted: full compensation less the parked aim); the thin bar runs from zero to "
+            f"the ideal change, the thick one to the change on the first {early_episodes} "
+            f"reaches.")
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        stem = ("savings_overview_main" if no_slot else
+                "savings_overview_schema" if slot is not None else
+                "savings_overview_side" if side else "savings_overview")
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"{stem}_{metric}")
+        if slot is not None:
+            # where the schematic goes, after the constrained layout has run
+            write_slot(fig, slot, path)
+        if with_schema:
+            n_ctx = e_res["n_ctx"] if e_res else 6
+            rank_txt = (
+                f"(c) Who gets going fastest, block by block: each model's average rank in early "
+                f"{metric}, its mean over the block's first {RANK_WINDOW} episodes, for every block "
+                f"of the cycle in run order -- the expected position of one of its seeds against "
+                f"one seed of each other model (1 = fastest, {len(runs)} = slowest; dotted, all "
+                f"alike), unpaired, with 95% bootstrap bands over seeds. The axis is broken where "
+                f"the cycle restarts, so blocks 1-{n_ctx} are first exposures, "
+                f"{n_ctx + 1}-{2 * n_ctx} second, the rest third. The re-exposed rotations, just "
+                f"after each restart, are relearned quickly by every model, so the ranks there "
+                f"sit near the middle. ")
+            caption = caption.replace("first reaches it. ", "first reaches it. " + rank_txt, 1)
+            if no_slot:
+                caption = (caption.replace("(a-c)", "(a) Left to right, previous experiences "
+                                           "0, 1 and 2:", 1)
+                           .replace("(c) Who gets going", "(b) Who gets going", 1)
+                           .replace("(d) Retrieval", "(c) Retrieval", 1)
+                           .replace("(e) Transfer", "(d) Transfer", 1))
+                save(fig, path, caption=caption)
+                print(f"Saved {path}")
+                continue
+            caption = "(a) Model schematic. " + caption.replace(
+                "(a-c)", "(b) Left to right, previous experiences 0, 1 and 2:", 1)
+            # text as outlines, so the composed SVG and its PDF need no fonts
+            with plt.rc_context({"svg.fonttype": "path"}):
+                # the PDF has the slot empty: the schematic is added by hand
+                # (user, 2026-10-13) or with compose_schema.py from the SVG
+                save(fig, path, formats=("pdf", "svg", "png"), caption=caption)
+        else:
+            save(fig, path, caption=caption)
+        print(f"Saved {path}")
+
+
+def plot_savings_supplement(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                            criterion_fraction: float = 0.8,
+                            smooth_window: int = TRACE_SMOOTH_WINDOW,
+                            early_episodes: int = PROBE_EARLY_EPISODES):
+    """Supplement to savings_overview (user, 2026-10-13): the distributions
+    behind its traces.
+
+      a-c  episodes to criterion per seed x context block, one panel per
+           previous-experience count, for the paper's four models in the
+           six-context cycle (criterion_summary's swarms), with the tests
+           against Motor Cortex in the strip no crossing can reach
+      d    retrieval: protection from interference, per seed
+      e    transfer: compensation added on the novel rotation's first reaches
+
+    Same models, order and colours as savings_overview; d and e are the
+    probe figure's score panels (_probe_score_panels), on its cells.
+    File probes/savings_supplement_<metric>, with _stats.csv for d and e."""
+    import inspect
+    metrics = METRICS if metrics is None else metrics
+    pdef = inspect.signature(plot_savings_probes_combined).parameters
+    retrieval_cell, transfer_cell = pdef["retrieval_cell"].default, pdef["transfer_cell"].default
+    runs = paper_cycle_runs(data)
+    pr = probe_rows(data)
+    if not runs or pr is None or pr.empty:
+        print("No six-context runs or no probe runs; skipping savings_supplement")
+        return
+    order = lambda c: (OVERVIEW_PROBE_ORDER.index(base_config(c))
+                       if base_config(c) in OVERVIEW_PROBE_ORDER else 99)
+    runs = sorted(runs, key=order)
+    models = [base_config(c) for c in runs]
+    col_of = lambda c: CONFIG_COLORS.get(base_config(c), CONFIG_COLORS.get(c, "gray"))
+    cyc = cycle_only(data)
+    cyc = cyc[cyc["config"].isin(runs)]
+    cyc = cyc[cyc["seed"].isin(get_shared_seeds(cyc, runs))].copy()
+    crossings = build_criterion_crossing_phase_table(cyc, metrics, criterion_fraction=criterion_fraction)
+    occ_order = sorted(pd.to_numeric(cyc["occurrence"], errors="coerce").dropna().unique().astype(int))
+    n_ep = int(cyc.groupby(["config", "seed", "phase_occurrence"]).size().max())
+    # the probe scores, on the probe figure's cells
+    done = {c for c in pr["config"].unique() if set(cell_roles(c)) <= set(pr[pr.config == c]["branch"])}
+    of = {(tag, base_config(c)): c for c in done for tag in (retrieval_cell, transfer_cell)
+          if cell_tag(c) == tag}
+    pc = probe_crossings(data, metrics, criterion_fraction, smooth_window)
+    scores = probe_scores(pc, probe_early(data, metrics, early_episodes),
+                          revisit_levels(data, metrics, early_episodes),
+                          transfer_aim(data, early_episodes))
+
+    for metric in metrics:
+        if metric not in cyc.columns:
+            continue
+        fig = plt.figure(figsize=figsize("double", height=5.0), layout="constrained")
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0])
+        g_top = gs[0].subgridspec(1, len(occ_order))
+        g_bot = gs[1].subgridspec(1, 2, wspace=0.12)
+        names = [display_name(b, wrap=True) for b in models]
+        swarms = []
+        for k, occ in enumerate(occ_order):
+            ab = fig.add_subplot(g_top[0, k], sharex=swarms[0] if swarms else None,
+                                 sharey=swarms[0] if swarms else None)
+            cr_k = crossings[(crossings["metric"] == metric) & (crossings["occurrence"] == occ)]
+            # ONE POINT PER SEED, its mean over the six contexts (user,
+            # 2026-10-14): the unit the test compares, so the swarm shows the
+            # distribution being tested. Hollow: the mean includes blocks that
+            # never reached criterion, so it is a lower bound.
+            per_seed = cr_k.groupby(["config", "seed"]).agg(
+                ep=("criterion_episode", "mean"), cens=("censored", "any")).reset_index()
+            groups = [per_seed[per_seed["config"] == c]["ep"].to_numpy(float) for c in runs]
+            hollow = [per_seed[per_seed["config"] == c]["cens"].to_numpy(bool) for c in runs]
+            swarm_ci(ab, groups, colors=[col_of(c) for c in runs], labels=names,
+                     x=np.arange(len(runs)), stat="median", hollow=hollow, orient="h",
+                     jitter=0.22, point_kw=dict(s=6), mean_ms=3, seed=k)
+            ab.set_yticks(np.arange(len(runs)), names)
+            ab.set_ylim(len(runs) - 0.4, -0.6)            # first model on top
+            ab.set_xlim(0, n_ep)
+            _gap_brackets(ab, cr_k, runs, x_max=smooth_window - 1)
+            ab.set_title(f"Previous experiences: {occ}")
+            ab.set_xlabel("Episodes to criterion\n(Context mean)")
+            if k:
+                ab.tick_params(labelleft=False)
+            swarms.append(ab)
+        axS, axT = fig.add_subplot(g_bot[0, 0]), fig.add_subplot(g_bot[0, 1])
+        stats_tbl, st_c, st_d = _probe_score_panels(axS, axT, scores, of, models, metric,
+                                                    retrieval_cell, transfer_cell)
+        for a in swarms:
+            offset_spines(a)
+        label_panels(fig, swarms + [axS, axT])
+        heads = {}
+        for tag in (retrieval_cell, transfer_cell):
+            cfg = next((of[(tag, m)] for m in models if (tag, m) in of), None)
+            if cfg is not None:
+                heads[tag] = " then ".join(T.C_LABEL[c] for c in sac.phase_ids_for(cycle_cell(cfg)[1]))
+        cell_txt = (f"the rotation pair ({heads.get(retrieval_cell, retrieval_cell)} trained, then a "
+                    f"washout), retrieval from its revisit and transfer from its novel rotation"
+                    if retrieval_cell == transfer_cell else
+                    f"{heads.get(retrieval_cell, retrieval_cell)} for retrieval and "
+                    f"{heads.get(transfer_cell, transfer_cell)} for transfer")
+        caption = (
+            f"The distributions behind the savings figure, {metric}. (a-c) Episodes to "
+            f"criterion ({criterion_fraction:g} x the best {metric} seen, on the "
+            f"{smooth_window}-episode mean) in the six-context cycle, by how many times the "
+            f"agent has met the context before: one point per seed, its mean over the six "
+            f"context blocks; median and IQR over the seeds. A block that never reached "
+            f"criterion counts at the block's last episode, and a seed whose mean includes one "
+            f"is drawn open: its mean is a lower bound. The brackets left of episode {smooth_window}, which no crossing can "
+            f"reach, are two-sided Mann-Whitney U tests against {display_name('baseline')}, one "
+            f"value per seed (its mean over the six contexts), unpaired (a seed number does not "
+            f"give two models the same reaches), Holm-corrected within the panel. "
+            f"(d, e) The probe scores, from {cell_txt}. (d) Retrieval as protection from "
+            f"interference, per seed: (revisit − naive) / (trained − naive) in early-block "
+            f"{metric} (first {early_episodes} episodes); 1 = the trained solution survived the "
+            f"conflicting rotation and the washout, 0 = back to naive. (e) Transfer, per seed: "
+            f"the compensation the first {early_episodes} reaches added, (aim − parked aim) / "
+            f"ideal aim; 1 = the whole rotation compensated beyond where the policy started, "
+            f"0 = no change. Median and IQR over seeds. Planned comparisons, two-sided "
+            f"Mann-Whitney U, unpaired, Holm-corrected within each panel: in (d) each context "
+            f"model against each context-blind one ({_p_summary(st_c)}); in (e) the Full "
+            f"Circuit against each other model ({_p_summary(st_d)}); details in the "
+            f"accompanying _stats.csv.")
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"savings_supplement_{metric}")
+        stats_tbl.round(4).to_csv(path + "_stats.csv", index=False)
+        save(fig, path, caption=caption)
+        print(f"Saved {path}")
+
+
+def plot_criterion_by_context(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                              criterion_fraction: float = 0.8,
+                              smooth_window: int = TRACE_SMOOTH_WINDOW):
+    """Episodes to criterion for every context x exposure (user, 2026-10-14):
+    rows the six contexts in the order the cycle first visits them, columns
+    the exposures (previous experiences 0, 1, 2), the paper's four models in
+    each panel. One block per seed per cell, so nothing is averaged.
+
+    The check it exists for: on the very first block of the run (the first
+    context, first exposure) nothing has been learned that could transfer,
+    so the models should be equal there; any gap is a difference in learning
+    speed, not in savings or transfer. Later first exposures can already
+    carry transfer from the contexts before them.
+
+    Tests: each model against Motor Cortex, two-sided Mann-Whitney U over
+    seeds (unpaired), Holm within the panel; a _stats.csv holds every cell.
+    File probes/criterion_by_context_<metric>."""
+    metrics = METRICS if metrics is None else metrics
+    runs = paper_cycle_runs(data)
+    if not runs:
+        print("No six-context runs; skipping criterion_by_context")
+        return
+    runs = sorted(runs, key=lambda c: (OVERVIEW_PROBE_ORDER.index(base_config(c))
+                                       if base_config(c) in OVERVIEW_PROBE_ORDER else 99))
+    col_of = lambda c: CONFIG_COLORS.get(base_config(c), CONFIG_COLORS.get(c, "gray"))
+    names = [display_name(base_config(c), wrap=True) for c in runs]
+    cyc = cycle_only(data)
+    cyc = cyc[cyc["config"].isin(runs)]
+    cyc = cyc[cyc["seed"].isin(get_shared_seeds(cyc, runs))].copy()
+    crossings = build_criterion_crossing_phase_table(cyc, metrics, criterion_fraction=criterion_fraction)
+    n_ep = int(cyc.groupby(["config", "seed", "phase_occurrence"]).size().max())
+    n_seed = int(cyc["seed"].nunique())
+    ctx_order = list(cyc[cyc["occurrence"] == 0].groupby("label")["phase"].min().sort_values().index)
+    occ_order = sorted(pd.to_numeric(cyc["occurrence"], errors="coerce").dropna().unique().astype(int))
+    base = runs[0]                                  # Motor Cortex, the context-blind reference
+    from scipy.stats import mannwhitneyu
+
+    for metric in metrics:
+        cr = crossings[crossings["metric"] == metric]
+        if cr.empty:
+            continue
+        fig, axes = plt.subplots(len(ctx_order), len(occ_order), sharex=True, sharey=True,
+                                 figsize=figsize("double", height=1.25 * len(ctx_order) + 0.6),
+                                 layout="constrained", squeeze=False)
+        rows = []
+        for r, ctx in enumerate(ctx_order):
+            for k, occ in enumerate(occ_order):
+                ax = axes[r, k]
+                cell = cr[(cr["label"] == ctx) & (cr["occurrence"] == occ)]
+                groups = [cell[cell["config"] == c]["criterion_episode"].to_numpy(float) for c in runs]
+                hollow = [cell[cell["config"] == c]["censored"].to_numpy(bool) for c in runs]
+                swarm_ci(ax, groups, colors=[col_of(c) for c in runs], labels=names,
+                         x=np.arange(len(runs)), stat="median", hollow=hollow, orient="h",
+                         jitter=0.25, point_kw=dict(s=2), mean_ms=3, seed=r * 10 + k)
+                ax.set_yticks(np.arange(len(runs)), names)
+                ax.set_ylim(len(runs) - 0.4, -0.6)
+                ax.set_xlim(0, n_ep)
+                _gap_brackets(ax, cell, runs, x_max=smooth_window - 1)
+                # every cell's tests for the table (the brackets show the same)
+                pv = []
+                for c in runs[1:]:
+                    a_, b_ = groups[0], groups[runs.index(c)]
+                    try:
+                        pv.append(float(mannwhitneyu(a_, b_, alternative="two-sided").pvalue))
+                    except ValueError:
+                        pv.append(np.nan)
+                for c, p_, ph in zip(runs[1:], pv, _holm(pv)):
+                    rows.append(dict(context=ctx, exposure=occ, model=display_name(base_config(c)),
+                                     reference=display_name(base_config(base)),
+                                     median_model=float(np.median(groups[runs.index(c)])),
+                                     median_reference=float(np.median(groups[0])),
+                                     never_model=float(np.mean(hollow[runs.index(c)])),
+                                     never_reference=float(np.mean(hollow[0])),
+                                     p=p_, p_holm=ph))
+                if r == 0:
+                    ax.set_title(f"Previous experiences: {occ}")
+                if k == 0:
+                    # family over its perturbation (user, 2026-10-14): "Rotation\n(−60°)"
+                    fam, _, pert = context_title(ctx).partition("\n")
+                    ax.set_ylabel(f"{fam.capitalize()}\n({pert})" if pert else ctx)
+                if r == len(ctx_order) - 1:
+                    ax.set_xlabel("Episodes to criterion")
+                if k:
+                    ax.tick_params(labelleft=False)
+        offset_spines(fig)
+        # one letter per row, a context (user, 2026-10-14)
+        label_panels(fig, list(axes[:, 0]))
+        stats = pd.DataFrame(rows)
+        first = stats[(stats.context == ctx_order[0]) & (stats.exposure == occ_order[0])]
+        # an all-censored cell has no information: say so rather than "p = 1"
+        if len(first) and (first["never_model"].min() >= 1.0) and (first["never_reference"].min() >= 1.0):
+            first_txt = ("no seed of any model reaches criterion within the block, so episodes to "
+                         "criterion cannot compare the models there; see the block's success "
+                         "levels instead")
+        else:
+            first_txt = "; ".join(f"{r_.model} median {r_.median_model:.0f} vs {r_.median_reference:.0f}, "
+                                  f"Holm p = {r_.p_holm:.2g}" for r_ in first.itertuples())
+        caption = (
+            f"Episodes to criterion ({criterion_fraction:g} x the best {metric} seen, on the "
+            f"{smooth_window}-episode mean) for every context and exposure of the six-context "
+            f"cycle. Rows: the contexts in the order the cycle first visits them; columns: how "
+            f"many times the agent has met the context before. One point per seed (one block "
+            f"per seed per cell, {n_seed} seeds), median and IQR; open circles never reached "
+            f"criterion and sit at the block's last episode. Brackets: each model against "
+            f"{display_name(base_config(base))}, two-sided Mann-Whitney U over seeds, unpaired, "
+            f"Holm within the panel; every cell's numbers are in the accompanying _stats.csv. "
+            f"The top-left panel is the run's first block, before anything could transfer: "
+            f"{first_txt}.")
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"criterion_by_context_{metric}")
+        stats.round(4).to_csv(path + "_stats.csv", index=False)
+        save(fig, path, caption=caption)
+        print(f"Saved {path}")
+        print(first.round(4).to_string(index=False))
+
+
+def _expected_rank(groups: list) -> np.ndarray:
+    """Each group's AVERAGE RANK among the groups, unpaired: the expected
+    position (1 = fastest) of one of its values against one value drawn from
+    every other group, 1 + sum over the others of P(other < this), ties
+    counting one half. All groups alike gives (k + 1) / 2."""
+    k = len(groups)
+    out = np.ones(k)
+    for i in range(k):
+        a = np.asarray(groups[i], float)[:, None]
+        for j in range(k):
+            if i == j:
+                continue
+            b = np.asarray(groups[j], float)[None, :]
+            out[i] += float(np.mean((b < a) + 0.5 * (b == a)))
+    return out
+
+
+def _standardised_by_block(cyc: pd.DataFrame, runs: list, metric: str) -> dict:
+    """Each run's STANDARDISED BLOCK SUCCESS for every block of the cycle in
+    run order (user, 2026-10-14; replaced the average rank in episodes to
+    criterion, whose ties at the smoothing floor and the block cap pulled
+    every model to the middle): per seed, the mean of `metric` over the
+    block, the area under its learning curve; per run, the mean over seeds,
+    less the mean of the four runs, over the pooled within-run SD across
+    seeds. 0 = the block's average model; units are seed SDs. Band: the 95%
+    interval of the run's mean (1.96 SEM) on the same scale. Uncensored and
+    floor-free. `cyc` holds the cycle rows of `runs` only. Returns blocks
+    [(exposure, context)], mean/lo/hi (run x block) and the pass sizes."""
+    ctx_order = list(cyc[cyc["occurrence"] == 0].groupby("label")["phase"].min().sort_values().index)
+    occ_order = sorted(pd.to_numeric(cyc["occurrence"], errors="coerce").dropna().unique().astype(int))
+    blocks = [(occ, ctx) for occ in occ_order for ctx in ctx_order]       # run order
+    per = cyc.groupby(["config", "seed", "label", "occurrence"])[metric].mean().reset_index()
+    mean = np.full((len(runs), len(blocks)), np.nan)
+    lo, hi = mean.copy(), mean.copy()
+    for bi, (occ, ctx) in enumerate(blocks):
+        cell = per[(per["label"] == ctx) & (per["occurrence"] == occ)]
+        groups = [cell[cell["config"] == c][metric].to_numpy(float) for c in runs]
+        if any(len(g) < 2 for g in groups):
+            continue
+        sd = float(np.sqrt(np.mean([g.var(ddof=1) for g in groups])))     # pooled within-run SD
+        grand = float(np.mean([g.mean() for g in groups]))
+        if sd <= 0:
+            continue
+        for i, g in enumerate(groups):
+            m = (g.mean() - grand) / sd
+            h = 1.96 * g.std(ddof=1) / np.sqrt(len(g)) / sd
+            mean[i, bi], lo[i, bi], hi[i, bi] = m, m - h, m + h
+    return dict(blocks=blocks, mean=mean, lo=lo, hi=hi, n_ctx=len(ctx_order),
+                n_occ=len(occ_order), empty=per.empty, measure="success", n_runs=len(runs))
+
+
+RANK_WINDOW = 50      # episodes at a block's start whose mean success is ranked
+
+
+def _rank_by_block(cyc: pd.DataFrame, runs: list, metric: str, criterion_fraction: float = 0.8,
+                   n_boot: int = 1000, by: str = "early", window: int = RANK_WINDOW) -> dict:
+    """Each run's AVERAGE RANK in episodes to criterion (_expected_rank: 1 =
+    fastest, (k + 1) / 2 = all alike) for every block of the cycle in run
+    order, with 95% bootstrap bands over seeds (each run's seeds resampled
+    independently). Speed, which is the claim -- block-mean success
+    (_standardised_by_block) also weighs the level reached, and on some
+    blocks a slower model ends higher (user, 2026-10-14: the standardised
+    version hid the Full Circuit's lead from block 4). Same return format
+    as _standardised_by_block.
+
+    `by` "early" (the default, user 2026-10-14): rank each seed's mean
+    `metric` over the block's first `window` episodes, higher = faster --
+    still a speed measure, but never censored and with no floor, so block 1
+    is measured rather than forced to the middle and the re-exposed
+    rotations are not tied at the smoothing floor (25 and 50 episodes gave
+    near-identical ranks). "criterion": rank episodes to criterion."""
+    if by == "early":
+        c2 = cyc.sort_values(["config", "seed", "label", "occurrence", "ep"]).copy()
+        c2["_i"] = c2.groupby(["config", "seed", "label", "occurrence"]).cumcount()
+        cr = (c2[c2["_i"] < window].groupby(["config", "seed", "label", "occurrence"])[metric]
+              .mean().reset_index())
+        cr["value"] = -cr[metric]                     # rank 1 = highest early success
+    else:
+        crossings = build_criterion_crossing_phase_table(cyc, [metric],
+                                                         criterion_fraction=criterion_fraction)
+        cr = crossings[crossings["metric"] == metric].copy()
+        cr["value"] = cr["criterion_episode"]
+    ctx_order = list(cyc[cyc["occurrence"] == 0].groupby("label")["phase"].min().sort_values().index)
+    occ_order = sorted(pd.to_numeric(cyc["occurrence"], errors="coerce").dropna().unique().astype(int))
+    blocks = [(occ, ctx) for occ in occ_order for ctx in ctx_order]       # run order
+    rng = np.random.default_rng(0)
+    mean = np.full((len(runs), len(blocks)), np.nan)
+    lo, hi = mean.copy(), mean.copy()
+    for bi, (occ, ctx) in enumerate(blocks):
+        cell = cr[(cr["label"] == ctx) & (cr["occurrence"] == occ)]
+        groups = [cell[cell["config"] == c]["value"].to_numpy(float) for c in runs]
+        if any(len(g) == 0 for g in groups):
+            continue
+        mean[:, bi] = _expected_rank(groups)
+        boot = np.array([_expected_rank([g[rng.integers(0, len(g), len(g))] for g in groups])
+                         for _ in range(n_boot)])
+        lo[:, bi], hi[:, bi] = np.percentile(boot, 2.5, axis=0), np.percentile(boot, 97.5, axis=0)
+    return dict(blocks=blocks, mean=mean, lo=lo, hi=hi, n_ctx=len(ctx_order),
+                n_occ=len(occ_order), empty=cr.empty, measure="rank", n_runs=len(runs),
+                by=by, window=window)
+
+
+def _draw_by_block(fig, spec, res: dict, runs: list, color_of, titles=True) -> list:
+    """The standardised block success in `spec`, AXIS BROKEN at each cycle
+    restart (user, 2026-10-14): one segment per pass, sharing y, a marker
+    per block, the lines not carried across the gaps. Returns the axes."""
+    n_ctx, n_occ = res["n_ctx"], res["n_occ"]
+    sub = spec.subgridspec(1, n_occ, wspace=0.08)
+    axes = []
+    for k in range(n_occ):
+        ax = fig.add_subplot(sub[0, k], sharey=axes[0] if axes else None)
+        x = np.arange(k * n_ctx + 1, (k + 1) * n_ctx + 1)
+        sl = slice(k * n_ctx, (k + 1) * n_ctx)
+        for i, c in enumerate(runs):
+            plot_band(ax, x, res["mean"][i, sl], lo=res["lo"][i, sl], hi=res["hi"][i, sl],
+                      color=color_of(c), label=display_name(base_config(c)), marker="o", ms=2.5)
+        ref = (res["n_runs"] + 1) / 2 if res["measure"] == "rank" else 0.0
+        ax.axhline(ref, color=MUTED, ls=":", lw=0.8, zorder=0.5)
+        ax.set_xlim(x[0] - 0.5, x[-1] + 0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(v) if v == x[0] or v == x[-1] else "" for v in x])
+        if titles:
+            ax.set_title(f"Previous: {k}")
+        if k:
+            ax.tick_params(labelleft=False)
+        if k == n_occ // 2:
+            ax.set_xlabel("Block (run order)")
+        axes.append(ax)
+    if res["measure"] == "rank":
+        axes[0].set_ylim(res["n_runs"] + 0.1, 0.9)        # rank 1 (fastest) on top
+        axes[0].set_yticks(np.arange(1, res["n_runs"] + 1))
+        axes[0].set_ylabel("Average rank\n(1 = fastest)")
+    else:
+        axes[0].set_ylabel("Block success (SD)")
+    return axes
+
+
+def plot_block_success_by_block(data: pd.DataFrame, output_dir: str, metrics: list = None,
+                                measure: str = "rank", criterion_fraction: float = 0.8):
+    """Who is ahead, block by block (user, 2026-10-14), for every block of
+    the six-context cycle in run order, the axis broken where the cycle
+    restarts (_draw_by_block). `measure` "rank" (default): the average rank
+    in episodes to criterion (_rank_by_block) -- speed, the claim; "success":
+    the standardised block success (_standardised_by_block), uncensored but
+    weighing the level reached too, which hid the Full Circuit's lead from
+    block 4. File probes/block_<measure>_by_block_<metric>, with a .csv."""
+    metrics = METRICS if metrics is None else metrics
+    runs = paper_cycle_runs(data)
+    if not runs:
+        print("No six-context runs; skipping block_success_by_block")
+        return
+    runs = sorted(runs, key=lambda c: (OVERVIEW_PROBE_ORDER.index(base_config(c))
+                                       if base_config(c) in OVERVIEW_PROBE_ORDER else 99))
+    col_of = lambda c: CONFIG_COLORS.get(base_config(c), CONFIG_COLORS.get(c, "gray"))
+    cyc = cycle_only(data)
+    cyc = cyc[cyc["config"].isin(runs)]
+    cyc = cyc[cyc["seed"].isin(get_shared_seeds(cyc, runs))].copy()
+    n_seed = int(cyc["seed"].nunique())
+
+    for metric in metrics:
+        if metric not in cyc.columns:
+            continue
+        res = (_rank_by_block(cyc, runs, metric, criterion_fraction) if measure == "rank"
+               else _standardised_by_block(cyc, runs, metric))
+        blocks = res["blocks"]
+        fig = plt.figure(figsize=figsize("onehalf", height=2.8), layout="constrained")
+        gs = fig.add_gridspec(1, 1)
+        axes = _draw_by_block(fig, gs[0], res, runs, col_of)
+        fig.legend(*axes[0].get_legend_handles_labels(), loc="outside upper center", ncol=len(runs))
+        for ax in axes:
+            offset_spines(ax)
+        tab = pd.DataFrame([dict(block=bi + 1, context=ctx, exposure=occ,
+                                 model=display_name(base_config(c)), z=res["mean"][i, bi],
+                                 ci_lo=res["lo"][i, bi], ci_hi=res["hi"][i, bi])
+                            for bi, (occ, ctx) in enumerate(blocks) for i, c in enumerate(runs)])
+        order_txt = ", ".join(f"{bi + 1} {ctx}" for bi, (occ, ctx) in enumerate(blocks[:res["n_ctx"]]))
+        if measure == "rank":
+            what = (f"each model's average rank in early {metric}, its mean over the block's "
+                    f"first {res['window']} episodes (how fast the model gets going; never "
+                    f"censored, no floor): the expected position of one of its seeds against one "
+                    f"seed of each other model, 1 = fastest, {len(runs)} = slowest; "
+                    f"{(len(runs) + 1) / 2:g} (dotted) is all alike. Unpaired; band: 95% bootstrap "
+                    f"interval over seeds ({n_seed} a model, resampled independently)")
+        else:
+            what = (f"each model's standardised block {metric}: per seed the mean {metric} over the "
+                    f"block, per model the mean over {n_seed} seeds less the mean of the four "
+                    f"models, over the pooled within-model SD; 0 (dotted) is the block's average "
+                    f"model; band: 95% interval of the mean")
+        caption = (
+            f"Who is ahead, block by block, {metric}. For each block of the six-context cycle in "
+            f"run order, {what}. The axis is broken where the cycle restarts: blocks "
+            f"1-{res['n_ctx']} are first exposures ({order_txt}), the next {res['n_ctx']} "
+            f"second, the last {res['n_ctx']} third.")
+        os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
+        path = os.path.join(output_dir, PROBE_SUBDIR, f"block_{measure}_by_block_{metric}")
+        tab.round(4).to_csv(path + ".csv", index=False)
+        save(fig, path, caption=caption)
+        print(f"Saved {path}")
+
+
 def plot_savings_probes_all(data: pd.DataFrame, output_dir: str, metrics: list = None, **kw):
     """The probe figure for the default block length AND one per non-default
     length present (user, 2026-10-08: the sub-criterion cells, run with
@@ -5255,7 +6105,7 @@ def plot_savings_probes_all(data: pd.DataFrame, output_dir: str, metrics: list =
     plot_savings_probes_combined(data, output_dir, metrics, **kw)
     for n in probe_block_lengths(data):
         plot_savings_probes_combined(data, output_dir, metrics, retrieval_cell=f"n2rot_ep{n}",
-                                     transfer_cell=f"n2wide_ep{n}", stem=f"savings_probes_ep{n}", **kw)
+                                     transfer_cell=f"n2rot_ep{n}", stem=f"savings_probes_ep{n}", **kw)
     # the COIN comparison belongs to the same selection (user, 2026-10-08)
     plot_savings_probes_coin_all(data, output_dir, metrics, **kw)
 
@@ -5265,40 +6115,204 @@ def plot_savings_probes_coin_all(data: pd.DataFrame, output_dir: str, metrics: l
     plot_savings_probes_coin(data, output_dir, metrics, **kw)
     for n in probe_block_lengths(data):
         plot_savings_probes_coin(data, output_dir, metrics, retrieval_cell=f"n2rot_ep{n}",
-                                 transfer_cell=f"n2wide_ep{n}", stem=f"savings_probes_coin_ep{n}", **kw)
+                                 transfer_cell=f"n2rot_ep{n}", stem=f"savings_probes_coin_ep{n}", **kw)
 
 
 def _compensation_traces(ax, pr, cfg, color, smooth_window, early_episodes, aim):
-    """One model's transfer comparison on `ax`: the first-action aim along
-    the novel rotation's branch (the model's colour), the ideal compensation
-    (dotted) and the parked aim it started from (thin line), with the score
-    drawn as in _protection_traces: from the parked level a thin bar up to
-    the ideal (what there was to compensate) and a thick one up to the first
-    `early_episodes` episodes' aim. The score is the first reaches' aim as a
-    fraction of the ideal; the parked level is shown beside it."""
+    """One model's transfer comparison on `ax`, as the CHANGE from the aim
+    the policy left the washout with (user, 2026-10-12: the models park at
+    different aims, so raw aim mixes the starting point into the comparison).
+    Per seed, the first-action aim along the novel rotation's branch minus
+    that seed's parked aim (the model's colour); the ideal change, the full
+    compensation less the parked aim (dotted); and the score drawn as in
+    _protection_traces, from zero: a thin bar to the ideal change and a
+    thick one to the first `early_episodes` episodes' change."""
     t_rot = transfer_rotation(cell_roles(cfg))
     br = pr[(pr.config == cfg) & (pr.branch == t_rot)] if t_rot else pr.iloc[0:0]
     if br.empty or "first_angle" not in br.columns:
         return
-    band = median_seed_band(br, "first_angle", None, smooth_window)
-    ax.plot(band.index, band["median"], color=color, lw=1.1, zorder=3)
     a = aim[aim.config == cfg]
     if a.empty:
         return
-    ideal, parked, first = float(a["ideal"].iloc[0]), float(a["parked"].mean()), float(a["aim"].mean())
-    ax.axhline(ideal, color=color, ls=":", lw=0.8, zorder=1)
-    if np.isfinite(parked) and np.isfinite(first):
+    parked_of = a.set_index("seed")["parked"]
+    br = br.copy()
+    br["first_angle"] = br["first_angle"] - br["seed"].map(parked_of)
+    band = median_seed_band(br, "first_angle", None, smooth_window)
+    ax.plot(band.index, band["median"], color=color, lw=1.1, zorder=3)
+    _iqr(ax, band, color, zorder=1.4)
+    ideal_change = float((a["ideal"] - a["parked"]).mean())
+    first_change = float((a["aim"] - a["parked"]).mean())
+    ax.axhline(ideal_change, color=color, ls=":", lw=0.8, zorder=1)
+    ax.axhline(0.0, color=MUTED, lw=0.6, zorder=1)
+    if np.isfinite(first_change) and np.isfinite(ideal_change):
         x0 = early_episodes / 2
-        ax.plot([x0 - 1.5, x0 - 1.5], [parked, ideal], color=INK, lw=1.2, solid_capstyle="butt", zorder=4)
-        ax.plot([x0 + 1.5, x0 + 1.5], [parked, first], color=color, lw=2.4, solid_capstyle="butt", zorder=4)
-        ax.plot([x0 - 3, x0 + 3], [parked, parked], color=INK, lw=0.6, zorder=4)
+        ax.plot([x0 - 1.5, x0 - 1.5], [0, ideal_change], color=INK, lw=1.2, solid_capstyle="butt", zorder=4)
+        ax.plot([x0 + 1.5, x0 + 1.5], [0, first_change], color=color, lw=2.4, solid_capstyle="butt", zorder=4)
+
+
+# draw the planned tests as brackets on panels c and d? Off (user, 2026-10-12):
+# they compressed the swarms into the bottom of the panels, and with every
+# planned contrast at p < .0001 they said one thing six times. The tests run
+# regardless; their results go to the caption and the _stats.csv.
+PROBE_BRACKETS = False
+
+
+def _score_tests(groups: dict, pairs: list, labels: dict, panel: str):
+    """Planned pairwise comparisons for a score panel: two-sided Mann-Whitney U
+    per pair, Holm-corrected within the panel, plus the difference in means
+    (a - b) with a Welch 95% interval. UNPAIRED on purpose (2026-10-12): a seed
+    does not give every model the same reaches -- the goal draws share the run
+    rng with the command noise and the early random actions, and models take
+    different numbers of steps per reach, so the streams diverge after the
+    first episode. Returns one row per pair."""
+    from scipy.stats import mannwhitneyu, t as tdist
+    rows = []
+    for a, b in pairs:
+        x = np.asarray(groups[a], float); y = np.asarray(groups[b], float)
+        x, y = x[np.isfinite(x)], y[np.isfinite(y)]
+        if len(x) < 2 or len(y) < 2:
+            rows.append(dict(panel=panel, a=labels[a], b=labels[b], n_a=len(x), n_b=len(y),
+                             diff=np.nan, ci_lo=np.nan, ci_hi=np.nan, U=np.nan, p=np.nan))
+            continue
+        U, pv = mannwhitneyu(x, y, alternative="two-sided")
+        d = x.mean() - y.mean()
+        va, vb = x.var(ddof=1) / len(x), y.var(ddof=1) / len(y)
+        se = np.sqrt(va + vb)
+        dof = (va + vb) ** 2 / (va ** 2 / (len(x) - 1) + vb ** 2 / (len(y) - 1)) if se > 0 else 1
+        h = tdist.ppf(0.975, dof) * se
+        rows.append(dict(panel=panel, a=labels[a], b=labels[b], n_a=len(x), n_b=len(y),
+                         diff=d, ci_lo=d - h, ci_hi=d + h, U=float(U), p=float(pv)))
+    out = pd.DataFrame(rows)
+    out["p_holm"] = _holm(out["p"].to_numpy(float)) if len(out) else []
+    return out
+
+
+def _p_summary(stats: pd.DataFrame) -> str:
+    """'all p < .0001' when every Holm-adjusted p clears the same bar, else the
+    range -- for a caption."""
+    p = stats["p_holm"].to_numpy(float) if len(stats) else np.array([])
+    p = p[np.isfinite(p)]
+    if not len(p):
+        return "not run"
+    for thr in (1e-4, 1e-3, 1e-2, 0.05):
+        if (p < thr).all():
+            return f"all p < {thr:g}".replace("0.", ".")
+    return f"Holm p from {p.min():.3g} to {p.max():.3g}"
+
+
+def _score_brackets(ax, stats: pd.DataFrame, pos: dict, y_top: float, step: float):
+    """Horizontal brackets above a swarm panel for `stats` (from _score_tests),
+    stars on the Holm-adjusted p; shorter spans drawn lower so none cross.
+    `pos` maps a display label to its x position. Returns the y reached."""
+    fs = plt.rcParams["xtick.labelsize"]
+    order = sorted(range(len(stats)),
+                   key=lambda i: abs(pos[stats.a.iloc[i]] - pos[stats.b.iloc[i]]))
+    y = y_top
+    for i in order:
+        r = stats.iloc[i]
+        x0, x1 = sorted((pos[r.a], pos[r.b]))
+        ax.plot([x0, x0, x1, x1], [y - 0.12 * step, y, y, y - 0.12 * step], color=INK, lw=0.6,
+                clip_on=False)
+        ax.text((x0 + x1) / 2, y, _stars(r.p_holm), ha="center", va="bottom", fontsize=fs, color=INK)
+        y += step
+    return y
+
+
+def _probe_score_panels(axS, axT, scores: pd.DataFrame, of: dict, models: list, metric: str,
+                        retrieval_cell: str, transfer_cell: str):
+    """Panels (c) and (d) of the savings probe figure, on the axes given:
+    retrieval as protection from interference, and transfer as the
+    compensation the novel rotation's first reaches added, per seed, mean and
+    95% CI, with the planned tests. `of` maps (cell tag, base preset) to a
+    run; `models` sets the order. Returns (stats table, retrieval tests,
+    transfer tests). Shared by plot_savings_probes_combined and
+    plot_savings_supplement so the two draw the scores identically."""
+    per = {}
+    for score, tag in (("retrieval", retrieval_cell), ("transfer", transfer_cell),
+                       ("transfer_parked", transfer_cell)):
+        per[score] = {}
+        for base in models:
+            cfg = of.get((tag, base))
+            sc = scores[(scores.config == cfg) & (scores.metric == metric)] if cfg else pd.DataFrame()
+            per[score][base] = sc[score].to_numpy(float) if len(sc) else np.array([np.nan])
+    cols = [CONFIG_COLORS.get(b, "gray") for b in models]
+    labels = [display_name(b, wrap=True) for b in models]
+    # median and IQR on every probe swarm (user, 2026-10-16)
+    swarm_ci(axS, [per["retrieval"][b] for b in models], colors=cols, labels=labels, jitter=0.12,
+             stat="median")
+    r_all = np.concatenate(list(per["retrieval"].values()))
+    lo = min(-0.1, np.nanmin(r_all) - 0.05) if np.isfinite(np.nanmin(r_all)) else -0.1
+    # planned tests (user, 2026-10-12): each context model against each
+    # context-blind one -- retrieval is what the context memory should buy
+    name = {b: display_name(b) for b in models}
+    pos = {name[b]: i for i, b in enumerate(models)}
+    ctx = [b for b in ("main", "coin") if b in models]
+    blind = [b for b in ("baseline", "cb_only_end_to_end") if b in models]
+    st_c = _score_tests(per["retrieval"], [(a, b) for a in ctx for b in blind], name, "retrieval")
+    top_c = max(1.1, np.nanmax(r_all) + 0.05) if np.isfinite(np.nanmax(r_all)) else 1.1
+    if PROBE_BRACKETS and len(st_c):
+        y_end = _score_brackets(axS, st_c, pos, top_c + 0.03, 0.28)
+        axS.set_ylim(lo, y_end + 0.05)
+        # ticks only over the score's own range; the space above holds the brackets
+        axS.set_yticks([v for v in (0, 0.5, 1.0, 1.5) if v <= max(1.0, np.nanmax(r_all))])
+    else:
+        axS.set_ylim(lo, top_c)
+    chance_line(axS, 1, "Trained", x=0.0)
+    chance_line(axS, 0, "Naive", x=0.0, above=False)
+    for t in axS.texts:
+        t.set_ha("left")
+    axS.set_ylabel("Protection")
+    axS.set_title("Retrieval")
+    # the compensation the probe ADDED: (aim - parked) / ideal, per seed
+    # (user, 2026-10-12) -- the models leave the washout parked at
+    # different aims, so the parked residue is subtracted, not shown beside
+    added = {b: per["transfer"][b] - per["transfer_parked"][b] for b in models}
+    swarm_ci(axT, [added[b] for b in models], colors=cols, labels=labels, jitter=0.12,
+             mean_kw=dict(mfc="white"), stat="median")
+    t_all = np.concatenate(list(added.values()))
+    lo = min(-0.1, np.nanmin(t_all) - 0.05) if np.isfinite(np.nanmin(t_all)) else -0.1
+    # planned tests: the Full Circuit against each other model; and,
+    # reported in the table only, each model against zero (one-sample
+    # Wilcoxon signed-rank, Holm over models)
+    st_d = (_score_tests(added, [("main", b) for b in models if b != "main"], name, "transfer")
+            if "main" in models else pd.DataFrame())
+    top_d = max(1.1, np.nanmax(t_all) + 0.05) if np.isfinite(np.nanmax(t_all)) else 1.1
+    y_end = (_score_brackets(axT, st_d, pos, top_d + 0.03, 0.25)
+             if (PROBE_BRACKETS and len(st_d)) else top_d)
+    # the lowest tick at or below the lowest seed, so no point sits off the spine
+    lo_tick = -0.5 if np.nanmin(t_all) < 0 else 0.0
+    axT.set_ylim(min(lo, lo_tick - 0.05), y_end + (0.05 if PROBE_BRACKETS else 0.0))
+    axT.set_yticks([v for v in (-0.5, 0, 0.5, 1.0) if v >= lo_tick - 1e-9])
+    from scipy.stats import wilcoxon as _wx
+    zero = []
+    for b in models:
+        v = np.asarray(added[b], float); v = v[np.isfinite(v)]
+        zero.append(dict(panel="transfer vs 0", a=name[b], b="0", n_a=len(v), n_b=0,
+                         diff=float(v.mean()) if len(v) else np.nan,
+                         ci_lo=np.nan, ci_hi=np.nan, U=np.nan,
+                         p=float(_wx(v).pvalue) if len(v) >= 2 and np.any(v != 0) else np.nan))
+    zero = pd.DataFrame(zero); zero["p_holm"] = _holm(zero["p"].to_numpy(float))
+    stats_tbl = pd.concat([st_c, st_d, zero], ignore_index=True)
+    chance_line(axT, 1, "Ideal", x=0.0)
+    chance_line(axT, 0, "No change", x=0.0, above=False)
+    for t in axT.texts:
+        t.set_ha("left")
+    axT.set_ylabel("Added compensation")
+    axT.set_title("Transfer")
+    for a in (axS, axT):
+        offset_spines(a)
+        a.spines["bottom"].set_visible(False)
+        # a bracket under each model, as the grouped bar/box figures have
+        bracket_xticks(a, half_width=0.32, positions=list(range(len(models))), labels=labels)
+
+    return stats_tbl, st_c, st_d
 
 
 def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: list = None,
                                  criterion_fraction: float = 0.8,
                                  smooth_window: int = TRACE_SMOOTH_WINDOW,
                                  early_episodes: int = PROBE_EARLY_EPISODES,
-                                 retrieval_cell: str = "n2rot", transfer_cell: str = "n2wide",
+                                 retrieval_cell: str = "n2rot", transfer_cell: str = "n2rot",
                                  models: tuple = None, stem: str = "savings_probes",
                                  note: str = ""):
     """THE PROBE FIGURE: the two cells that answer the two questions, in one
@@ -5364,15 +6378,20 @@ def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: l
         trained = [T.C_LABEL[c] for c in sac.phase_ids_for(ps)]
         wash = "" if "_nowash" in split_run_name(cfg)[1] else ", washout"
         return f"{what}: {' then '.join(trained)} trained{wash}"
+    one_cell = retrieval_cell == transfer_cell
     heads = {retrieval_cell: head(retrieval_cell, "interference cell"),
              transfer_cell: head(transfer_cell, "transfer cell")}
+    if one_cell:
+        heads = {retrieval_cell: head(retrieval_cell, "the rotation pair")}
     t_roles = cell_roles(by_cell[transfer_cell][0]) if by_cell[transfer_cell] else ()
     aim = transfer_aim(data, early_episodes)
     t_rot = transfer_rotation(t_roles)
     t_label = PROBE_LABEL.get(t_rot, "novel rotation")
+    t_rot_note = ""
     if by_cell[transfer_cell]:
         t_ideal, _ = transfer_ideal_aim(by_cell[transfer_cell][0])
         t_label += f" (rot {-t_ideal:+.0f})"
+        t_rot_note = f" (rot {-t_ideal:+.0f})"
 
     for metric in metrics:
         if metric not in pr.columns:
@@ -5384,23 +6403,22 @@ def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: l
         gs = fig.add_gridspec(5, len(models), height_ratios=[0.1, 1.0, 0.1, 1.0, 1.15])
         row_of = {0: 1, 1: 3}
         legend_handles = {
-            retrieval_cell: [Line2D([], [], color=INK, lw=1.6, label="revisit, after interference"),
-                             Line2D([], [], color=_lighten(INK, 2 * ROLE_TINT), lw=1.6, label="first visit (naive)"),
-                             Line2D([], [], color=INK, ls=":", lw=0.8, label="trained level"),
-                             Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="naive → trained"),
-                             Line2D([], [], color=INK, lw=2.4, marker="|", ms=8, mew=2.4, ls="",
-                                    label="naive → revisit (protection = ratio)")],
-            transfer_cell: [Line2D([], [], color=INK, lw=1.6, label="first-action aim"),
-                            Line2D([], [], color=INK, ls=":", lw=0.8, label="ideal compensation"),
-                            Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="parked → ideal"),
+            # the line types only (user, 2026-10-12); the bars are explained in the caption
+            0: [Line2D([], [], color=INK, lw=1.6, label="Revisit"),
+                Line2D([], [], color=_lighten(INK, 0.78), lw=1.6, label="Novel rotation"),
+                Line2D([], [], color=MUTED, lw=1.6, label="First visit"),
+                Line2D([], [], color=INK, ls=":", lw=0.8, label="Trained level")],
+            1: [Line2D([], [], color=INK, lw=1.6, label="change in first-action aim"),
+                            Line2D([], [], color=INK, ls=":", lw=0.8, label="ideal change"),
+                            Line2D([], [], color=INK, lw=1.2, marker="|", ms=8, mew=1.2, ls="", label="zero → ideal"),
                             Line2D([], [], color=INK, lw=2.4, marker="|", ms=8, mew=2.4, ls="",
-                                   label="parked → first reaches")]}
+                                   label="change on first reaches")]}
         first_axes = []
         for r_, tag in enumerate((retrieval_cell, transfer_cell)):
             strip = fig.add_subplot(gs[row_of[r_] - 1, :]); strip.axis("off")
             # no title: which cell each row is (its trained contexts, the
             # washout) is in the caption (user, 2026-10-08)
-            strip.legend(handles=legend_handles[tag], loc="center", ncol=len(legend_handles[tag]),
+            strip.legend(handles=legend_handles[r_], loc="center", ncol=len(legend_handles[r_]),
                          borderaxespad=0, handlelength=1.6)
             tr_axes = [fig.add_subplot(gs[row_of[r_], col]) for col in range(len(models))]
             for a in tr_axes[1:]:
@@ -5423,8 +6441,9 @@ def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: l
                 ax.set_title(display_name(base, wrap=True) if r_ == 0 else "")
                 ax.set_xlabel("Episodes since switch")
                 if col == 0:
-                    ax.set_ylabel(f"{metric.capitalize()} ({smooth_window}-episode mean)" if r_ == 0
-                                  else f"First-action aim (°, {smooth_window}-episode mean)")
+                    # the smoothing window is stated in the caption, not the label
+                    ax.set_ylabel(metric.capitalize() if r_ == 0
+                                  else "Change in first-action aim (°)")
                 else:
                     ax.tick_params(labelleft=False)
             if metric == "success" and r_ == 0:
@@ -5442,91 +6461,65 @@ def plot_savings_probes_combined(data: pd.DataFrame, output_dir: str, metrics: l
         # lines). Raw units, not z-scores.
         gs_sc = gs[4, :].subgridspec(1, 2, wspace=0.12)
         axS, axT = fig.add_subplot(gs_sc[0, 0]), fig.add_subplot(gs_sc[0, 1])
-        per = {}
-        for score, tag in (("retrieval", retrieval_cell), ("transfer", transfer_cell),
-                           ("transfer_parked", transfer_cell)):
-            per[score] = {}
-            for base in models:
-                cfg = of.get((tag, base))
-                sc = scores[(scores.config == cfg) & (scores.metric == metric)] if cfg else pd.DataFrame()
-                per[score][base] = sc[score].to_numpy(float) if len(sc) else np.array([np.nan])
-        cols = [CONFIG_COLORS.get(b, "gray") for b in models]
-        labels = [display_name(b, wrap=True) for b in models]
-        swarm_ci(axS, [per["retrieval"][b] for b in models], colors=cols, labels=labels, jitter=0.12)
-        r_all = np.concatenate(list(per["retrieval"].values()))
-        lo = min(-0.1, np.nanmin(r_all) - 0.05) if np.isfinite(np.nanmin(r_all)) else -0.1
-        axS.set_ylim(lo, 1.1)
-        chance_line(axS, 1, "Trained", x=0.0)
-        chance_line(axS, 0, "Naive", x=0.0, above=False)
-        for t in axS.texts:
-            t.set_ha("left")
-        axS.set_ylabel("Protection")
-        axS.set_title("Retrieval")
-        swarm_ci(axT, [per["transfer"][b] for b in models], colors=cols, labels=labels, jitter=0.12,
-                 mean_kw=dict(mfc="white"))
-        # the parked level per model (the residue the probe started from), a
-        # muted tick to the left of the swarm: the gap from it to the mean is
-        # what the probe's first reaches added
-        labelled = False
-        for i, b in enumerate(models):
-            pk = per["transfer_parked"][b]
-            if np.isfinite(np.nanmean(pk)):
-                axT.plot([i - 0.3], [np.nanmean(pk)], marker="_", ms=9, mew=1.4, color=MUTED, ls="", zorder=2)
-                if not labelled:        # the first tick names them all, as panel c's lines are named
-                    axT.annotate("parked", (i - 0.3, np.nanmean(pk)), xytext=(0, -3), textcoords="offset points",
-                                 ha="center", va="top", color=MUTED, fontsize=plt.rcParams["xtick.labelsize"])
-                    labelled = True
-        t_all = np.concatenate(list(per["transfer"].values()) + list(per["transfer_parked"].values()))
-        lo = min(-0.1, np.nanmin(t_all) - 0.05) if np.isfinite(np.nanmin(t_all)) else -0.1
-        axT.set_ylim(lo, max(1.1, np.nanmax(t_all) + 0.05) if np.isfinite(np.nanmax(t_all)) else 1.1)
-        chance_line(axT, 1, "Ideal", x=0.0)
-        chance_line(axT, 0, "Straight at the goal", x=0.0, above=False)
-        for t in axT.texts:
-            t.set_ha("left")
-        axT.set_ylabel("Fractional compensation")
-        axT.set_title("Transfer")
-        for a in (axS, axT):
-            offset_spines(a)
-            a.spines["bottom"].set_visible(False)
-            # a bracket under each model, as the grouped bar/box figures have
-            bracket_xticks(a, half_width=0.32, positions=list(range(len(models))), labels=labels)
-
+        stats_tbl, st_c, st_d = _probe_score_panels(
+            axS, axT, scores, of, models, metric, retrieval_cell, transfer_cell)
         label_panels(fig, first_axes + [axS, axT])
         caption = (
             f"The savings probes, {metric}. After each cycle a {n_ep}-episode washout in the "
             f"unperturbed plant, then learning blocks of {n_ep} episodes branch from the "
             f"end-of-washout state (identical agent, buffer, observer and rng): a revisit, a "
             f"novel rotation and a novel family (reflection across 45°); across-seed medians of "
-            f"the {smooth_window}-episode mean. (a) Interference cell: {heads[retrieval_cell]}. "
+            f"the {smooth_window}-episode mean, shaded over the interquartile range across "
+            f"seeds. "
+            + (f"Both rows are one cell, {heads[retrieval_cell]}: retrieval from its revisit, "
+               f"transfer from its novel rotation. (a) " if one_cell else
+               f"(a) Interference cell: {heads[retrieval_cell]}. ") +
             f"Per model, the revisit of the first context after the conflicting rotation and "
             f"the washout (the model's colour) against the same context's first cycle visit "
-            f"(naive learning, lightest tint) and its trained level (dotted: the last cycle "
+            f"(naive learning, grey) and its trained level (dotted: the last cycle "
             f"visit's last {early_episodes} episodes); a protected memory starts at the trained "
             f"line, an overwritten one on the naive curve. The two bars at the revisit's start "
             f"draw the score: from the naive level, the thin bar rises to the trained level and "
             f"the thick one to the revisit's first {early_episodes} episodes; protection is "
-            f"their ratio. (b) Transfer cell: {heads[transfer_cell]}; the {t_label} branch is "
-            f"the midpoint of the trained anchors, so learning it is interpolation. Per model, "
-            f"the first-action aim along that branch -- the signed angle from the goal "
-            f"direction to the first action, the feedforward compensation -- against the ideal "
-            f"(dotted: the aim that cancels the rotation) and the parked aim the policy left the "
-            f"washout with (the thin baseline). The bars draw the comparison as in (a): thin "
-            f"from parked to ideal, thick from parked to the branch's first {early_episodes} "
-            f"episodes. Success is not used here: after a washout "
-            f"every policy sits within the controller's feedback tolerance of the interior "
-            f"rotation and succeeds at once, context or not. (c) Retrieval as protection from "
+            f"their ratio."
+            + (f" The lighter bar is the novel rotation's first {early_episodes} episodes on "
+               f"the same scale." if one_cell else "")
+            + (f" Lighter: the novel rotation, the revisit's mirror image (same magnitude, never "
+               f"trained), forked from the same state. (b) The novel rotation{t_rot_note}: it lies "
+               f"beyond the trained rot +30, so compensating it before learning it is "
+               f"extrapolation along the rotation family. Per model, " if one_cell else
+               f" (b) Transfer cell: {heads[transfer_cell]}; the {t_label} branch is "
+               f"the midpoint of the trained anchors, so learning it is interpolation. Per model, ") +
+            f"the change in first-action aim along that branch -- the signed angle from the "
+            f"goal direction to the first action, the feedforward compensation, less the aim "
+            f"the same seed's policy left the washout with, so the models' different starting "
+            f"points cancel -- against the ideal change (dotted: the compensating aim less the "
+            f"parked aim). The bars draw the comparison as in (a): thin from zero to the ideal "
+            f"change, thick to the change on the branch's first {early_episodes} episodes. "
+            + ("Aim rather than success: feedback absorbs a misaimed first action, so success "
+               "here reflects proximity to the trained rot +30 as much as compensation. "
+               if one_cell else
+               "Success is not used here: after a washout every policy sits within the "
+               "controller's feedback tolerance of the interior rotation and succeeds at once, "
+               "context or not. ") +
+            f"(c) Retrieval as protection from "
             f"interference in (a), per seed: (revisit − naive) / (trained − naive) in "
             f"early-block {metric} (first {early_episodes} episodes); 1 = the trained solution "
             f"survived the conflicting rotation and the washout, 0 = back to naive. (d) Transfer "
-            f"in (b), per seed: the first {early_episodes} reaches' aim as a fraction of the "
-            f"ideal; 1 = aimed as the rotation demands, 0 = straight at the goal. The muted tick "
-            f"left of each swarm is the model's parked aim on the same scale, the residue it "
-            f"carried out of the washout; what the probe added is the gap from the tick to the "
-            f"mean. Mean and 95% CI over seeds in (c) and (d). The novel "
+            f"in (b), per seed: the compensation the first {early_episodes} reaches added, "
+            f"(aim − parked aim) / ideal aim; 1 = the whole rotation compensated beyond where "
+            f"the policy started, 0 = no change from the parked aim. Median and IQR over "
+            f"seeds in (c) and (d). Planned comparisons, two-sided Mann-Whitney U tests, "
+            f"unpaired (a seed does not give every model the same reaches), Holm-corrected "
+            f"within each panel: in (c) each context model against each context-blind one "
+            f"({_p_summary(st_c)}); in (d) the Full Circuit against each other model "
+            f"({_p_summary(st_d)}). Differences in means with 95% intervals, and one-sample "
+            f"tests of (d) against zero, are in the accompanying _stats.csv. The novel "
             f"rotation is novel to the learner but lies in the frozen circuit's pretraining "
             f"table; the reflection is novel to both." + (f" {note}" if note else ""))
         os.makedirs(os.path.join(output_dir, PROBE_SUBDIR), exist_ok=True)
         path = os.path.join(output_dir, PROBE_SUBDIR, f"{stem}_{metric}")
+        stats_tbl.round(4).to_csv(path + "_stats.csv", index=False)
         save(fig, path, caption=caption)
         print(f"Saved {path}")
 
@@ -5679,6 +6672,10 @@ SELECTABLE = {
     "traces_by_context": lambda data, out: plot_metric_traces_by_context(data, METRICS, out),
     "savings_probes": plot_savings_probes_all,
     "savings_probes_coin": plot_savings_probes_coin_all,
+    "savings_overview": plot_savings_overview,
+    "savings_supplement": plot_savings_supplement,
+    "criterion_by_context": plot_criterion_by_context,
+    "block_rank_by_block": plot_block_success_by_block,
     "savings_probes_cells": plot_savings_probes,
     "cycle_length": plot_cycle_length,
     "paradigm_overview": plot_paradigm_overview,

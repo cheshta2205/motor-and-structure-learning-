@@ -133,25 +133,25 @@ def test_load_all_configs_ignores_unknown_directory_names(tmp_path):
 
 
 def test_testable_pairs_drops_untestable_comparisons():
-    """A paired Wilcoxon needs >=2 seeds whose values differ: n=1 per config
-    (a single-seed sweep) and two configs that saturate identically both leave
-    scipy with nothing to test."""
+    """The tests are UNPAIRED (2026-10-14): a comparison needs >=2 seeds a side
+    and some variation across the two sides together. Two configs that both
+    saturate at the block's end leave nothing to test; equal per-seed values
+    no longer matter, since seeds are not matched."""
     facet = pd.DataFrame({
-        "occurrence": [0] * 8,
-        "config": (["baseline"] * 4 + ["oracle"] * 2 + ["end_to_end"] * 2),
-        "seed": [0, 1, 2, 3, 0, 1, 0, 1],
-        # oracle differs from baseline on both shared seeds -> testable
-        # end_to_end is identical to baseline on both shared seeds -> not
-        "criterion_episode": [10.0, 20.0, 30.0, 40.0, 15.0, 25.0, 10.0, 20.0],
+        "occurrence": [0] * 10,
+        "config": (["baseline"] * 4 + ["oracle"] * 2 + ["end_to_end"] * 2 + ["coin"] * 2),
+        "seed": [0, 1, 2, 3, 0, 1, 0, 1, 0, 1],
+        "criterion_episode": [10.0, 20.0, 30.0, 40.0, 15.0, 25.0, 10.0, 20.0, 149.0, 149.0],
     })
+    sat = facet.copy()
+    sat.loc[sat.config == "baseline", "criterion_episode"] = 149.0
     pairs = [
         ((0, "baseline"), (0, "oracle")),
         ((0, "baseline"), (0, "end_to_end")),
     ]
-
-    keep = MAP.testable_pairs(facet, pairs)
-
-    assert keep == [((0, "baseline"), (0, "oracle"))]
+    assert MAP.testable_pairs(facet, pairs) == pairs
+    # both sides one constant: baseline and coin all at the block's end
+    assert MAP.testable_pairs(sat, [((0, "baseline"), (0, "coin"))]) == []
 
 
 def test_testable_pairs_drops_single_seed_comparisons():

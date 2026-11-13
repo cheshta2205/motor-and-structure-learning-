@@ -304,7 +304,8 @@ def context_affine(c):
         return LINEAR_MATS[int(c)], Z, z
     if kind == REFLECTION_KIND:                       # the retired family, as a probe
         return refl_mat(np.deg2rad(param)), Z, z
-    return I, Z, (DRIFT_VEL * unit(param)).astype(np.float32)     # drift
+    speed = DRIFT_SPEED.get(int(c), 1.0)               # off-table drifts may be faster/slower
+    return I, Z, (DRIFT_VEL * speed * unit(param)).astype(np.float32)     # drift
 
 
 def context_matrix(c):
@@ -353,6 +354,54 @@ def rotation_id(theta_deg):
         FAMILY[c] = 0
         C_PARAM[c] = theta
         C_LABEL[c] = f"rot {theta:+g}"
+    return c
+
+
+# ── Off-table curls and drifts (2026-10-15) ──────────────────────────────
+#
+# The held-out representation figures (heldout_representation.py) need curls
+# and drifts the circuit was never fitted on, as rotation_id gives rotations:
+# interpolation between trained values (curl +-3, +-10; drift directions on
+# the diagonals) and extrapolation beyond them (curl +-20; drift at half and
+# double the table speed -- direction lives on a circle, so speed is the only
+# way to leave the trained range). Same contract as rotation_id: a table
+# value returns its TABLE id, anything else is registered once, under an id
+# that is a function of the parameters alone. A drift's speed multiplier
+# lives in DRIFT_SPEED (1 when absent) and context_affine applies it.
+CURL_ID_BASE = 30_000
+DRIFT_ID_BASE = 100_000
+DRIFT_SPEED = {}
+
+
+def curl_id(k):
+    """The context id of the curl with gain `k`, registering it if the table
+    does not hold it. Idempotent."""
+    k = float(k)
+    for c, kind in FAMILY.items():
+        if kind == 1 and c < EXTRA_ID_BASE and np.isclose(C_PARAM[c], k):
+            return c
+    c = CURL_ID_BASE + int(round((k + 500.0) * 10.0))
+    if c not in FAMILY:
+        FAMILY[c] = 1
+        C_PARAM[c] = k
+        C_LABEL[c] = f"curl {k:+g}"
+    return c
+
+
+def drift_id(phi_deg, speed=1.0):
+    """The context id of the drift towards `phi_deg` at `speed` x the table's
+    drift velocity, registering it if the table does not hold it."""
+    phi, speed = float(phi_deg) % 360.0, float(speed)
+    if np.isclose(speed, 1.0):
+        for c, kind in FAMILY.items():
+            if kind == 2 and c < EXTRA_ID_BASE and np.isclose(C_PARAM[c] % 360.0, phi):
+                return c
+    c = DRIFT_ID_BASE + int(round(speed * 100.0)) * 10_000 + int(round(phi * 10.0))
+    if c not in FAMILY:
+        FAMILY[c] = 2
+        C_PARAM[c] = phi
+        DRIFT_SPEED[c] = speed
+        C_LABEL[c] = f"drift {phi:g}" + ("" if np.isclose(speed, 1.0) else f" x{speed:g}")
     return c
 
 

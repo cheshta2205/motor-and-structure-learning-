@@ -3,12 +3,17 @@ figures.py -- every figure we need.
 
 SIX PER SEED, into figures/<arm>/seed<N>/ :
 
-  epoch_curves.png      training history: MSE and per-family decoding vs epoch
+  epoch_curves.png      training history: MSE and per-family decoding vs epoch,
+                        with the two PREDICTION FLOORS on the MSE panel (see
+                        floor_lines, and prediction_floor.py for what they are)
   tss_curves.png        PER FACTOR LEVEL vs steps-since-switch: velocity MSE against
                         that family's two oracle rungs, and its decoding curve
                         -- how fast the circuit recovers after a switch
-  ablation.png          THE MAIN FIGURE.  intact / zero e / shuffle e, decoding
-                        vs tss, oandhow it depends on cb error. 
+  ablation.png          THE MAIN FIGURE (2026-10-15: three panels -- MSE, 12-way
+                        decoding, the switch-aligned lesion averaged over the
+                        families; the six-panel version is ablation_supp.png).  intact / zero e / shuffle e, decoding
+                        vs tss, oandhow it depends on cb error.  The MSE panel
+                        carries the CONTEXT-FREE FLOOR (floor_lines). 
   decoding_global.png   those two honest readouts on their own, larger
   switch_aligned.png    e lesioned ONLY in a window around each switch - to see if e only infers or is needed continuously
   forces.png            angle between CB's predicted force and the true one,
@@ -17,10 +22,12 @@ SIX PER SEED, into figures/<arm>/seed<N>/ :
 TWO POOLED, into figures/<arm>/across_seeds/ :
 
   ablation_seeds.png       the main figure, banded across TRAINING SEEDS
+  ablation_seeds_supp.png  the six-panel supplement, banded the same way
   switch_aligned_seeds.png the same for the switch-aligned window
   training_seeds.png       training history and context confusion, pooled:
                            MSE and within-family decoding by epoch, banded
-                           across seeds, and the seed-averaged confusion of z
+                           across seeds, the two prediction floors, and the
+                           seed-averaged confusion of z
 
 WHICH ERROR BAR.  A per-seed band is +-1 SD over decoder train/test SPLITS: how
 precisely context can be read out of THIS network. 
@@ -48,7 +55,8 @@ import numpy as np
 import torch
 from matplotlib.lines import Line2D
 from plotting_utils import (use_paper_style, offset_spines, PALETTE, INK, MUTED, figsize,
-                            plot_band, chance_line, label_panels, save, colorbar)
+                            plot_band, chance_line, label_panels, save, colorbar, bracket_xticks,
+                            write_slot)
 
 import model as M
 import oracle as O
@@ -63,9 +71,9 @@ KS       = [0, 1, 2, 3, 4, 6, 8, 10, 12]
 # The three cerebellar-channel conditions, plus a control that never touches
 # the cerebellum: noise into MTL's own recurrent state, scaled by that state's
 # sd.  Without it, "zeroing e hurts" only shows that perturbing something hurts.
-COND = [("intact", "intact", INK, "-"),
-        ("zero", "$e$ zeroed", PALETTE["rose"], "-"),
-        ("shuffle", "$e$ shuffled", PALETTE["amber"], "--"),
+COND = [("intact", "Intact", INK, "-"),
+        ("zero", "Zeroed error", PALETTE["rose"], "-"),       # renamed 2026-10-23
+        ("shuffle", "Shuffled error", PALETTE["amber"], "--"),
         ("mtl_noise", "MTL noise", MUTED, ":")]
 FCOL = {"rotation": PALETTE["navy"], "reflection": PALETTE["rose"],
         "curl": PALETTE["teal"], "drift": PALETTE["amber"]}
@@ -95,6 +103,71 @@ def _chance(readout):
     if readout == "family":
         return 1.0 / len(FAM_NAMES)
     return len(FAM_NAMES) / N_CONTEXTS
+
+
+# ── the prediction task's reference lines ────────────────────────────────────
+#
+# THE MSE PANEL'S ANSWER TO chance_line. A decoding axis has chance drawn on it
+# because an accuracy is meaningless without it; a held-out MSE is in exactly
+# the same position and went without for much longer. prediction_floor.py
+# computes the two lines and caches them; this draws them.
+#
+#   cb_blind   the best a CONTEXT-FREE forward model can do -- CB trained with
+#              z = 0, which agrees with the analytic prior-mean predictor to
+#              1.3%. A curve BELOW this line is the whole claim: no predictor
+#              given one (s, a) and no context can get there, so the circuit is
+#              carrying context information that no single observation holds.
+#   cb_oracle  the same CB handed the context as a one-hot. The target, and
+#              0.0012 above the command-noise floor -- so the gap to it is
+#              context inference left on the table, not CB's capacity.
+#
+# WHICH COLUMN. `settled` (tss >= TSS_MIN) for a curve that is itself settled;
+# `all` for an epoch curve, which pools every step including the re-inference
+# transient after each switch, and must be compared against a floor pooled the
+# same way. The floors barely move between the two (0.0227 vs 0.0224) because
+# they have nothing to re-infer; the CIRCUIT moves a lot (0.0137 vs 0.0100),
+# which is why the column still has to match.
+FLOOR_LINES = (("cb_blind", "Context-free floor"),
+               ("cb_oracle", "Ideal observer"))      # renamed 2026-10-23 (user)
+
+
+def floor_lines(ax, action_mode=M.DEFAULT_ACTION_MODE, column="all", label=True,
+                only=None):
+    """Draw the context-free and perfect-context floors on an MSE axis.
+
+    Returns the values drawn, so a caller that sets its own y-limits can
+    enclose them -- an axis scaled to the data alone cuts the lower floor off,
+    which is the one failure mode of adding a reference line after the fact.
+    Returns [] when prediction_floor.py has not been run, and the figure then
+    renders exactly as it did before.
+
+    `only` restricts it to a subset of FLOOR_LINES by key -- for an axis with
+    no room for both, such as a bar panel whose bars cross the lower floor.
+    """
+    from prediction_floor import load_floors, load_floor_spread
+    f = load_floors(M.circuit(action_mode))
+    spread = load_floor_spread(M.circuit(action_mode))
+    if f is None:
+        print("  (no prediction_floor cache; drawing no floor lines -- "
+              "run `python prediction_floor.py`)")
+        return []
+    j = 0 if column == "all" else 1
+    drawn = []
+    for key, text in FLOOR_LINES:
+        if only is not None and key not in only:
+            continue
+        y = f[key][j]
+        # a band of +-1 SD across independent task draws where that has been
+        # measured (prediction_floor.py --spread; user, 2026-10-23)
+        if spread is not None and key in spread:
+            v = spread[key][j]
+            if len(v) > 1:
+                sd = float(np.std(v, ddof=1))
+                ax.axhspan(y - sd, y + sd, color=MUTED, alpha=0.18, lw=0, zorder=0.4)
+                drawn += [y - sd, y + sd]
+        chance_line(ax, y, text if label else None, ls="--", lw=0.9, above=True)
+        drawn.append(y)
+    return drawn
 
 
 def _level_mask(d, name):
@@ -269,9 +342,70 @@ def fig_mtl_control(arm, seed, r, path):
     print(f"    saved -> {path}", flush=True)
 
 
+def _mse_panel(axM, d, action_mode=M.DEFAULT_ACTION_MODE, values=True) -> bool:
+    """Held-out velocity MSE per condition on `axM`, with the context-free
+    floor. Shared by fig_ablation (panel b) and fig_ablation_main (panel a).
+    Returns whether the floor was drawn (it is absent for a circuit without
+    a measured floor)."""
+    # b: MSE. d[m] is a rollout dict (one MSE), a float, or an ARRAY of
+    # per-seed MSEs (across_seeds): then mean, +-1 SD whisker, one dot per seed.
+    per_seed = [np.atleast_1d(d[m]["mse"] if isinstance(d[m], dict) else d[m]).astype(float)
+                for m, _, _, _ in COND]
+    ms = [v.mean() for v in per_seed]
+    # bars in a light tint of each condition's colour, edged in the full colour,
+    # so the ink whisker and seed dots stay visible on every bar -- intact's
+    # colour is ink itself (user, 2026-10-23)
+    from matplotlib.colors import to_rgb
+    tint = lambda c, f=0.55: tuple(1 - f * (1 - x) for x in to_rgb(c))
+    axM.bar(range(len(COND)), ms, color=[tint(c) for _, _, c, _ in COND],
+            edgecolor=[c for _, _, c, _ in COND], linewidth=1.0, width=.62, zorder=1)
+    for k, v in enumerate(per_seed):
+        if len(v) > 1:
+            axM.errorbar(k, v.mean(), v.std(ddof=1), color=INK, lw=0.8, capsize=0, zorder=3)
+            axM.scatter(k + np.linspace(-0.18, 0.18, len(v)), v, s=4, color=INK,
+                        alpha=0.5, lw=0, zorder=2)
+    # the long names on two lines under the bars
+    axM.set_xticks(range(len(COND)), [l.replace(" error", "\nerror") for _, l, _, _ in COND])
+    axM.set_ylabel("velocity MSE")
+    axM.set_title("prediction error")
+    # THE CONTEXT-FREE FLOOR, and only that one. On this panel the line is the
+    # whole reading: intact and e-zeroed sit BELOW it, which no predictor given
+    # one (s, a) and no context can do, and e-shuffled sits ABOVE it, which
+    # says a permuted error is worse than no error rather than merely worse
+    # than a true one. The perfect-context floor is left off: at 0.0068 it
+    # crosses every bar, so its label would sit on a filled bar wherever it
+    # went, and the epoch panels (floor_lines in fig_epochs and
+    # fig_training_seeds) already carry it with room to breathe.
+    _floor_drawn = bool(floor_lines(axM, action_mode, column="all", only=("cb_blind",)))
+    for k, v in enumerate(per_seed if values else []):     # the numbers, optional
+        top = max(v.mean() + (v.std(ddof=1) if len(v) > 1 else 0.0), v.max())
+        text = f"{v.mean():.4f}" if len(v) == 1 else f"{v.mean():.4f}\n±{v.std(ddof=1):.4f}"
+        axM.annotate(text, (k, top), xytext=(0, 1.5), textcoords="offset points",
+                     ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
+
+    return _floor_drawn
+
+
+def _switch_curves(a, curves: dict) -> None:
+    """The switch-aligned lesion on `a`: e removed PRE steps before to POST - 1
+    after each switch and the context decoded in that window. `curves` maps
+    a condition to (mean over OFFSETS, sd or None). Shared by fig_ablation
+    (per family) and fig_ablation_main (averaged over the families)."""
+    for mode, lab, col, ls in COND:
+        mu, sd = curves[mode]
+        if sd is None:
+            a.plot(OFFSETS, mu, ls, color=col, marker="o", ms=3, lw=1.2, label=lab)
+        else:
+            plot_band(a, OFFSETS, mu, sd, color=col, ls=ls, label=lab)
+    a.axvline(-.5, color=MUTED, lw=.8)       # the switch
+    a.set_xticks(OFFSETS)
+    a.set_xlabel("steps relative to switch")
+
+
 def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
-                 switch=None):
-    """The main figure, 2 x 3 at double-column width:
+                 switch=None, action_mode=M.DEFAULT_ACTION_MODE):
+    """THE SUPPLEMENTARY ABLATION FIGURE since 2026-10-15 (fig_ablation_main
+    is the main one), 2 x 3 at double-column width:
 
       a  calibration: predicted against actual velocity component, per
          condition -- faint points and the binned mean, against the identity
@@ -326,25 +460,7 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
     else:
         axS.axis("off")
 
-    # b: MSE. d[m] is a rollout dict (one MSE), a float, or an ARRAY of
-    # per-seed MSEs (across_seeds): then mean, +-1 SD whisker, one dot per seed.
-    per_seed = [np.atleast_1d(d[m]["mse"] if isinstance(d[m], dict) else d[m]).astype(float)
-                for m, _, _, _ in COND]
-    ms = [v.mean() for v in per_seed]
-    axM.bar(range(len(COND)), ms, color=[c for _, _, c, _ in COND], width=.62, zorder=1)
-    for k, v in enumerate(per_seed):
-        if len(v) > 1:
-            axM.errorbar(k, v.mean(), v.std(ddof=1), color=INK, lw=0.8, capsize=0, zorder=3)
-            axM.scatter(k + np.linspace(-0.18, 0.18, len(v)), v, s=4, color=INK,
-                        alpha=0.5, lw=0, zorder=2)
-    axM.set_xticks(range(len(COND)), [l for _, l, _, _ in COND])
-    axM.set_ylabel("velocity MSE")
-    axM.set_title("prediction error")
-    for k, v in enumerate(per_seed):
-        top = max(v.mean() + (v.std(ddof=1) if len(v) > 1 else 0.0), v.max())
-        text = f"{v.mean():.4f}" if len(v) == 1 else f"{v.mean():.4f}\n±{v.std(ddof=1):.4f}"
-        axM.annotate(text, (k, top), xytext=(0, 1.5), textcoords="offset points",
-                     ha="center", va="bottom", fontsize=plt.rcParams["xtick.labelsize"])
+    _floor_drawn = _mse_panel(axM, d, action_mode)
 
     # c-f: decoding. LEVEL readouts are titled in their level's colour; the
     # all-contexts readout is not a level and stays in ink.
@@ -353,17 +469,7 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
         if a is not dec[0]:
             a.sharey(dec[0])
         if switch is not None and ro in LEVELS:
-            # the switch-aligned lesion: e removed PRE steps before to POST - 1
-            # after each switch and decoded in that window
-            for mode, lab, col, ls in COND:
-                mu, sd = switch[(mode, ro)]
-                if sd is None:
-                    a.plot(OFFSETS, mu, ls, color=col, marker="o", ms=3, lw=1.2, label=lab)
-                else:
-                    plot_band(a, OFFSETS, mu, sd, color=col, ls=ls, label=lab)
-            a.axvline(-.5, color=MUTED, lw=.8)       # the switch
-            a.set_xticks(OFFSETS)
-            a.set_xlabel("steps relative to switch")
+            _switch_curves(a, {mode: switch[(mode, ro)] for mode, _, _, _ in COND})
         else:
             for mode, lab, col, ls in COND:
                 mu, sd = r[(mode, ro)]
@@ -403,7 +509,16 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
                f"SD. Predicted against actual change lies on the identity for every "
                f"condition (slopes 0.92-1.03), so the ablations widen the prediction "
                f"rather than bias it. "
-               f"(b) Held-out velocity MSE per condition. (c) Linear decoding of the "
+               f"(b) Held-out velocity MSE per condition"
+               + (", against the context-free floor (dashed): the lowest error a forward "
+                  "model with no context input can reach, measured as the same cerebellum "
+                  "trained with its context input clamped to zero and confirmed "
+                  "analytically by averaging the plant's one-step map over the contexts "
+                  "(prediction_floor.py). Intact and e-zeroed fall below it, which no "
+                  "predictor given a single state and action can do; e-shuffled rises "
+                  "above it, so a permuted error is worse than no error at all"
+                  if _floor_drawn else "")
+               + f". (c) Linear decoding of the "
                f"context among all {N_CONTEXTS} from z against steps since the context "
                f"switch; dotted line is chance. "
                + (f"(d-f) Per family, e lesioned only in a window from {PRE} steps before "
@@ -413,6 +528,77 @@ def fig_ablation(arm, seed, d, r, path, band="split", n_seed=None, scatter=None,
                   f"detector alone. " if switch is not None else
                   f"(d-f) The same within each family. ")
                + err)
+    offset_spines(fig)
+    label_panels(fig, [a for a in ax if a.axison])
+    save(fig, path, caption=caption)
+    print(f"  saved -> {path}")
+
+
+def fig_ablation_main(arm, seed, d, r, path, switch_avg, band="split", n_seed=None,
+                      action_mode=M.DEFAULT_ACTION_MODE):
+    """THE MAIN ABLATION FIGURE (user, 2026-10-15), three panels in a row; the
+    six-panel fig_ablation is now the supplement:
+
+      a  held-out velocity MSE per condition (fig_ablation's b)
+      b  decoding of the context among all N_CONTEXTS vs steps since switch
+         (fig_ablation's c)
+      c  the switch-aligned lesion, decoding AVERAGED OVER THE FAMILIES
+         (fig_ablation's d-f in one panel)
+
+    `switch_avg` is {mode: (mean over OFFSETS, sd or None)}: the per-family
+    curves averaged over families within each seed first, then over seeds,
+    so a band is across seeds as elsewhere. None draws c empty."""
+    fig, ax = plt.subplots(1, 3, figsize=figsize("double", height=2.4), layout="constrained")
+    axM, axD, axW = ax
+    _floor_drawn = _mse_panel(axM, d, action_mode)
+
+    for mode, lab, col, ls in COND:
+        mu, sd = r[(mode, "all")]
+        plot_band(axD, KS, mu, sd, color=col, ls=ls, label=lab)
+    axD.set_xlabel("steps since context switch")
+    ch = _chance("all")
+    chance_line(axD, ch, f"chance {ch:.2f}")
+    axD.set_ylim(0, 1)
+    axD.set_ylabel("decoding accuracy")
+    axD.set_title(f"which context? (all {N_CONTEXTS})")
+
+    if switch_avg is not None:
+        _switch_curves(axW, switch_avg)
+        chw = float(np.mean([_chance(f) for f in LEVELS]))
+        chance_line(axW, chw, f"chance {chw:.2f}", x=0.0, above=False)
+        for t in axW.texts:
+            if t.get_text().startswith("chance"):
+                t.set_ha("left")
+        axW.set_ylim(0, 1)
+        # its own labels: c decodes WITHIN a family (chance 1/4), b among all
+        # contexts (chance 1/12), so a shared unlabelled axis would mislead
+        axW.set_ylabel("within-family decoding")
+        axW.set_title("e lesioned around the switch")
+    else:
+        axW.axis("off")
+
+    fig.legend(handles=_handles(), ncol=len(COND), loc="outside upper center")
+    if band == "split":
+        err = (f"Lines: mean over {N_SPLITS} sequence-level decoder splits; bands: +-1 SD "
+               f"across splits, an internal check and not the error bar to quote.")
+    else:
+        err = (f"Lines: mean over {n_seed} training seeds; bands: +-1 SD across them, the "
+               f"error bar to quote. In (a) the bar is the mean MSE over seeds, the whisker "
+               f"+-1 SD and each dot one seed.")
+    caption = (f"{ARM_TITLE.get(arm, arm)}: is the cerebellar error necessary? "
+               f"(a) Held-out velocity MSE per condition"
+               + (", against the context-free floor (dashed): the lowest error a forward "
+                  "model with no context input can reach. Intact and e-zeroed fall below it; "
+                  "e-shuffled rises above it, so a permuted error is worse than no error"
+                  if _floor_drawn else "")
+               + f". (b) Linear decoding of the context among all {N_CONTEXTS} from z "
+               f"against steps since the context switch; dotted line is chance. (c) e "
+               f"lesioned only in a window from {PRE} steps before to {POST - 1} after a "
+               f"context switch (grey line), the context decoded within its family in that "
+               f"window and averaged over the {len(LEVELS)} families; dotted line is chance. "
+               f"Decoding falls on both sides of the switch, so the error feeds a continuous "
+               f"state estimate rather than a change detector alone. The per-family panels "
+               f"and the prediction residuals are in the supplementary version. " + err)
     offset_spines(fig)
     label_panels(fig, [a for a in ax if a.axison])
     save(fig, path, caption=caption)
@@ -551,6 +737,11 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
         ax[0].plot(ep, pf[:, i], color=FCOL[f], lw=.9, label=f)
     ax[0].set_yscale("log"); ax[0].set_xlabel("epoch")
     ax[0].set_ylabel("held-out velocity MSE")
+    # the epoch curve pools every step, so the floors must be the pooled ones
+    fl = floor_lines(ax[0], action_mode, column="all")
+    if fl:
+        lo = min([float(np.nanmin(z["hist"])), float(np.nanmin(pf))] + fl)
+        ax[0].set_ylim(bottom=lo * 0.85)
     ax[0].legend()
     for f in LEVELS:
         # track() writes the level name ALONE.  It was "<level>_linear" while an
@@ -566,12 +757,114 @@ def fig_epochs(arm, seed, path, action_mode=M.DEFAULT_ACTION_MODE):
     ax[1].set_ylabel("within-family linear decoding")
     ax[1].legend()
     caption = (f"{ARM_TITLE.get(arm, arm)}, seed {seed}: training history. (a) Held-out "
-               f"velocity MSE by epoch, overall and per family. (b) Within-family linear "
+               f"velocity MSE by epoch, overall and per family"
+               + (", with the two prediction floors (dashed): the best a context-free "
+                  "forward model can reach, and the same model handed the context as a "
+                  "one-hot (prediction_floor.py)" if fl else "")
+               + f". (b) Within-family linear "
                f"decoding of context from z at the tracked epochs; dotted line is chance.")
     offset_spines(fig)
     label_panels(fig)
     save(fig, path, caption=caption)
     print(f"  saved -> {path}")
+
+
+def _training_panels(axM, axD, tracks, action_mode=M.DEFAULT_ACTION_MODE, families=True,
+                     blind=False):
+    """The training-history panels on two axes: held-out velocity MSE by epoch
+    (geometric mean across seeds, band x/÷ one geometric SD, with the
+    prediction floors) and within-family decoding by epoch (mean +- SD).
+    Shared by fig_training_seeds and fig_circuit_main. Returns the floor
+    values drawn on axM."""
+    fl = []
+    if tracks:
+        n_ep = min(len(z["hist"]) for z in tracks.values())
+        levels = [str(l) for l in next(iter(tracks.values()))["levels"]]
+    if tracks:
+        ep = np.arange(1, n_ep + 1)
+        H = np.log10(np.array([z["hist"][:n_ep] for z in tracks.values()], float))
+        P = np.log10(np.array([z["per_fam"][:n_ep] for z in tracks.values()], float))
+        def geo(L):
+            m, sd = L.mean(0), L.std(0)
+            return 10 ** m, 10 ** (m - sd), 10 ** (m + sd)
+        # the context-free cerebellum trained on the circuit's own schedule
+        # (prediction_floor.py --blind-track; user, 2026-10-23), in grey
+        # beneath the circuit's curve; absent until it has been run
+        if blind:
+            from prediction_floor import load_blind_tracks
+            Bt = load_blind_tracks(M.circuit(action_mode))
+            if Bt is not None:
+                nb = min(n_ep, Bt.shape[1])
+                mb, lob, hib = geo(np.log10(Bt[:, :nb]))
+                plot_band(axM, ep[:nb], mb, lo=lob, hi=hib, color=MUTED,
+                          label="CB only", marker=None, lw=1.0)          # names: user, 2026-10-23
+        m, lo, hi = geo(H)
+        plot_band(axM, ep, m, lo=lo, hi=hi, color=INK,
+                  label="CB-MTL" if blind else "overall", marker=None)
+        for i, f in enumerate(levels if families else []):
+            m, lo, hi = geo(P[:, :, i])
+            plot_band(axM, ep, m, lo=lo, hi=hi, color=FCOL[f], label=f, marker=None, lw=0.9)
+        axM.set_yscale("log")
+        # the learning-rate warm restarts, which cause the inflections
+        # (user, 2026-10-23)
+        restart_label = None
+        for i_, e_ in enumerate(M.lr_restart_epochs(n_ep)):
+            axM.axvline(e_, color=MUTED, ls=":", lw=0.8, zorder=0.5)
+            if i_ == 0:
+                restart_label = axM.annotate(
+                    "LR restart", (e_, 1.0), xycoords=axM.get_xaxis_transform(),
+                    xytext=(2, -2), textcoords="offset points", ha="left", va="top",
+                    color=MUTED, fontsize=plt.rcParams["xtick.labelsize"])
+        # the two prediction floors, BEFORE the limits are solved: the lower one
+        # sits under every curve on this axis, so an axis fitted to the data
+        # alone would clip it off -- see floor_lines
+        fl = floor_lines(axM, action_mode, column="all")
+        # the restart label just above the lowest floor line (the ideal
+        # observer), in the empty bottom of the panel (user, 2026-10-23)
+        if restart_label is not None and fl:
+            restart_label.xy = (restart_label.xy[0], min(fl))
+            restart_label.xycoords = "data"
+            restart_label.set_position((2, 2)); restart_label.set_va("bottom")
+        # plain decimal ticks at round values inside the data, no minor labels
+        from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+        lo_v, hi_v = float(np.min(10 ** P.mean(0))), float(np.max(10 ** H.mean(0)))
+        lo_v, hi_v = min(lo_v, float(10 ** H.mean(0).min())), max(hi_v, float(np.max(10 ** P.mean(0))))
+        lo_v = min([lo_v] + fl)
+        cands = [k * 10.0 ** e for e in range(-5, 2) for k in (1, 1.5, 2, 3, 4, 5, 7)]
+        # enclose the data: the round value just below the minimum and just
+        # above the maximum, and the round values between
+        below = max(t for t in cands if t <= lo_v)
+        above = min(t for t in cands if t >= hi_v * 0.98)
+        ticks = [t for t in cands if below <= t <= above]
+        if len(ticks) > 5:
+            ticks = ticks[::2] if ticks[::2][-1] == ticks[-1] else ticks[::2] + [ticks[-1]]
+        axM.set_ylim(below, above)
+        axM.yaxis.set_major_locator(FixedLocator(ticks))
+        axM.yaxis.set_minor_locator(NullLocator())
+        axM.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        axM.set_xlabel("Epoch"); axM.set_ylabel("Held-out velocity MSE")
+        if families:
+            axM.legend(loc="upper right", ncol=2)
+        elif blind and len(axM.get_lines()) > 1:
+            # in the empty band between the circuit's curve and the ideal
+            # observer, clear of the restart and floor lines
+            axM.legend(loc="lower right", bbox_to_anchor=(1.0, 0.24), frameon=False)
+        dec_ep = next(iter(tracks.values()))["dec_ep"]
+        for f in levels:
+            if not all(f in z.files for z in tracks.values()):
+                continue
+            R = np.array([z[f][:len(dec_ep)] for z in tracks.values()], float)
+            plot_band(axD, dec_ep, R.mean(0), R.std(0), color=FCOL[f], label=f)
+        ch = _chance(levels[0])
+        chance_line(axD, ch, "Chance")
+        axD.set_ylim(0, 1.0)
+        axD.set_xlabel("Epoch"); axD.set_ylabel("Within-family decoding")
+    else:
+        for a in (axM, axD):
+            a.text(0.5, 0.5, "no training history", ha="center", va="center",
+                   color=MUTED, transform=a.transAxes)
+
+    return fl
 
 
 def fig_training_seeds(arm, seeds, path, action_mode=M.DEFAULT_ACTION_MODE, site="z"):
@@ -603,56 +896,13 @@ def fig_training_seeds(arm, seeds, path, action_mode=M.DEFAULT_ACTION_MODE, site
         n_ep = min(len(z["hist"]) for z in tracks.values())
         levels = [str(l) for l in next(iter(tracks.values()))["levels"]]
 
+    fl = []          # the floor values drawn on (a); [] when there is no cache
     fig = plt.figure(figsize=figsize("double", height=4.4), layout="constrained")
     gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.15])
     axM, axD = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0], sharex=None)
     axC = fig.add_subplot(gs[:, 1])
 
-    if tracks:
-        ep = np.arange(1, n_ep + 1)
-        H = np.log10(np.array([z["hist"][:n_ep] for z in tracks.values()], float))
-        P = np.log10(np.array([z["per_fam"][:n_ep] for z in tracks.values()], float))
-        def geo(L):
-            m, sd = L.mean(0), L.std(0)
-            return 10 ** m, 10 ** (m - sd), 10 ** (m + sd)
-        m, lo, hi = geo(H)
-        plot_band(axM, ep, m, lo=lo, hi=hi, color=INK, label="overall", marker=None)
-        for i, f in enumerate(levels):
-            m, lo, hi = geo(P[:, :, i])
-            plot_band(axM, ep, m, lo=lo, hi=hi, color=FCOL[f], label=f, marker=None, lw=0.9)
-        axM.set_yscale("log")
-        # plain decimal ticks at round values inside the data, no minor labels
-        from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
-        lo_v, hi_v = float(np.min(10 ** P.mean(0))), float(np.max(10 ** H.mean(0)))
-        lo_v, hi_v = min(lo_v, float(10 ** H.mean(0).min())), max(hi_v, float(np.max(10 ** P.mean(0))))
-        cands = [k * 10.0 ** e for e in range(-5, 2) for k in (1, 1.5, 2, 3, 4, 5, 7)]
-        # enclose the data: the round value just below the minimum and just
-        # above the maximum, and the round values between
-        below = max(t for t in cands if t <= lo_v)
-        above = min(t for t in cands if t >= hi_v * 0.98)
-        ticks = [t for t in cands if below <= t <= above]
-        if len(ticks) > 5:
-            ticks = ticks[::2] if ticks[::2][-1] == ticks[-1] else ticks[::2] + [ticks[-1]]
-        axM.set_ylim(below, above)
-        axM.yaxis.set_major_locator(FixedLocator(ticks))
-        axM.yaxis.set_minor_locator(NullLocator())
-        axM.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        axM.set_xlabel("Epoch"); axM.set_ylabel("Held-out velocity MSE")
-        axM.legend(loc="upper right", ncol=2)
-        dec_ep = next(iter(tracks.values()))["dec_ep"]
-        for f in levels:
-            if not all(f in z.files for z in tracks.values()):
-                continue
-            R = np.array([z[f][:len(dec_ep)] for z in tracks.values()], float)
-            plot_band(axD, dec_ep, R.mean(0), R.std(0), color=FCOL[f], label=f)
-        ch = _chance(levels[0])
-        chance_line(axD, ch, "Chance")
-        axD.set_ylim(0, 1.0)
-        axD.set_xlabel("Epoch"); axD.set_ylabel("Within-family decoding")
-    else:
-        for a in (axM, axD):
-            a.text(0.5, 0.5, "no training history", ha="center", va="center",
-                   color=MUTED, transform=a.transAxes)
+    fl = _training_panels(axM, axD, tracks, action_mode)
 
     acc_txt = ""
     if confs:
@@ -705,7 +955,13 @@ def fig_training_seeds(arm, seeds, path, action_mode=M.DEFAULT_ACTION_MODE, site
     caption = (
         f"{ARM_TITLE.get(arm, arm)}: the prediction task across training seeds. (a) "
         f"Held-out velocity MSE by epoch, overall (ink) and per family; geometric mean "
-        f"across {len(tracks)} seeds, band x/÷ one geometric SD. (b) Within-family linear "
+        f"across {len(tracks)} seeds, band x/÷ one geometric SD. "
+        + ("Dashed: the best a context-free forward model can reach (the cerebellum "
+           "alone, with no context input), and the same model handed the context as a "
+           "one-hot. The trained circuit ends BELOW the context-free floor, which no "
+           "predictor given one state and action can do. "
+           if fl else "")
+        + f"(b) Within-family linear "
         f"decoding of context from z at the tracked epochs, mean +- SD across "
         f"{len(tracks)} seeds; dotted line is chance. (c) 12-way linear decoding of context "
         f"from {site} at the end of training (tss >= {TSS_MIN}): row-normalised confusion "
@@ -880,7 +1136,13 @@ def per_seed(arm, seed, action_mode=M.DEFAULT_ACTION_MODE):
     sa = switch_aligned(arm, seed, action_mode=action_mode)
     sw_band = ({(m, f): (np.array([sa.get((m, f, o), np.nan) for o in OFFSETS]), None)
                 for m, _, _, _ in COND for f in LEVELS} if sa else None)
-    fig_ablation(arm, seed, d, r, os.path.join(out, "ablation.png"), switch=sw_band)
+    fig_ablation(arm, seed, d, r, os.path.join(out, "ablation_supp.png"), switch=sw_band,
+                 action_mode=action_mode)
+    # the main figure: the switch panels averaged over the families
+    sw_avg = ({m: (np.nanmean([sw_band[(m, f)][0] for f in LEVELS], axis=0), None)
+               for m, _, _, _ in COND} if sw_band else None)
+    fig_ablation_main(arm, seed, d, r, os.path.join(out, "ablation.png"), sw_avg,
+                      action_mode=action_mode)
     fig_mtl_control(arm, seed, r, os.path.join(out, "mtl_control.png"))
     fig_global(arm, seed, r, os.path.join(out, "decoding_global.png"))
     fig_tss(arm, seed, d, os.path.join(out, "tss_curves.png"))
@@ -901,6 +1163,92 @@ def per_seed(arm, seed, action_mode=M.DEFAULT_ACTION_MODE):
             mu, sd = r[(m, ro)]
             print(f"  {ro:<11}{m:<10}" + "".join(
                 f"{a:>8.3f}+-{b:.3f}" for a, b in zip(mu, sd)))
+
+
+def fig_circuit_main(arm, seeds, mse, r, path, n_seed, action_mode=M.DEFAULT_ACTION_MODE):
+    """THE CIRCUIT FIGURE (user, 2026-10-23): the training figure and the
+    ablation figure combined, with a slot for the model schematic. 2 x 3:
+
+      a  (top left, two columns) the schematic -- left EMPTY; the PDF is for
+         placing it by hand, the SVG and <stem>_slot.json (write_slot) for compose_schema
+      b  held-out velocity MSE by epoch, with the prediction floors
+      c  within-family decoding of context from z by epoch
+      d  held-out velocity MSE per ablation condition
+      e  12-way decoding of context from z against steps since the switch
+
+    All across training seeds. The switch-window lesion and the confusion
+    matrix stay in ablation_seeds_supp and training_seeds."""
+    tracks = {}
+    for s_ in seeds:
+        pt = os.path.join(M.fig_dir(arm, s_, action_mode=action_mode), "track.npz")
+        if os.path.exists(pt):
+            tracks[s_] = np.load(pt)
+    with plt.rc_context({"svg.fonttype": "path"}):
+        fig = plt.figure(figsize=figsize("double", height=4.8), layout="constrained")
+        gs = fig.add_gridspec(2, 3)
+        slot = fig.add_subplot(gs[0, 0:2]); slot.axis("off")
+        axM, axD = fig.add_subplot(gs[0, 2]), fig.add_subplot(gs[1, 0])
+        axB, axE = fig.add_subplot(gs[1, 1]), fig.add_subplot(gs[1, 2])
+        # overall MSE only in the main figure (user, 2026-10-23)
+        fl = _training_panels(axM, axD, tracks, action_mode, families=False, blind=True)
+        axM.set_title("Training"); axD.set_title("Context in z during training")
+        # the family key, which b no longer carries
+        axD.legend(handles=[Line2D([], [], color=FCOL[f], lw=1.4, label=f.capitalize())
+                            for f in LEVELS], loc="lower right", frameon=False)
+        floor = _mse_panel(axB, mse, action_mode, values=False)   # the whiskers say it
+        axB.set_title("Ablations")
+        axB.set_ylabel("Velocity MSE")
+        for mode, lab, col, ls in COND:
+            mu, sd = r[(mode, "all")]
+            plot_band(axE, KS, mu, sd, color=col, ls=ls, label=lab)
+        ch = _chance("all")
+        chance_line(axE, ch, "Chance")
+        axE.set_ylim(0, 1)
+        axE.set_xlabel("Steps since context switch")
+        axE.set_ylabel("Decoding accuracy (12-way)")
+        axE.set_title("Context in z after ablation")
+        axE.legend(handles=_handles(), loc="upper left", frameon=False)
+        for a_ in (axM, axD, axB, axE):
+            offset_spines(a_)
+        # the bar bracket treatment on d's x axis (user, 2026-10-23): a bracket
+        # under each bar, the width of the bar
+        bracket_xticks(axB, half_width=0.3, positions=list(range(len(COND))),
+                       labels=[l.replace(" error", "\nerror") for _, l, _, _ in COND])
+        axB.spines["bottom"].set_visible(False)
+        # the floor's label centred between the intact and zeroed bars, above
+        # the line (user, 2026-10-23); placed once the limits are final
+        lo_, hi_ = axB.get_xlim()
+        for t in axB.texts:
+            if t.get_text().startswith("Context-free"):
+                # an Annotation: its anchor (axes-fraction x, data y) is what moves
+                t.xy = ((0.5 - lo_) / (hi_ - lo_), t.xy[1]); t.set_ha("center")
+
+        label_panels(fig, [slot, axM, axD, axB, axE])
+        from prediction_floor import load_blind_tracks
+        _bt = load_blind_tracks(M.circuit(action_mode))
+        n_blind = 0 if _bt is None else len(_bt)
+        caption = (
+            f"{ARM_TITLE.get(arm, arm)}, across {len(tracks)} training seeds (training) and "
+            f"{n_seed} (ablations). (a) Model schematic. (b) Held-out velocity MSE by epoch for the "
+            f"full circuit (CB-MTL, ink) and, in grey, the same cerebellum with its context input "
+            f"clamped to zero (CB only), trained on the identical sequences, schedule and loss ({n_blind} seeds): "
+            f"geometric mean across seeds, band x/÷ one geometric SD; dotted verticals the "
+            f"learning-rate warm restarts of the cosine schedule (the optimizer is not reset; "
+            f"the rate returns to its maximum), which cause the transient rises; dashed lines the "
+            f"context-free floor (the same cerebellum with its context input clamped to zero) and "
+            f"the ideal observer (the cerebellum given the true context). (c) Within-family linear decoding of context "
+            f"from z at the tracked epochs, mean +- SD across seeds; dotted line chance. (d) "
+            f"Held-out velocity MSE per condition -- intact; zeroed error, the cerebellar "
+            f"prediction error e set to zero; shuffled error, e permuted across "
+            f"sequences; and noise added to MTL's own state as a control -- the "
+            f"bar the mean over seeds, the whisker +-1 SD, each dot one seed"
+            + (", against the context-free floor (dashed)" if floor else "")
+            + f". (e) Linear decoding of the context among all {N_CONTEXTS} from z against steps "
+            f"since the context switch, per condition, mean +- SD across seeds; dotted line "
+            f"chance.")
+        write_slot(fig, slot, path)
+        save(fig, path, formats=("pdf", "svg", "png"), caption=caption)
+    print(f"  saved -> {path}")
 
 
 def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
@@ -958,8 +1306,20 @@ def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
             for f in LEVELS:
                 R = np.array([z[f"{m}|{f}"] for z in sw.values()], float)
                 sw_band[(m, f)] = (np.nanmean(R, 0), np.nanstd(R, 0))
-    fig_ablation(arm, None, mse, r, os.path.join(out, "ablation_seeds.png"),
-                 band="seed", n_seed=n, scatter=scatter, switch=sw_band)
+    fig_ablation(arm, None, mse, r, os.path.join(out, "ablation_seeds_supp.png"),
+                 band="seed", n_seed=n, scatter=scatter, switch=sw_band,
+                 action_mode=action_mode)
+    # the main figure: per seed, the switch curve averaged over the families,
+    # then mean and SD across seeds
+    sw_avg = None
+    if sw:
+        sw_avg = {}
+        for m, _, _, _ in COND:
+            R = np.array([np.nanmean([z[f"{m}|{f}"] for f in LEVELS], axis=0)
+                          for z in sw.values()], float)
+            sw_avg[m] = (np.nanmean(R, 0), np.nanstd(R, 0))
+    fig_ablation_main(arm, None, mse, r, os.path.join(out, "ablation_seeds.png"), sw_avg,
+                      band="seed", n_seed=n, action_mode=action_mode)
     # the two honest readouts, pooled the same way.  Bands here are ACROSS
     # SEEDS, unlike the per-seed version where they are across decoder splits.
     if all((m, "family_derived") in r for m, _, _, _ in COND):
@@ -973,6 +1333,8 @@ def across_seeds(arm, seeds, action_mode=M.DEFAULT_ACTION_MODE):
                    band=sw_band, n_seed=len(sw))
     fig_training_seeds(arm, seeds, os.path.join(out, "training_seeds.png"),
                        action_mode=action_mode)
+    fig_circuit_main(arm, seeds, mse, r, os.path.join(out, "circuit_main.png"), n,
+                     action_mode=action_mode)
     print(f"\n{arm}: pooled over {n} seeds {sorted(d)}")
     print(f"  {'readout':<11}{'mode':<10}" + "".join(f"{k:>13}" for k in KS))
     for ro in READOUTS:

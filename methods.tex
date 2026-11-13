@@ -1,0 +1,218 @@
+% Methods draft. Needs amsmath, amssymb.
+
+\paragraph{Dynamics}
+The agent is a point mass moving in a continuous two-dimensional square arena, $[-1, 1]^2$. The agent navigates this environment by producing two-dimensional forces, $F_t \in [-1, 1]^2$. On each step, the agent's force is corrupted by signal-dependent noise
+\begin{equation}
+\begin{bmatrix}
+    \hat{F}_x \\
+    \hat{F}_y
+\end{bmatrix}_t = \begin{bmatrix}
+    F_x \\
+    F_y
+\end{bmatrix}_t + \sigma_m \lVert F_t \rVert \, \epsilon_t, \qquad \epsilon_t \sim \mathcal{N}(0, I_2),
+\end{equation}
+where $\sigma_m = 0.28$ is the motor-noise scale and $\hat{F}_t$ is the corrupted action. The corrupted action is transformed by the current context $k$ and integrated as
+\begin{gather}
+\begin{bmatrix}
+    a_x \\
+    a_y
+\end{bmatrix}_t
+= \frac{1}{m} \left( R_k \begin{bmatrix}
+    \hat{F}_x \\
+    \hat{F}_y
+\end{bmatrix}_t + \left( C_k - \gamma I_2 \right) \begin{bmatrix}
+    V_x \\
+    V_y
+\end{bmatrix}_t \right), \\
+\begin{bmatrix}
+    \tilde{V}_x \\
+    \tilde{V}_y
+\end{bmatrix}_{t+1} = \begin{bmatrix}
+    V_x \\
+    V_y
+\end{bmatrix}_t +
+\begin{bmatrix}
+    a_x \\
+    a_y
+\end{bmatrix}_t + D_k, \qquad
+V_{t+1} = \tilde{V}_{t+1} \min\!\left(1, \frac{V_{\max}}{\lVert \tilde{V}_{t+1} \rVert}\right), \\
+\begin{bmatrix}
+    x \\ y
+\end{bmatrix}_{t+1} = \operatorname{clip}\!\left( \begin{bmatrix}
+    x \\ y
+\end{bmatrix}_{t} + \begin{bmatrix}
+    V_x \\
+    V_y
+\end{bmatrix}_{t+1}, \, -1, \, 1 \right),
+\end{gather}
+where $m = 32$, $\gamma = 1$ and $V_{\max} = 0.1$ are the agent's mass, the damping coefficient and the maximum speed, respectively. The speed cap acts on the norm of the velocity, so it does not change the direction of motion. Collisions with the walls are inelastic: if a step would carry the agent past a wall, its position is clipped to the wall and the velocity component normal to that wall is set to zero. The remaining parameters, $R_k$, $C_k$ and $D_k$, are context-dependent and govern rotation, curl and drift, respectively:
+\begin{equation*}
+    R_k = \begin{bmatrix}
+        \cos(\theta_k) & -\sin(\theta_k) \\
+        \sin(\theta_k) & \cos(\theta_k)
+    \end{bmatrix}, \quad C_k = \kappa_k \begin{bmatrix}
+        0 & -1 \\
+        1 & 0
+    \end{bmatrix}, \quad D_k = \alpha_k \begin{bmatrix}
+        \cos(\phi_k) \\ \sin(\phi_k)
+    \end{bmatrix}.
+\end{equation*}
+Each context perturbs a single family, and the other two are left at their null values ($\theta_k = 0$, $\kappa_k = 0$, $\alpha_k = 0$). There are four contexts per family: rotations $\theta_k \in \{\pm 30^\circ, \pm 60^\circ\}$; curl fields $\kappa_k \in \{\pm 7, \pm 13\}$; and drifts of magnitude $\alpha_k = 0.016$ in directions $\phi_k \in \{0^\circ, 90^\circ, 180^\circ, 270^\circ\}$. The parameters were chosen so that the families have matched effect sizes, measured as the deviation of the applied force from the commanded force relative to the command, $\lVert F^{\text{applied}} - \hat{F} \rVert / \lVert \hat{F} \rVert$. A $30^\circ$ rotation deviates the force by $0.52$ and a $60^\circ$ rotation by $1.00$. The curl gains reproduce these values at the root-mean-square speed reached in the null field (0.51 and 0.98). The drift is equivalent to a constant force of the $30^\circ$ effect size. Contexts were never cued.
+
+\paragraph{Circuit architecture}
+The circuit consists of two networks, a cerebellar forward model (CB) and a recurrent network standing for the entorhinal cortex and medial temporal lobe (EC). Both operate on the agent's state, $s_t = [x, y, V_x / V_{\max}, V_y / V_{\max}]^\top \in \mathbb{R}^4$. Velocity is divided by the speed cap so that position and velocity both lie in $[-1, 1]$. On each step, CB predicts the next state from the current state, the current action and the context latent $z_t$. EC infers $z_t$ from CB's prediction error. CB receives the current action $F_t$ and EC the previous action $F_{t-1}$. In both cases this is an efference copy of the commanded action, not the noise-corrupted $\hat{F}$ that drives the plant.
+
+\textit{Cerebellum.} CB is a feedforward network with two hidden layers of 256 rectified linear units,
+\begin{gather}
+    h^{(1)}_t = \operatorname{ReLU}\!\left( W_1 \, [s_t; F_t; z_t] + b_1 \right), \qquad
+    h^{(2)}_t = \operatorname{ReLU}\!\left( W_2 \, h^{(1)}_t + b_2 \right), \\
+    \hat{s}_{t+1} = W_3 \, h^{(2)}_t + b_3,
+\end{gather}
+where $[\,\cdot\,;\,\cdot\,]$ denotes concatenation. Its input is the 4-dimensional state, the 2-dimensional action and the 32-dimensional latent, 38 dimensions in all. CB predicts the next state directly, rather than a change from the current state. It has no recurrence, so it cannot compare consecutive states and therefore cannot identify the context on its own. The prediction error,
+\begin{equation}
+    e_t = s_t - \hat{s}_t,
+\end{equation}
+compares the observed state with the prediction CB made on the previous step.
+
+\textit{Entorhinal cortex.} EC is a gated recurrent unit (GRU) with 256 hidden units. In the main arm, its input on step $t$ is the previous state, the previous action and the current prediction error, $x_t = [s_{t-1}; F_{t-1}; e_t] \in \mathbb{R}^{10}$. EC therefore never sees the current state $s_t$; the prediction error is its only access to the outcome of its last action. The hidden state is updated as
+\begin{gather}
+    r_t = \sigma\!\left( W_{xr} x_t + W_{hr} h_{t-1} + b_r \right), \qquad
+    u_t = \sigma\!\left( W_{xu} x_t + W_{hu} h_{t-1} + b_u \right), \\
+    n_t = \tanh\!\left( W_{xn} x_t + b_{xn} + r_t \odot \left( W_{hn} h_{t-1} + b_{hn} \right) \right), \\
+    h_t = (1 - u_t) \odot n_t + u_t \odot h_{t-1},
+\end{gather}
+where $\sigma$ is the logistic function and $\odot$ is element-wise multiplication. The latent is read out from the hidden state through a noisy, saturating channel,
+\begin{equation}
+    \mu_t = W_z h_t + b_z, \qquad
+    z_t = \tanh\!\left( \mu_t + \sigma_z \xi_t \right), \qquad \xi_t \sim \mathcal{N}(0, I_{32}),
+\end{equation}
+with a fixed noise scale $\sigma_z = 0.3$. The noise is applied only during circuit training; afterwards, the latent is the deterministic $z_t = \tanh(\mu_t)$. Because the noise has a fixed scale, a larger $\lVert \mu_t \rVert$ transmits more information, and a cost on $\lVert \mu_t \rVert^2$ during training (see \textit{Circuit training}) limits the rate of the channel.
+
+\textit{Timing.} Within step $t$, the circuit observes $s_t$ and $F_t$, computes $e_t$ from the prediction made on step $t-1$, updates EC to obtain $z_t$, and then has CB predict $\hat{s}_{t+1}$ from $(s_t, F_t, z_t)$. On the first step of a sequence, the hidden state $h_0$, the previous state and action, and the prediction error are all set to zero.
+
+\textit{Control arm.} In the control arm, EC additionally receives the current state, $x_t = [s_{t-1}; F_{t-1}; s_t; e_t] \in \mathbb{R}^{14}$, so the prediction error is no longer its only access to the present. The two arms are otherwise identical in architecture, training data, loss and random seeds.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\hline
+Module & Layer & Size & Nonlinearity \\
+\hline
+EC & GRU input & 10 (main), 14 (control) & --- \\
+   & GRU hidden & 256 & logistic gates, $\tanh$ candidate \\
+   & latent readout & 32 & $\tanh$ (noise $\sigma_z = 0.3$ in training) \\
+CB & input & 38 ($s$: 4, $F$: 2, $z$: 32) & --- \\
+   & hidden 1 & 256 & ReLU \\
+   & hidden 2 & 256 & ReLU \\
+   & output & 4 & linear \\
+\hline
+\end{tabular}
+\caption{Circuit dimensions. EC has 214{,}048 parameters in the main arm (217{,}120 in the control arm), and CB has 76{,}804.}
+\label{tab:circuit}
+\end{table}
+
+\paragraph{Circuit training data}
+The circuit was trained on sequences of $T = 128$ steps generated by the plant above, with motor noise on. Each sequence began at a position drawn uniformly from $[-0.5, 0.5]^2$, with zero velocity, in a context drawn uniformly from the training set. On every subsequent step, the context switched with probability $0.1$ to a different context drawn uniformly from the remaining contexts in the training set. Context blocks therefore had geometrically distributed lengths, with a mean of 10 steps before truncation by the end of the sequence. Context labels were never given to the circuit.
+
+The actions were not produced by a controller. Instead, each sequence's actions were drawn from a randomly parameterised Gaussian process, so that the circuit was fitted on a broad family of action statistics. For each sequence we drew a Mat\'ern smoothness $\nu \in \{\tfrac{1}{2}, \tfrac{3}{2}, \tfrac{5}{2}, \infty\}$, a length scale $\ell \sim \operatorname{LogUniform}(0.3, 3)$ steps, a saturation gain $g \sim \mathcal{U}(0, 5)$ and an amplitude scale $c \sim \mathcal{U}(0.6, 1.8)$. Each action component was then generated independently as
+\begin{equation}
+    u_{1:T} \sim \mathcal{GP}\!\left(0, k_{\nu, \ell}\right), \qquad
+    F_t = c \, \sigma_a \, \frac{\tanh(g \, u_t)}{\operatorname{sd}\!\left[\tanh(g \, u)\right]},
+\end{equation}
+where $k_{\nu,\ell}$ is the Mat\'ern correlation function with unit variance ($\nu = \infty$ being the squared-exponential kernel), $\operatorname{sd}[\tanh(g u)]$ is the standard deviation of $\tanh(g u)$ for $u \sim \mathcal{N}(0, 1)$, and $\sigma_a = 1/\sqrt{3}$. As $g \to 0$, the actions are Gaussian with standard deviation $c \, \sigma_a$; at large $g$, they are close to binary. The base scale $\sigma_a$ matches the standard deviation of a uniform variable on $[-1, 1]$, which approximates the output range of the controller's squashed policy. The actions of a sequence were drawn jointly before its context sequence, so they carried no information about the context.
+
+\paragraph{Training sets}
+The default circuit was trained on all 12 contexts. For the zero-shot experiment, we trained two further circuits whose rotation family was replaced while the curl and drift families were kept. In the \textit{structured} circuit, the four rotations were $\theta_k \in \{\pm 30^\circ, \pm 90^\circ\}$. In the \textit{unstructured} control, they were replaced by four random linear transforms of the action, $A_k = I_2 + E_k$, where $E_k$ was drawn uniformly from the sphere $\lVert E_k \rVert_F = \sqrt{2}\, \delta_k$. The radii were set so that each transform matched the effect size $\delta_k$ of one of the structured rotations ($0.52$ for $\pm 30^\circ$, $1.41$ for $\pm 90^\circ$). Here the effect size of a transform $A$ is the root-mean-square deviation it produces over unit actions, $\delta(A) = \lVert A - I_2 \rVert_F / \sqrt{2}$, which for a rotation equals $2\lvert\sin(\theta/2)\rvert$. The random transforms were drawn once, with a fixed seed, and shared across circuit seeds. The two circuits therefore differ only in whether the four action transforms lie on a one-parameter family.
+
+\paragraph{Circuit training}
+EC and CB were trained jointly, end to end, to predict the next state. The loss was the mean squared prediction error, with velocity weighted more heavily than position, plus a rate cost on the latent channel:
+\begin{equation}
+    \mathcal{L} = \frac{1}{2}\left\langle \lVert \hat{p}_{t+1} - p_{t+1} \rVert^2 \right\rangle
+    + \frac{\alpha}{2}\left\langle \lVert \hat{v}_{t+1} - v_{t+1} \rVert^2 \right\rangle
+    + \beta \left\langle \lVert \mu_t \rVert^2 \right\rangle ,
+\end{equation}
+where $p$ and $v$ are the position and scaled velocity components of $s$, $\langle \cdot \rangle$ denotes the average over sequences and time steps, $\alpha = 3$ and $\beta = 10^{-3}$. The velocity weight compensates for the fact that the next position is almost entirely predicted by copying the current one, whereas the next velocity carries all of the context-dependent change. The rate cost penalises the magnitude of the pre-noise latent mean. Because the readout noise has a fixed scale (see \textit{Circuit architecture}), this limits the information the latent transmits to CB.
+
+Each circuit was trained on a fixed set of 8{,}192 sequences for 256 epochs, in minibatches of 256 sequences. Gradients were computed by backpropagation through time over the full sequence. We used AdamW with a learning rate of $10^{-3}$ and weight decay of $10^{-4}$. The learning rate followed a cosine schedule with warm restarts, with a first cycle of 50 epochs, a cycle length that doubled after each restart, and a minimum learning rate of $10^{-5}$. Weights were initialised with PyTorch defaults. Prediction error was monitored on 300 held-out sequences, but there was no early stopping; the weights at the final epoch were kept. After training, the circuit was frozen, and the readout noise was removed for all subsequent use. [TODO: number of circuit seeds per configuration.]
+
+\paragraph{Reaching task}
+Each episode is a single reach. The start position and the goal were drawn independently and uniformly from the arena, and pairs closer than $0.5$ were redrawn. The agent started at rest. A reach ended when the agent came within $0.1$ of the goal, or after 30 steps. On each step, the agent received
+\begin{equation}
+    r_t = -\lambda_d \, d_{t+1}
+    + \lambda_p \, g_t \, \frac{d_t - d_{t+1}}{d_t}
+    - \lambda_F \lVert F_t \rVert^2
+    - \lambda_w \frac{J_t}{m V_{\max}}
+    + R \, \mathbb{1}\!\left[ d_{t+1} < 0.1 \right],
+    \qquad
+    g_t = \begin{cases} 1 & d_{t+1} \le d_t \\ 2 & d_{t+1} > d_t \end{cases}
+\end{equation}
+where $d_t$ is the distance to the goal, $J_t = m \lVert V^{\perp}_t \rVert$ is the impulse of any wall contact on that step ($V^{\perp}_t$ being the velocity removed by the wall), $\lambda_d = 0.3$, $\lambda_p = 1$, $\lambda_F = 0.1$, $\lambda_w = 1$, and $R = 5$ is the success bonus. The first term is a cost proportional to the remaining distance, which makes standing still costly. The second rewards progress, measured as the fraction of the remaining distance closed on that step; moving away from the goal costs twice as much as the same movement towards it earns. The third is an effort cost on the commanded force, and the fourth a cost of wall collisions, normalised by the impulse of a head-on collision at the speed cap. Measuring progress relative to the remaining distance makes a reach's return depend on the logarithm of the starting distance rather than on the distance itself, which reduces the variance contributed by the random start and goal positions.
+
+\paragraph{Controller}
+The controller (MC) is a soft actor-critic agent \citep{haarnoja2018soft}. Its observation is the agent's position, velocity and goal, $[x, y, V_x, V_y, x_g, y_g]$, in the plant's units. Configurations with the circuit append two circuit channels. The first is EC's latent, $z_t$ (32 dimensions). The second is CB's second hidden layer, $h^{(2)}_{t-1}$, mapped to 32 dimensions by a fixed random projection $P \in \mathbb{R}^{256 \times 32}$. $P$ has unit-norm columns and is drawn once per run. The CB channel is one step behind $z_t$ because CB needs the current action, which has not yet been chosen. The observation does not include the previous action, so a context can be identified only from the circuit channels, not from the action--outcome pair.
+
+The actor and both critics are multilayer perceptrons with two hidden layers of 256 ReLU units. The actor outputs the mean and log standard deviation of a Gaussian. The log standard deviation is passed through $\tanh$ and rescaled to $[-5, 2]$. The action is a sample from this Gaussian, squashed by $\tanh$ into $[-1, 1]^2$. Each critic takes the observation and the action and outputs a scalar $Q$-value; target critics were updated by Polyak averaging with $\tau = 0.005$. We used a discount factor of $\gamma = 0.99$. The entropy temperature was tuned automatically \citep{haarnoja2018soft} towards a target entropy of $-2$, starting from a temperature of 1. Actor, critics and temperature were optimised with Adam at a learning rate of $3 \times 10^{-4}$. Gradients of the actor and the critics were clipped to a norm of 1, and all networks used PyTorch's default initialisation. Reaching the goal ended an episode, and the critics' target was not bootstrapped past it. Reaching the 30-step limit did not end the episode for the critics, so their target bootstrapped as usual. One gradient update was made per environment step, with minibatches of 256 transitions. Until the replay buffer held 256 transitions, actions were drawn uniformly from $[-1, 1]^2$. In configurations with the circuit, EC and CB were frozen throughout, with the deterministic readout $z_t = \tanh(\mu_t)$. Only MC learned.
+
+\paragraph{Replay}
+Transitions were stored in a replay buffer indexed by episode, which held the 500 most recent episodes. Sampling weighted each episode by its age $a$, in episodes, as $\exp(-a / 40)$, mixed with a 2\% uniform floor over episodes. Each episode's weight was split equally over its transitions, so an episode's total sampling weight does not depend on its length, and therefore on how quickly a configuration reaches the goal. In addition, each minibatch was split between the block currently being trained and all earlier blocks. The current block received 85\% of the sampling weight and earlier blocks 15\%, with the recency weighting applied within each part. Minibatches were drawn with replacement.
+
+\paragraph{EC state across reaches}
+EC's hidden state was carried from one reach to the next: each reach began with the hidden state at the end of the previous reach. Each reach's final hidden state was also stored in a bank. With probability $0.02$ per reach, the carried state was replaced by a state drawn uniformly from this bank, so that the start state drifts towards contexts in proportion to how often they have been visited. This plays the role of the sticky transition prior in COIN \citep{heald2021contextual}. At the start of every reach, EC's other inputs (the previous state, the previous action and the prediction error) were reset to zero, as at the start of a training sequence. [TODO: confirm "carry" is the setting for every reported circuit run.]
+
+[TODO: number of RL seeds per configuration. Note: every RL run checked so far loads circuit seed 0, so seed-to-seed variability is variability in MC, not in the circuit.]
+
+\paragraph{Models}
+We compared four models. All of them share the controller, the reward, the replay scheme and the training schedule described above; they differ only in what MC observes beyond its kinematic observation.
+
+\textit{Motor Cortex (MC).} MC alone, observing only $[x, y, V_x, V_y, x_g, y_g]$. It has no access to the context other than through the consequences of its actions within the current reach, and it has no memory across steps.
+
+\textit{Motor Cortex + Cerebellum (MC + CB).} MC with a cerebellum but no EC. CB has the architecture described above, but its latent input is fixed at zero, so it is a single context-blind forward model, $\hat{s}_{t+1} = \mathrm{CB}(s_t, F_t, 0)$. Unlike in the Full Circuit, CB was not pretrained. It was initialised at random and trained online, alongside MC, to predict the next state from replayed transitions. It used the circuit-training loss without the rate term, Adam at a learning rate of $10^{-4}$, gradients clipped to a norm of 1, and one update per environment step on the same minibatch as MC's update. MC observes CB's second hidden layer through the fixed random projection $P$, as in the Full Circuit. This model therefore tests whether a cerebellar forward model, without a context representation, is enough by itself.
+
+\textit{Full Circuit.} MC with the pretrained, frozen EC and CB (main arm), observing both $z_t$ and the projected CB hidden state.
+
+\textit{COIN.} MC with an ideal Bayesian observer in place of the circuit, as a finite-hypothesis version of the contextual inference model of \citet{heald2021contextual}. The observer's hypotheses are the contexts the agent is trained on in that schedule (and, in the COIN paradigms, the null field). It is given each hypothesis's true dynamics. Because $R_k$ is orthogonal, the force realised on a step can be recovered exactly from the observed velocities,
+\begin{equation}
+    y_t = m \left( V_{t+1} - V_t \right) + \gamma V_t ,
+    \qquad
+    y_t \mid k \sim \mathcal{N}\!\left( R_k F_t + C_k V_t + m D_k, \; \sigma_m^2 \lVert F_t \rVert^2 I_2 \right),
+\end{equation}
+which gives an exact likelihood for each context. Steps on which this relation does not hold were treated as carrying no evidence: a wall contact, a step that reached the speed cap, or a zero action. Between steps, the posterior evolves under a sticky transition prior,
+\begin{equation}
+    p(k_{t+1}) = (1 - h)\, p(k_t) + h \, q, \qquad
+    q_k = \frac{n_k}{\sum_j n_j},
+\end{equation}
+with a hazard of $h = 10^{-3}$ per step. Here $n_k$ accumulates, at the end of every reach, that reach's final posterior probability of context $k$, so the observer jumps towards contexts in proportion to how often they have been visited. Before any reach has been completed, $q$ is uniform over the other contexts. The posterior is carried across reaches and blocks, and the observer is never told when the context switches. MC observes the posterior-weighted mixture of fixed context codes, $c_t = \sum_k p_t(k)\, e_k$, where the $e_k$ are unit-norm random vectors in $\mathbb{R}^{32}$, drawn once per run. The null field's code is zero. The code therefore has the same width as $z_t$ and, at certainty, is a fixed point per context.
+
+This observer is the generous version of COIN: it is handed the set of contexts and their exact dynamics, and needs only to infer which is active. A COIN that also had to discover new contexts would have to create a new context at a novel perturbation and start it from its prior.
+
+\paragraph{Training schedules}
+Contexts were presented in blocks of consecutive reaches, and switches were never signalled to the agent. The schedules below differ in which contexts were used, how long the blocks were, and what followed training.
+
+\textit{Context cycle.} The default schedule cycled through six contexts, two from each family: rotations of $-60^\circ$ and $+30^\circ$, curl fields with $\kappa = -13$ and $+7$, and drifts in the directions $0^\circ$ and $180^\circ$. Each block was 150 reaches long, and the cycle was repeated three times, giving 18 blocks and 2{,}700 reaches. Savings were measured by comparing learning in a context's later blocks with learning in its first.
+
+\textit{Savings probes.} To separate context-specific retrieval from transfer within a family, some cycles were followed by a washout and a set of probe blocks. The washout was a 150-reach block in the null field ($R_k = I$, $C_k = D_k = 0$), which removes any carry-over from the last training block. Three probe blocks of 150 reaches followed. Each probe was run as a separate branch from the same end-of-washout state, so all three started from identical experience. That state comprised MC's weights and optimiser, the replay buffer, EC's carried state and bank, the observer's posterior and counts, and the random number generator. The three probes were a revisit of the cycle's first context; a novel rotation, never experienced by MC; and a reflection of the action about the $45^\circ$ axis, from a family that neither the agent nor the circuit had ever experienced. The comparison of the revisit with the novel rotation measures retrieval, and the comparison of the novel rotation with the reflection measures family-level transfer. We ran these probes after three cycles. Each cycle consisted of either (i) the rotations $-60^\circ$ and $+30^\circ$, in which case the novel rotation was the first context's mirror image, $+60^\circ$; or (ii) the rotations $-30^\circ$ and $-90^\circ$, in which case the novel rotation was the midpoint, $-60^\circ$. The circuit was pretrained on $-60^\circ$, but MC never encountered it in this schedule, so case (ii) tests interpolation between the two trained rotations. In the probe blocks, MC acted from its policy from the first reach, rather than taking random actions until the replay buffer refilled. [TODO: which cells and block lengths are reported; the 6-context cycle with probes, $n = 2$ cells, and the 50/100-reach variants all exist.]
+
+\textit{COIN paradigms.} We reproduced three paradigms from \citet{heald2021contextual}, using rotations of $\pm 60^\circ$ as the perturbations P$^{+}$ ($+60^\circ$) and P$^{-}$ ($-60^\circ$). For these schedules, the agent's context set was the four table rotations, and COIN's hypotheses also included the null field (P$^{0}$). The block sequences are given in Table~\ref{tab:paradigms}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\hline
+Paradigm & Blocks (reaches) \\
+\hline
+Spontaneous recovery & P$^{0}$ (100), P$^{+}$ (300), P$^{-}$ (50), channel (150) \\
+Evoked recovery & P$^{0}$ (100), P$^{+}$ (300), P$^{-}$ (50), channel (10), P$^{+}$ (1), channel (140) \\
+Savings & $-60^\circ$ (100), $+60^\circ$ (300), $-60^\circ$ (75), $+60^\circ$ (300) \\
+\hline
+\end{tabular}
+\caption{Block sequences of the COIN paradigms. P$^{0}$: null field; P$^{+}$: $+60^\circ$ rotation; P$^{-}$: $-60^\circ$ rotation.}
+\label{tab:paradigms}
+\end{table}
+
+In the savings paradigm, the baseline and washout blocks were the trained $-60^\circ$ rotation rather than the null field, because the circuit was never trained on the null field. Block lengths were scaled up from the human paradigm (50, 125, 15 and 150 trials) because the agent adapts more slowly than people. Each block had to be long enough for every model to adapt fully before the next.
+
+\textit{Channel trials.} In a channel block, the plant was replaced by a clamp that moved the hand straight towards the goal at the speed cap, whatever the action. MC's weights were frozen, nothing was written to the replay buffer, and MC acted with the deterministic mean of its policy. The channel therefore reads out the expressed memory without adding learning. COIN's observer received no evidence on channel steps, so its posterior evolved under the transition prior alone. EC's carried state was not updated at the end of a channel reach, because its final state there reflects the clamp rather than a context, so it changed only through the 2\% leak to the bank. Throughout each paradigm, the expressed adaptation was also read out after every reach. This readout was a one-step, deterministic centre-out probe to eight targets at a radius of $0.75$, which began from the state the agent would carry into its next reach. It did not affect training.
+
+\textit{Replay at null-field boundaries.} In every schedule, the replay buffer was cleared once on leaving a null-field block for a perturbation: P$^{0}$ to P$^{+}$ in the paradigms, and the washout to each probe branch. In the null field, the circuit produces latents it was never trained on, which lie close to every context's centroid. Replaying those transitions would teach MC to aim straight across the whole latent space.
+
+\textit{Zero-shot generalisation.} The agent was trained on a cycle of four rotations, $\pm 30^\circ$ and $\pm 90^\circ$, in 150-reach blocks repeated three times. The Full Circuit used the structured circuit pretrained on the same four rotations (see \textit{Training sets}). The unstructured control used the circuit pretrained on random linear transforms, with MC trained on the same rotation cycle. COIN's hypotheses were the four trained rotations. Two test phases followed. The first was a frozen sweep, in which the agent made 16 reaches at each of 37 rotations, every $5^\circ$ from $-90^\circ$ to $+90^\circ$, in one block per angle, with the order of the blocks permuted for each seed. MC was frozen and acted with the deterministic mean of its policy. EC's state and COIN's posterior were carried from reach to reach as in training, but nothing was written to long-term memory: there was no replay, and no bank entries or visit counts were added. The trained angles were included in the sweep as ordinary test points, and rotations of $\pm 15^\circ$, $\pm 45^\circ$, $\pm 60^\circ$ and $\pm 75^\circ$ were novel to both MC and the circuit. The second test phase was a few-shot block of 150 reaches of ordinary training at $+60^\circ$, the midpoint between the $+30^\circ$ and $+90^\circ$ anchors. In both test phases, every reach was centre-out, from the origin to one of eight targets at a radius of $0.75$, in a permuted order. The reach limit was 12 steps instead of 30. A centre-out reach needs about 8 steps at full force, and trained policies took about 10. With 30 steps, feedback corrects a wrong initial aim at almost no cost in return. With 12 steps, a straight reach still arrives but a curved one does not.

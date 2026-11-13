@@ -65,7 +65,8 @@ import torch
 import model as M
 from data import generate_sequences
 from decode import _clf, seq_split
-from task import (CONTEXTS, C_LABEL, FAMILY, FAM_NAMES, N_CONTEXTS, TSS_MIN)
+from task import (CONTEXTS, C_LABEL, C_PARAM, FAMILY, FAM_NAMES, N_CONTEXTS,
+                  TSS_MIN)
 from plotting_utils import (use_paper_style, offset_spines, bracket_xticks, PALETTE, INK,
                             figsize, colorbar, label_panels, save)
 
@@ -86,7 +87,7 @@ def _despine(a):
 
 
 def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN,
-            action_mode=M.DEFAULT_ACTION_MODE):
+            action_mode=M.DEFAULT_ACTION_MODE, contexts=None):
     """Roll out and return the four sites plus labels, restricted to settled
     steps.
 
@@ -99,7 +100,10 @@ def collect(arm, seed, mode="intact", n=N_SEQ, tss_min=TSS_MIN,
     if loaded is None:
         return None
     ec, cb = loaded
-    trans, ctx, tss = generate_sequences(n, seed=123, action_mode=action_mode)
+    # `contexts`: the ids to draw from, None for the circuit's own set; the
+    # held-out figures pass the table plus registered off-table contexts
+    trans, ctx, tss = generate_sequences(n, seed=123, action_mode=action_mode,
+                                         contexts=contexts)
     with torch.no_grad():
         _, _, _, sites = M.rollout(ec, cb, trans, arm, mode,
                                    torch.Generator().manual_seed(0), sites=True)
@@ -242,6 +246,61 @@ def _within_family_mass(C):
             "chance": (per_fam - 1) / (N_CONTEXTS - 1)}
 
 
+def _error_structure(C):
+    """WHERE THE ERRORS GO, one level finer than _within_family_mass: having
+    stayed inside the family, does a confusion preserve the SIGN of the
+    perturbation?
+
+    Returns per family {"within": f, "within_chance": c, "same_sign": f,
+    "same_sign_chance": c} plus a pooled "signed" entry over the families that
+    HAVE a sign.
+
+    WHICH FAMILIES HAVE A SIGN, and why drift is reported differently.
+    Rotation and curl are graded sweeps of a signed parameter -- (-60, -30,
+    +30, +60) and (-13, -7, +7, +13) -- so of the three ways to be wrong
+    inside the family, ONE keeps the sign (the other magnitude, same
+    direction) and two flip it.  Chance for "same sign" is therefore 1/3, and
+    a value above it means the code confuses magnitude more readily than
+    direction.  Drift has no magnitude at all: its four members are one
+    magnitude at four headings (0, 90, 180, 270), so "same sign" is undefined
+    and the comparable split is the 90-degree NEIGHBOURS against the
+    180-degree OPPOSITE -- two of the three wrong members are neighbours, so
+    chance there is 2/3.  Forcing drift into the same column as the other two
+    would compare a magnitude confusion with a heading confusion.
+    """
+    fam = np.array([FAMILY[c] for c in ORDER])
+    par = np.array([C_PARAM[c] for c in ORDER], float)
+    off = C.copy()
+    np.fill_diagonal(off, 0)
+    out = {}
+    sign_num = sign_den = 0.0
+    for f, name in enumerate(FAM_NAMES):
+        rows = fam == f
+        tot_f = max(off[rows].sum(), 1e-12)
+        inside = off[np.ix_(rows, rows)]
+        n_mem = int(rows.sum())
+        res = {"within": float(inside.sum() / tot_f),
+               "within_chance": (n_mem - 1) / (N_CONTEXTS - 1)}
+        p_f = par[rows]
+        if name == "drift":
+            # headings on a circle: neighbour = 90 degrees away, opposite = 180
+            d = np.abs(p_f[:, None] - p_f[None, :]) % 360.0
+            d = np.minimum(d, 360.0 - d)
+            nb = (d > 0) & (d < 180.0)
+            res["neighbour"] = float(inside[nb].sum() / max(inside.sum(), 1e-12))
+            res["neighbour_chance"] = (n_mem - 2) / (n_mem - 1)
+        else:
+            same = (np.sign(p_f)[:, None] == np.sign(p_f)[None, :])
+            np.fill_diagonal(same, False)
+            res["same_sign"] = float(inside[same].sum() / max(inside.sum(), 1e-12))
+            res["same_sign_chance"] = (n_mem // 2 - 1) / (n_mem - 1)
+            sign_num += inside[same].sum(); sign_den += inside.sum()
+        out[name] = res
+    out["signed"] = {"same_sign": float(sign_num / max(sign_den, 1e-12)),
+                     "same_sign_chance": out[FAM_NAMES[0]]["same_sign_chance"]}
+    return out
+
+
 # ── 2. PCA: what explains the variance at each site ──────────────────────────
 def pca_sites(d, n_comp=64):
     """PCA at every site, plus the kinematic variables to colour by.
@@ -262,8 +321,21 @@ def pca_sites(d, n_comp=64):
     return out
 
 
+# DIRECTION as a colouring (user, 2026-10-10), beside speed: the angle of the
+# velocity, atan2(vy, vx) in degrees, on a CYCLIC map so -180 and +180 share a
+# colour. Near rest the angle is ill-defined; those points are noise in it.
+DIR_CMAP = "paper_cyc"        # plotting_utils: five distinct hues on a loop
+DIR_LIM = (-180.0, 180.0)
+
+
+def _direction(d, idx):
+    v = d["vel"][idx]
+    return np.degrees(np.arctan2(v[:, 1], v[:, 0]))
+
+
 def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
-    """One row per site: cumulative variance, then PC1-2 coloured four ways."""
+    """One row per site: cumulative variance, then PC1-2 coloured five ways
+    (context, family, x position, speed, direction)."""
     rng = np.random.default_rng(rng_seed)
     idx = rng.choice(len(d["cid"]), size=min(n_show, len(d["cid"])),
                      replace=False)
@@ -275,6 +347,7 @@ def fig_pca(arm, seed, d, P, path, n_show=4000, rng_seed=0):
         ("position (x)", pos[:, 0], "viridis", None),
         ("speed |v|", spd, "plasma", (np.percentile(spd, 1),
                                       np.percentile(spd, 99))),
+        ("direction", _direction(d, idx), DIR_CMAP, DIR_LIM),
     ]
     fig, axes = plt.subplots(len(SITES), 1 + len(colourings),
                              figsize=(4.2 * (1 + len(colourings)),
@@ -437,7 +510,7 @@ def fig_pc_variance(arm, seed, V, path, n_pc=10):
 
 
 def gif_pca(arm, seed, d, P, site, path, n_show=3000, frames=72, rng_seed=0):
-    """Rotating 3D view of the top three PCs, coloured four ways at once.
+    """Rotating 3D view of the top three PCs, coloured five ways at once.
 
     A static 2D projection hides whether an apparent cluster is real or an
     artefact of the viewing angle -- rotation is the cheapest way to tell.  The
@@ -456,7 +529,8 @@ def gif_pca(arm, seed, d, P, site, path, n_show=3000, frames=72, rng_seed=0):
               ("family", d["fam"][idx], None, None),
               ("position (x)", d["pos"][idx][:, 0], "viridis", None),
               ("speed |v|", spd, "plasma",
-               (np.percentile(spd, 1), np.percentile(spd, 99)))]
+               (np.percentile(spd, 1), np.percentile(spd, 99))),
+              ("direction", _direction(d, idx), DIR_CMAP, DIR_LIM)]
     fig = plt.figure(figsize=(4.25 * len(panels), 4.6))
     axes = [fig.add_subplot(1, len(panels), i + 1, projection="3d")
             for i in range(len(panels))]
@@ -572,7 +646,8 @@ def fig_clusters(arm, seed, d, P, site, path, n_show=4000, rng_seed=0):
             ("family", d["fam"][idx], None, None),
             ("position (x)", d["pos"][idx][:, 0], "viridis", None),
             ("speed |v|", spd, "plasma",
-             (np.percentile(spd, 1), np.percentile(spd, 99)))]
+             (np.percentile(spd, 1), np.percentile(spd, 99))),
+            ("direction", _direction(d, idx), DIR_CMAP, DIR_LIM)]
     pairs = [(0, 1), (0, 2), (1, 2)]
     fig, axes = plt.subplots(len(rows), 3, figsize=(13.5, 4.1 * len(rows)))
     for ri, (name, c, cmap, lim) in enumerate(rows):
@@ -610,34 +685,42 @@ def fig_clusters(arm, seed, d, P, site, path, n_show=4000, rng_seed=0):
     print(f"  saved -> {path}")
 
 
+# the paper figure's sites, in circuit order, and what each row is called
+# (user, 2026-10-10: show MTL and CB layer 2 beside z)
+PAPER_SITES = ("z", "mtl_hidden", "cb_layer2")      # z first (user, 2026-10-10)
+SITE_TITLE = {"mtl_hidden": "MTL hidden state", "z": "z (MTL output)",
+              "cb_layer1": "CB layer 1", "cb_layer2": "CB layer 2"}
+
+
 def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0,
-                    action_mode=M.DEFAULT_ACTION_MODE):
-    """PAPER FIGURE.  What z encodes, and how consistent it is across seeds.
+                    action_mode=M.DEFAULT_ACTION_MODE, sites=PAPER_SITES):
+    """PAPER FIGURE.  What each stage of the circuit encodes, and how
+    consistent it is across seeds.
 
-    Top row: PC1 vs PC2 of z for ONE seed, coloured by context, position and
-    speed.  Scatters cannot be averaged across seeds -- each seed has its own PC
-    basis and its own sign conventions -- so a single seed is shown and the
-    across-seed claim is carried by the bottom row instead.
+    One row per site (MTL's output z, its hidden state, CB's second layer):
+    PC1 vs PC2 for ONE seed, coloured by context, position, speed and
+    direction of motion. Scatters cannot be averaged across seeds -- each seed
+    has its own PC basis and its own sign conventions -- so a single seed is
+    shown and the across-seed claim is carried by the bottom row instead.
 
-    Bottom row: for each of the top 10 PCs, how much of ITS variance is
-    explained by context (eta^2 over the contexts), by position and by
-    velocity (linear R^2), as mean +- SD ACROSS SEEDS.  This is the quantitative
-    statement and it is what should be quoted.
+    Bottom row: for each site and each of its top 10 PCs, how much of the
+    PC's variance is explained by context (eta^2 over the contexts), by
+    position and by velocity (linear R^2), as mean +- SD ACROSS SEEDS. This is
+    the quantitative statement and it is what should be quoted.
 
     Caveat kept in the caption: context is measured assumption-free while
     position and velocity are linear fits, so a nonlinear kinematic dependence
-    would be understated.  The same linear measure reaches R^2 ~ 1.0 in CB's
+    would be understated. The same linear measure reaches R^2 ~ 1.0 in CB's
     layers, which shows it detects kinematics perfectly well when they are
     there.
     """
     rng = np.random.default_rng(rng_seed)
     idx = rng.choice(len(d["cid"]), size=min(n_show, len(d["cid"])),
                      replace=False)
-    pr = P["z"]["proj"][idx]
-    var = P["z"]["var"]
     spd = np.linalg.norm(d["vel"][idx], axis=1)
     # pool the per-PC variance decomposition over whatever seeds have it
-    V = {k: [] for k in ("context", "family", "position", "velocity")}
+    keys = ("context", "position", "velocity")
+    V = {(k, st): [] for k in keys for st in sites}
     got = []
     for sd_ in seeds:
         f = os.path.join(M.fig_dir(arm, sd_, action_mode=action_mode),
@@ -645,64 +728,92 @@ def fig_paper_pca_z(arm, seeds, d, P, path, n_show=4000, rng_seed=0,
         if not os.path.exists(f):
             continue
         z = np.load(f)
-        for k in V:
-            if f"{k}|z" in z.files:             # family is absent from older npz
-                V[k].append(z[f"{k}|z"])
+        for k in keys:
+            for st in sites:
+                if f"{k}|{st}" in z.files:
+                    V[(k, st)].append(z[f"{k}|{st}"])
         got.append(sd_)
-    V = {k: v for k, v in V.items() if v}
-    # Built at double-column width, type from the style, methods prose in the
-    # caption file rather than a suptitle (plotting_utils follow-ups 1, 2, 5).
-    fig = plt.figure(figsize=figsize("double", height=4.6), layout="constrained")
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, .8])
-    panels = [("context", d["cid"][idx], "tab20", None),
-              ("position (x)", d["pos"][idx][:, 0], "paper_seq", None),
-              ("speed |v|", spd, "paper_seq",
-               (np.percentile(spd, 1), np.percentile(spd, 99)))]
-    top = []
-    for i, (name, c, cmap, lim) in enumerate(panels):
-        # one PC basis, so the three scatters share both axes and only the
-        # first carries the y label
-        a = fig.add_subplot(gs[0, i], sharex=top[0] if top else None,
-                            sharey=top[0] if top else None)
-        kw = {} if lim is None else {"vmin": lim[0], "vmax": lim[1]}
-        sc = a.scatter(pr[:, 0], pr[:, 1], s=2, alpha=.45, c=c, cmap=cmap, lw=0, **kw)
-        a.set_xlabel(f"PC1 ({var[0]:.0%} of variance)")
-        if i == 0:
-            a.set_ylabel(f"PC2 ({var[1]:.0%})")
+    # panel titles capitalised; speed and direction of the velocity read as
+    # heading speed / heading direction (user, 2026-10-10)
+    colourings = [("Context", d["cid"][idx], "tab20", None),
+                  # x position red (left) to blue (right), centred on zero
+                  ("Position (x)", d["pos"][idx][:, 0], "coolwarm_r", (-1.0, 1.0)),
+                  ("Heading speed", spd, "plasma",
+                   (np.percentile(spd, 1), np.percentile(spd, 99))),
+                  ("Heading direction", _direction(d, idx), DIR_CMAP, DIR_LIM)]
+    nr, nc = len(sites), len(colourings)
+    fig = plt.figure(figsize=figsize("double", height=2.0 * nr + 2.2), layout="constrained")
+    gs = fig.add_gridspec(nr + 1, nc, height_ratios=[1] * nr + [1.05])
+    first_col = []
+    for r, st in enumerate(sites):
+        pr = P[st]["proj"][idx]
+        var = P[st]["var"]
+        row = []
+        for i, (name, c, cmap, lim) in enumerate(colourings):
+            # one PC basis per site, so a row shares both axes and only its
+            # first scatter carries the y label
+            a = fig.add_subplot(gs[r, i], sharex=row[0] if row else None,
+                                sharey=row[0] if row else None)
+            kw = {} if lim is None else {"vmin": lim[0], "vmax": lim[1]}
+            sc = a.scatter(pr[:, 0], pr[:, 1], s=1.5, alpha=.45, c=c, cmap=cmap, lw=0, **kw)
+            a.set_xlabel(f"PC1 ({var[0]:.0%})")
+            if i == 0:
+                a.set_ylabel(f"{SITE_TITLE.get(st, st)}\nPC2 ({var[1]:.0%})")
+            else:
+                a.tick_params(labelleft=False)
+            if r == 0:
+                a.set_title(name)
+            # one colour bar per colouring, on the last row, shared by the column
+            if r == nr - 1 and name != "Context":
+                if name == "Heading direction":
+                    cb = colorbar(sc, ax=a, ticks=[-180, 0, 180], location="bottom")
+                    cb.set_ticklabels(["−180°", "0°", "180°"])
+                else:
+                    cb = colorbar(sc, ax=a, location="bottom")
+                cb.solids.set_alpha(1)        # the bar at full colour, not the dots' alpha
+            row.append(a)
+        first_col.append(row[0])
+    bars = []
+    # context in salmon: the dark violet hid the ink error bars (user, 2026-10-10)
+    cols = {"context": PALETTE["salmon"], "position": PALETTE["teal"],
+            "velocity": PALETTE["amber"]}
+    gs_b = gs[nr, :].subgridspec(1, nr)
+    for j, st in enumerate(sites):
+        ax = fig.add_subplot(gs_b[0, j], sharey=bars[0] if bars else None)
+        if V[("context", st)]:
+            n_pc = len(V[("context", st)][0])
+            x = np.arange(n_pc)
+            for bi, (name, col) in enumerate(cols.items()):
+                A = np.array(V[(name, st)])
+                ax.bar(x + (bi - 1) * .27, A.mean(0), yerr=A.std(0), width=.26,
+                       color=col, label=name, error_kw={"lw": .5, "ecolor": INK})
+            ax.set_xticks(x); ax.set_xticklabels([str(i + 1) for i in x])
+        ax.set_xlabel(f"PC of {SITE_TITLE.get(st, st)}")
+        if j == 0:
+            ax.set_ylabel("Variance explained")
+            ax.set_ylim(0, 1)
         else:
-            a.tick_params(labelleft=False)
-        a.set_title(name)
-        if name != "context":
-            colorbar(sc, ax=a)
-        top.append(a)
-    ax = fig.add_subplot(gs[1, :])
-    if got:
-        n_pc = len(V["context"][0])
-        x = np.arange(n_pc)
-        cols = {"context": PALETTE["violet"], "position": PALETTE["teal"],
-                "velocity": PALETTE["amber"]}
-        for bi, (name, col) in enumerate(cols.items()):
-            A = np.array(V[name])
-            ax.bar(x + (bi - 1) * .27, A.mean(0), yerr=A.std(0), width=.26,
-                   color=col, label=name, error_kw={"lw": .6, "ecolor": INK})
-        ax.set_xticks(x); ax.set_xticklabels([str(i + 1) for i in x])
-        ax.set_xlabel("principal component of $z$")
-        ax.set_ylabel("variance explained ($R^2$)")
-        ax.set_ylim(0, 1)
-        ax.legend(ncol=3, loc="upper right")
-        ax.set_title(f"what each PC encodes (mean $\\pm$ SD, {len(got)} seeds)")
+            ax.tick_params(labelleft=False)
+        bars.append(ax)
+    fig.legend(handles=[plt.Rectangle((0, 0), 1, 1, color=c_) for c_ in cols.values()],
+               labels=list(cols), ncol=3, loc="outside lower center")
+    names = ", ".join(SITE_TITLE.get(st, st) for st in sites)
     caption = (
-        f"{arm}: z encodes context in its dominant components (tss >= {TSS_MIN}; "
-        f"scatter from seed {seeds[0]}; pooled seeds {got}). Top: PC1 vs PC2 of z "
-        f"for one seed, coloured by context, x position and speed. Bottom: for each "
-        f"of the top PCs, the share of its variance explained by context (eta^2 "
-        f"over the {N_CONTEXTS} contexts, assumption-free), position and velocity "
-        f"(linear R^2), mean +- SD across seeds. The shares need not sum to 1: "
-        f"drift contexts move the agent, so context and position are correlated.")
+        f"{arm}: what each stage of the circuit encodes (tss >= {TSS_MIN}; scatter from "
+        f"seed {seeds[0]}; pooled seeds {got}). Rows: {names}. Each row shows PC1 vs PC2 "
+        f"of that site for one seed, coloured by context, x position, heading speed (|v|) "
+        f"and heading direction (the velocity angle, on a cyclic colour map; ill-defined "
+        f"near rest); "
+        f"the colour bars under the last row hold for their column. Bottom: for each site "
+        f"and each of its top PCs, the share of the PC's variance explained by context "
+        f"(eta^2 over the {N_CONTEXTS} contexts, assumption-free), position and velocity "
+        f"(linear R^2), mean +- SD across seeds. The shares need not sum to 1: drift "
+        f"contexts move the agent, so context and position are correlated.")
     offset_spines(fig)
     if got:
-        bracket_xticks(ax, half_width=0.4)        # three .26 bars at .27 spacing: 0.8 wide
-    label_panels(fig, top + [ax])
+        for ax in bars:
+            bracket_xticks(ax, half_width=0.4)     # three .26 bars at .27 spacing: 0.8 wide
+    label_panels(fig, first_col + bars)
     save(fig, path, caption=caption)
     print(f"  saved -> {path}")
 

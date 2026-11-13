@@ -92,6 +92,7 @@ def test_every_figure_function_runs(tiny):
 
     _collect([
         ("fig_ablation", lambda: F.fig_ablation("main", 0, mse, r, p("a.png"))),
+        ("fig_ablation_main", lambda: F.fig_ablation_main("main", 0, mse, r, p("am.png"), None)),
         ("fig_global", lambda: F.fig_global("main", 0, r, p("g.png"))),
         ("fig_mtl_control", lambda: F.fig_mtl_control("main", 0, r, p("m.png"))),
         ("fig_tss", lambda: F.fig_tss("main", 0, d, p("t.png"))),

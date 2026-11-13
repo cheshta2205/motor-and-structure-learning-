@@ -1049,6 +1049,23 @@ def track(ec, cb, arm, va, va_ctx, va_tss, seed=0):
     return out, dec
 
 
+# the learning-rate schedule's warm restarts: back to LR after LR_RESTART_T0
+# epochs, then after cycles LR_RESTART_TMULT times longer each time. Named so
+# figures can mark them (figures.lr_restart_epochs); unchanged values.
+LR_RESTART_T0 = 50
+LR_RESTART_TMULT = 2
+
+
+def lr_restart_epochs(n_epochs):
+    """The epochs after which the learning rate jumps back to LR."""
+    out, t, cyc = [], LR_RESTART_T0, LR_RESTART_T0
+    while t < n_epochs:
+        out.append(t)
+        cyc *= LR_RESTART_TMULT
+        t += cyc
+    return out
+
+
 def train(arm, seed, epochs=EPOCHS, decode_every=32,
           save=True, action_mode=DEFAULT_ACTION_MODE, readout=DEFAULT_READOUT,
           beta=RATE_BETA, sigma=NOISE_SIGMA):
@@ -1078,7 +1095,7 @@ def train(arm, seed, epochs=EPOCHS, decode_every=32,
     cb = CB(CB_ACTIVATION)
     opt = torch.optim.AdamW(list(ec.parameters()) + list(cb.parameters()), lr=LR, weight_decay=WD)
     sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        opt, T_0=50, T_mult=2, eta_min=1e-5)
+        opt, T_0=LR_RESTART_T0, T_mult=LR_RESTART_TMULT, eta_min=1e-5)
     hist, per_fam, dec_ep, dec = [], [], [], []
     for ep in range(1, epochs + 1):
         perm = torch.randperm(N_TRAIN); tot = 0.
