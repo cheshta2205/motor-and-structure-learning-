@@ -219,6 +219,34 @@ purpose: a blind policy can reach every target while needing a far longer path
 than a specialist, and a version of this that reported only success would call
 that set uninformative.
 
+## Part 4 — hippocampal and cerebellar simulations (`published_simulations/`)
+
+Parts 1–3 are the motor task.  Part 4 asks whether the same circuit accounts for
+three findings outside motor control: the SRO reversal task of Bernardi et al.,
+the OLM/ORM dissociation under cerebellar perturbation, and Rochefort's place field
+stability.  Self-contained, with its own README, checkpoints and cached results
+— every figure regenerates without retraining.
+
+    sro.py                        SRO task, networks, training
+    sro_paper_figs.py             context decoding, CCGP, layer geometry
+    sro_geometry_pca.py           MTL state geometry in PCA space
+    sro_task_schematic.py         the task table
+    sro_*_pooled.py               write the per-seed caches the figure scripts read
+
+    olm_orm_final.py              arena, observation model, training, dose-response
+    gap_rows_fig.py               prediction error, changed vs unchanged object
+    olm_orm_task_schematic.py     the two paradigms
+    pi_surface.py, pi_tau_half.py perturbation strength x averaging window
+    olm_orm_robustness_sweep.py   robustness to the observation model
+
+    rochefort_final.py            place-field simulation and training
+    roche_pooled_final.py         pooled figures over ten networks
+
+Figures: 7a–h (OLM/ORM), 8a–d (SRO), ED 8–11.  The map from script to panel is
+in `published_simulations/README.md`.
+
+
+
 ## Requirements
 
 python 3.10+, torch, numpy, matplotlib, scikit-learn, pandas, seaborn, scipy,
